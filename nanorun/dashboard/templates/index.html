@@ -1,0 +1,2864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>nanorun Dashboard</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v={{ v }}">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <h1>nanorun</h1>
+    </header>
+
+    <main>
+        <section class="experiments-panel" id="experiments-panel">
+            <div class="collapse-handle" onclick="toggleSidebar()" title="Toggle sidebar"></div>
+
+            <!-- Experiments View -->
+            <div id="experiments-view" class="panel-view active">
+                <div class="filter-bar">
+                    <input type="text" id="search-filter" placeholder="Search" oninput="refreshExperiments()">
+                    <select id="status-filter" onchange="refreshExperiments()">
+                        <option value="">Status</option>
+                        <option value="running">Running</option>
+                        <option value="queued">Queued</option>
+                        <option value="completed">Completed</option>
+                        <option value="failed">Failed</option>
+                    </select>
+                    <select id="track-filter" onchange="refreshExperiments()">
+                        <option value="">Track</option>
+                    </select>
+                </div>
+                <div id="experiments-list" class="experiments-list">
+                    Loading...
+                </div>
+            </div>
+
+            <!-- Queue View -->
+            <div id="queue-view" class="panel-view">
+                <div class="queue-header">
+                    <span class="queue-title">Queue</span>
+                    <span id="queue-state-badge" class="queue-state-badge">active</span>
+                </div>
+                <div id="queue-content" class="queue-content">
+                    Loading...
+                </div>
+            </div>
+
+            <!-- View Switcher -->
+            <div class="view-switcher">
+                <button class="view-btn active" data-view="experiments" onclick="switchView('experiments')">Experiments</button>
+                <button class="view-btn" data-view="queue" onclick="switchView('queue')">Queue</button>
+            </div>
+        </section>
+
+        <section class="detail-panel">
+            <div class="panel-header">
+                <h2 id="detail-title">Details</h2>
+            </div>
+
+            <div class="meta-chart-block">
+                <div class="meta-row-wrapper">
+                    <div id="meta-row-container"></div>
+                    <div class="chart-view-switcher" id="chart-view-switcher">
+                        <button class="chart-view-btn" data-view="heatmap" onclick="switchChartView('heatmap')" title="Heatmap view">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <rect x="3" y="3" width="5" height="5" rx="1"/><rect x="10" y="3" width="5" height="5" rx="1"/><rect x="17" y="3" width="5" height="5" rx="1"/>
+                                <rect x="3" y="10" width="5" height="5" rx="1"/><rect x="10" y="10" width="5" height="5" rx="1"/><rect x="17" y="10" width="5" height="5" rx="1"/>
+                                <rect x="3" y="17" width="5" height="5" rx="1"/><rect x="10" y="17" width="5" height="5" rx="1"/><rect x="17" y="17" width="5" height="5" rx="1"/>
+                            </svg>
+                        </button>
+                        <button class="chart-view-btn" data-view="residual" onclick="switchChartView('residual')" title="Residual view">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <rect x="2" y="11" width="20" height="2"/>
+                                <path d="M4 8 L8 5 L12 9 L16 4 L20 7" stroke="currentColor" stroke-width="2" fill="none"/>
+                                <path d="M4 16 L8 19 L12 15 L16 20 L20 17" stroke="currentColor" stroke-width="2" fill="none"/>
+                            </svg>
+                        </button>
+                        <button class="chart-view-btn" data-view="line" onclick="switchChartView('line')" title="Line graph view">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M3 17 L8 12 L12 14 L17 8 L21 10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+                                <circle cx="3" cy="17" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="12" cy="14" r="2"/><circle cx="17" cy="8" r="2"/><circle cx="21" cy="10" r="2"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <div class="chart-body">
+                        <div id="chart-legend" class="chart-legend"></div>
+                        <div class="chart-canvas-wrap">
+                            <canvas id="loss-chart"></canvas>
+                            <div id="chart-heatmap-container"></div>
+                        </div>
+                    </div>
+                    <div class="chart-toolbar">
+                        <div id="chart-range" class="chart-range"></div>
+                        <div class="chart-toolbar-btns">
+                            <input type="text" id="chart-copy-title" class="chart-copy-title" placeholder="title (optional)" title="Title for copied image">
+                            <button class="chart-copy-btn" onclick="copyChartAsImage()" title="Copy chart as image">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                            </button>
+                            <button class="chart-fullscreen-btn" onclick="toggleChartFullscreen()" title="Toggle fullscreen">
+                                <svg class="expand-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                                </svg>
+                                <svg class="collapse-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </div><!-- .chart-container -->
+            </div><!-- .meta-chart-block -->
+
+            <div id="experiment-details" class="details-content">
+                <p class="placeholder">Select an experiment to view details</p>
+            </div>
+
+            <div class="metrics-panel">
+                <div id="metrics-table" class="metrics-table">
+                    <h3>Metrics History</h3>
+                    <p class="placeholder">Select an experiment to view metrics</p>
+                </div>
+            </div>
+
+            <div class="diff-notes-panel">
+                <div class="diff-notes-tabs">
+                    <button class="diff-notes-tab active" data-tab="diff" onclick="switchDiffNotesTab('diff')">Code Diff</button>
+                    <button class="diff-notes-tab" data-tab="notes" onclick="switchDiffNotesTab('notes')">Notes</button>
+                </div>
+                <div id="diff-tab-content" class="diff-notes-content active">
+                    <div id="diff-content" class="diff-content">
+                        <p class="placeholder">Select an experiment to view code diff</p>
+                    </div>
+                </div>
+                <div id="notes-tab-content" class="diff-notes-content">
+                    <div id="notes-content" class="notes-content">
+                        <p class="placeholder">Select an experiment to view notes</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <nav class="mobile-nav">
+        <button class="mobile-nav-btn active" data-panel="experiments" onclick="switchMobilePanel('experiments')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/>
+            </svg>
+            <span>Experiments</span>
+        </button>
+        <button class="mobile-nav-btn" data-panel="queue" onclick="switchMobilePanel('queue')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/>
+            </svg>
+            <span>Queue</span>
+        </button>
+        <button class="mobile-nav-btn" data-panel="detail" onclick="switchMobilePanel('detail')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
+            </svg>
+            <span>Details</span>
+        </button>
+    </nav>
+
+    <script>
+        let lossChart = null;
+        let selectedExperiment = null;
+        let selectedExperimentIds = null;
+        let selectedRunId = null;  // Currently selected row in runs table
+        let selectedCellExpIds = null;  // Experiment IDs selected via heatmap cell click
+        let refreshInterval = null;
+        let currentValidData = null;  // Store for metrics table switching
+        let deleteInProgress = false;  // Flag to prevent auto-refresh during delete
+
+        // Runs table sort/filter state
+        let runsSort = { col: 'started_at', dir: 'desc' };
+        let runsEnvFilters = {};  // { KEY: 'value', ... }
+        let runsLimit = 20;
+        let runsIsSweep = false;
+
+        // Bucket state (persisted in localStorage)
+        function getBucket() {
+            try { return JSON.parse(localStorage.getItem('nanorun_bucket') || '[]'); }
+            catch { return []; }
+        }
+        function saveBucket(ids) {
+            localStorage.setItem('nanorun_bucket', JSON.stringify(ids));
+        }
+        function toggleBucketItem(expId) {
+            const bucket = getBucket();
+            const idx = bucket.indexOf(expId);
+            if (idx >= 0) {
+                bucket.splice(idx, 1);
+            } else {
+                bucket.push(expId);
+            }
+            saveBucket(bucket);
+            renderBucketCard();
+            // Re-render runs table if viewing bucket to update icons
+            if (selectedExperiment === 'bucket') {
+                selectExperiment('bucket', bucket.slice());
+            }
+        }
+        function removeFromBucket(expId) {
+            const bucket = getBucket().filter(id => id !== expId);
+            saveBucket(bucket);
+            renderBucketCard();
+            if (selectedExperiment === 'bucket') {
+                if (bucket.length === 0) {
+                    selectedExperiment = null;
+                    selectedExperimentIds = null;
+                    document.getElementById('experiment-details').innerHTML = '';
+                    document.getElementById('meta-row-container').innerHTML = '';
+                    document.getElementById('detail-title').textContent = '';
+                } else {
+                    selectExperiment('bucket', bucket.slice());
+                }
+            }
+        }
+        function isBucketView() {
+            return selectedExperiment === 'bucket';
+        }
+
+        function renderBucketCard() {
+            // Remove existing bucket card
+            const existing = document.getElementById('bucket-card');
+            if (existing) existing.remove();
+
+            const bucket = getBucket();
+            if (bucket.length === 0) return;
+
+            const listEl = document.getElementById('experiments-list');
+            if (!listEl) return;
+
+            const isSelected = selectedExperiment === 'bucket';
+            const card = document.createElement('div');
+            card.id = 'bucket-card';
+            card.className = `experiment-card bucket${isSelected ? ' selected' : ''}`;
+            card.dataset.id = 'bucket';
+            card.onclick = () => selectExperiment('bucket', bucket.slice());
+            card.innerHTML = `
+                <div class="exp-header">
+                    <div class="exp-name-group">
+                        <span class="exp-name"><span class="exp-track bucket-label">★ Bucket</span></span>
+                    </div>
+                    <div class="exp-badges">
+                        <span class="bucket-count">${bucket.length} run${bucket.length !== 1 ? 's' : ''}</span>
+                    </div>
+                </div>
+            `;
+            listEl.prepend(card);
+        }
+
+        function isMobile() {
+            return window.innerWidth < 768;
+        }
+
+        function switchMobilePanel(panelName) {
+            const sidebar = document.getElementById('experiments-panel');
+            const detail = document.querySelector('.detail-panel');
+
+            // Remove mobile-active from both
+            sidebar.classList.remove('mobile-active');
+            detail.classList.remove('mobile-active');
+
+            if (panelName === 'experiments') {
+                sidebar.classList.add('mobile-active');
+                switchView('experiments');
+            } else if (panelName === 'queue') {
+                sidebar.classList.add('mobile-active');
+                switchView('queue');
+            } else if (panelName === 'detail') {
+                detail.classList.add('mobile-active');
+            }
+
+            // Update bottom nav active state
+            document.querySelectorAll('.mobile-nav-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.panel === panelName);
+            });
+        }
+
+        async function loadDiff(codeHash) {
+            const contentEl = document.getElementById('diff-content');
+
+            if (!codeHash) {
+                contentEl.innerHTML = '<p class="placeholder">No code hash available</p>';
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/diff/${codeHash}`);
+                if (!response.ok) {
+                    contentEl.innerHTML = '<p class="placeholder">No diff available (root node or diff not generated)</p>';
+                    return;
+                }
+                const diffText = await response.text();
+                contentEl.innerHTML = renderDiff(diffText);
+            } catch (e) {
+                contentEl.innerHTML = `<p class="placeholder">Error loading diff: ${e.message}</p>`;
+            }
+        }
+
+        async function loadNotes(scriptPath) {
+            const contentEl = document.getElementById('notes-content');
+            const notesTab = document.querySelector('.diff-notes-tab[data-tab="notes"]');
+
+            if (!scriptPath) {
+                contentEl.innerHTML = '';
+                notesTab.style.display = 'none';
+                // Switch to diff if notes was selected
+                if (currentDiffNotesTab === 'notes') {
+                    switchDiffNotesTab('diff');
+                }
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/notes/${encodeURIComponent(scriptPath)}`);
+                if (!response.ok) {
+                    contentEl.innerHTML = '';
+                    notesTab.style.display = 'none';
+                    // Switch to diff if notes was selected
+                    if (currentDiffNotesTab === 'notes') {
+                        switchDiffNotesTab('diff');
+                    }
+                    return;
+                }
+                const notesText = await response.text();
+                contentEl.innerHTML = renderNotes(notesText);
+                notesTab.style.display = '';
+            } catch (e) {
+                contentEl.innerHTML = '';
+                notesTab.style.display = 'none';
+                if (currentDiffNotesTab === 'notes') {
+                    switchDiffNotesTab('diff');
+                }
+            }
+        }
+
+        let currentNotesRaw = null;
+
+        function renderNotes(notesText) {
+            if (!notesText || notesText.trim() === '') {
+                currentNotesRaw = null;
+                return '<p class="placeholder">Empty notes file</p>';
+            }
+            currentNotesRaw = notesText;
+            const html = marked.parse(notesText);
+            return `<div class="notes-wrapper">
+                <button class="notes-copy-btn" onclick="copyNotes(this)" title="Copy notes">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                </button>
+                <div class="notes-markdown">${html}</div>
+            </div>`;
+        }
+
+        function copyNotes(btn) {
+            if (!currentNotesRaw) return;
+            copyToClipboard(currentNotesRaw, btn);
+        }
+
+        let currentDiffNotesTab = 'diff';
+
+        function switchDiffNotesTab(tabName) {
+            currentDiffNotesTab = tabName;
+
+            // Update URL
+            const url = new URL(window.location);
+            url.searchParams.set('tab', tabName);
+            window.history.replaceState({}, '', url);
+
+            // Update tab buttons
+            document.querySelectorAll('.diff-notes-tab').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tabName);
+            });
+
+            // Update content visibility
+            document.getElementById('diff-tab-content').classList.toggle('active', tabName === 'diff');
+            document.getElementById('notes-tab-content').classList.toggle('active', tabName === 'notes');
+        }
+
+        function renderDiff(diffText) {
+            if (!diffText || diffText.trim() === '') {
+                return '<p class="placeholder">Empty diff</p>';
+            }
+
+            const lines = diffText.split(/\r?\n/);
+            const htmlLines = lines.map(line => {
+                let className = 'diff-line';
+                if (line.startsWith('+++') || line.startsWith('---')) {
+                    className += ' diff-file';
+                } else if (line.startsWith('@@')) {
+                    className += ' diff-hunk';
+                } else if (line.startsWith('+')) {
+                    className += ' diff-add';
+                } else if (line.startsWith('-')) {
+                    className += ' diff-del';
+                }
+                // Escape HTML
+                const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return `<div class="${className}">${escaped}</div>`;
+            });
+
+            return `<pre class="diff-pre">${htmlLines.join('')}</pre>`;
+        }
+
+        function formatTime(ms) {
+            if (!ms) return '';
+            const seconds = ms / 1000;
+            if (seconds >= 1000) {
+                return Math.round(seconds) + 's';
+            }
+            return seconds.toPrecision(3) + 's';
+        }
+
+        function formatStartedAt(isoString) {
+            if (!isoString) return '-';
+            // DB stores UTC times without timezone suffix. Append Z so JS interprets as UTC.
+            // The getHours/getMinutes methods then convert to local timezone automatically.
+            if (!/Z$/.test(isoString) && !/[+-]\d{2}:\d{2}$/.test(isoString)) {
+                isoString += 'Z';
+            }
+            const date = new Date(isoString);
+            const month = (date.getMonth() + 1).toString().padStart(2, '0');
+            const day = date.getDate().toString().padStart(2, '0');
+            const hour24 = date.getHours();
+            const hour12 = hour24 % 12 || 12;
+            const ampm = hour24 < 12 ? 'am' : 'pm';
+            const mins = date.getMinutes().toString().padStart(2, '0');
+            return `${month}/${day} ${hour12}:${mins}${ampm}`;
+        }
+
+        function formatValLoss(val_loss, train_time_ms) {
+            if (!val_loss) return '<span class="val-loss-value">n/a</span>';
+            const loss = val_loss.toFixed(4);
+            if (train_time_ms) {
+                return `<span class="val-loss-value">${loss}</span><span class="val-loss-at">@</span><span class="val-loss-time">${formatTime(train_time_ms)}</span>`;
+            }
+            return `<span class="val-loss-value">${loss}</span>`;
+        }
+
+        async function loadTracks() {
+            const response = await fetch('/api/tracks');
+            const data = await response.json();
+            const select = document.getElementById('track-filter');
+
+            // Keep "All Tracks" option, add discovered tracks
+            data.tracks.forEach(track => {
+                const option = document.createElement('option');
+                option.value = track.name;
+                option.textContent = track.name;
+                select.appendChild(option);
+            });
+        }
+
+        async function refreshExperiments() {
+            const searchFilter = document.getElementById('search-filter').value.trim();
+            const statusFilter = document.getElementById('status-filter').value;
+            const trackFilter = document.getElementById('track-filter').value;
+
+            const params = new URLSearchParams();
+            if (trackFilter) params.set('track', trackFilter);
+            if (statusFilter) params.set('status', statusFilter);
+            if (searchFilter) params.set('search', searchFilter);
+
+            const url = params.toString() ? `/api/experiments?${params}` : '/api/experiments';
+            const response = await fetch(url);
+            let data = await response.json();
+
+            const listEl = document.getElementById('experiments-list');
+
+            if (data.experiments.length === 0) {
+                listEl.innerHTML = '<p class="placeholder">No experiments found. Run "nanorun run &lt;script&gt;" to start an experiment.</p>';
+                return [];
+            }
+
+            listEl.innerHTML = data.experiments.map(exp => {
+                const scriptPath = (exp.script || '').replace(/'/g, "\\'");
+                return `
+                <div class="experiment-card ${exp.status}" onclick="selectExperiment('${exp.code_hash || exp.id}', ${JSON.stringify(exp.experiment_ids || [exp.id])})" data-id="${exp.code_hash || exp.id}">
+                    <div class="exp-header">
+                        <div class="exp-name-group">
+                            <span class="exp-name copyable" onclick="event.stopPropagation(); copyToClipboard('${scriptPath}', this)" title="Click to copy: ${exp.script || 'n/a'}"><span class="exp-track">${exp.track || 'untracked'}</span>/${exp.name.substring(0, 25)}${exp.name.length > 25 ? '…' : ''}</span>${exp.code_hash ? `<span class="exp-hash">${exp.code_hash.substring(0, 8)}</span>` : ''}
+                        </div>
+                        <div class="exp-badges">
+                            ${exp.status !== 'completed' ? `<span class="status-badge ${exp.status}">${exp.status}</span>` : ''}
+                        </div>
+                    </div>
+                    <div class="exp-metrics">
+                        <span class="val-loss">${formatValLoss(exp.val_loss, exp.train_time_ms)}${exp.n_runs > 1 ? ` <span class="n-runs-inline">(n=${exp.n_runs})</span>` : ''}</span>
+                        ${exp.status === 'running' ? `
+                        <div class="exp-progress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: ${exp.total_steps ? (exp.current_step / exp.total_steps * 100) : 0}%"></div>
+                            </div>
+                            <span class="progress-text">${exp.current_step || 0}/${exp.total_steps || '?'}</span>
+                        </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `}).join('');
+
+            // Re-highlight selected if still in list
+            if (selectedExperiment) {
+                document.querySelectorAll('.experiment-card').forEach(el => {
+                    el.classList.toggle('selected', el.dataset.id == selectedExperiment);
+                });
+            }
+
+            renderBucketCard();
+
+            return data.experiments;
+        }
+
+        async function selectExperiment(codeHashOrId, experimentIds) {
+            selectedQueuedScript = null;  // Clear queued selection
+            const isSameExperiment = selectedExperiment === codeHashOrId;
+            selectedExperiment = codeHashOrId;
+            selectedExperimentIds = experimentIds;
+
+            // Only clear selections when changing to a different experiment
+            if (!isSameExperiment) {
+                selectedRunId = null;
+                selectedCellExpIds = null;
+                heatmapSelectedVars = [];
+                currentChartView = null;  // Reset chart view for new experiment
+            }
+
+            // Update URL with selected experiment
+            const url = new URL(window.location);
+            url.searchParams.set('exp', codeHashOrId);
+            // Only clear run/chart params when changing to a different experiment
+            if (!isSameExperiment) {
+                url.searchParams.delete('run');
+                url.searchParams.delete('chart');
+            }
+            window.history.replaceState({}, '', url);
+
+            // Highlight selected
+            document.querySelectorAll('.experiment-card').forEach(el => {
+                el.classList.toggle('selected', el.dataset.id == codeHashOrId);
+            });
+
+            // Fetch details for all experiments in the group
+            const allData = await Promise.all(
+                experimentIds.map(id => fetch(`/api/experiment/${id}`).then(r => r.json()))
+            );
+
+            // Filter out errors
+            const validData = allData.filter(d => !d.error);
+            if (validData.length === 0) {
+                document.getElementById('experiment-details').innerHTML = `<p class="error">No valid experiments found</p>`;
+                return;
+            }
+
+            const primary = validData[0];
+            const isMultiple = validData.length > 1;
+
+            // Load heatmap defaults for this experiment's code hash
+            currentCodeHash = primary.code_hash;
+            if (!isSameExperiment) {
+                heatmapDefaults = loadHeatmapDefaults(currentCodeHash);
+                // Auto-detect defaults from script if we have partial vars and no saved defaults
+                const partialVars = detectPartialVars(validData);
+                if (partialVars.length > 0 && primary.script) {
+                    // Always fetch defaults for partial vars — overwrite stale (default) markers
+                    const needsAutoDetect = partialVars.some(k => !heatmapDefaults[k] || heatmapDefaults[k] === '(default)');
+                    if (needsAutoDetect) {
+                        fetch(`/api/env-defaults/${primary.script}`).then(r => r.json()).then(data => {
+                            if (data.defaults) {
+                                let changed = false;
+                                for (const key of partialVars) {
+                                    if (data.defaults[key] !== undefined && heatmapDefaults[key] !== data.defaults[key]) {
+                                        heatmapDefaults[key] = data.defaults[key];
+                                        changed = true;
+                                    }
+                                }
+                                if (changed) {
+                                    saveHeatmapDefaults(currentCodeHash, heatmapDefaults);
+                                    // Re-render heatmap with updated defaults
+                                    if (currentChartView === 'heatmap') {
+                                        switchChartView('heatmap', false);
+                                    }
+                                }
+                            }
+                        }).catch(() => {});  // Silently fail if script not found
+                    }
+                }
+            }
+
+            // Check if it's a sweep (different env vars)
+            const envVarStrings = new Set(validData.map(d => JSON.stringify(d.env_vars || {})));
+            const isSweep = envVarStrings.size > 1;
+
+            // Compute aggregated stats (exclude running experiments from averages)
+            const completedData = validData.filter(d => d.status !== 'running');
+            const valLosses = completedData.map(d => d.final_val_loss).filter(v => v != null);
+            const trainTimes = completedData.map(d => d.final_train_time_ms).filter(v => v != null);
+            const meanValLoss = valLosses.length ? valLosses.reduce((a,b) => a+b, 0) / valLosses.length : null;
+            const meanTrainTime = trainTimes.length ? trainTimes.reduce((a,b) => a+b, 0) / trainTimes.length : null;
+
+            document.getElementById('detail-title').textContent = isBucketView() ? '★ Bucket' : (primary.script ? primary.script.split('/').pop() : primary.name);
+
+            // Pre-fill copy title
+            const copyTitleInput = document.getElementById('chart-copy-title');
+            if (copyTitleInput) copyTitleInput.value = primary.script ? primary.script.split('/').pop() : primary.name;
+
+            // Update meta row (in the meta-chart block)
+            document.getElementById('meta-row-container').innerHTML = isBucketView() ? `
+                <div class="meta-row">
+                    <span class="meta-item bucket-label">${validData.length} run${validData.length !== 1 ? 's' : ''} collected</span>
+                </div>
+            ` : `
+                <div class="meta-row">
+                    <a class="meta-item meta-script" href="#" onclick="event.preventDefault(); revealInFinder(${primary.id})" title="Reveal in Finder: ${primary.script || 'n/a'}">${primary.track || 'untracked'}/${primary.script ? primary.script.split('/').pop() : 'n/a'}</a>
+                    <span class="meta-sep">·</span>
+                    <span class="meta-item">${primary.gpus}x ${primary.gpu_type || 'H100'}</span>
+                    <span class="meta-sep">·</span>
+                    ${primary.code_hash
+                        ? `<span class="meta-item meta-hash" title="${primary.code_hash}">${primary.code_hash.substring(0, 8)}</span>`
+                        : `<span class="meta-item meta-hash-missing">no code hash</span>`}
+                    ${isMultiple ? `<span class="meta-sep">·</span><span class="meta-item">${isSweep ? 'sweep' : 'n'}=${validData.length}</span>` : ''}
+                </div>
+            `;
+
+            // Update details
+            const detailsEl = document.getElementById('experiment-details');
+            // Reset filters when switching experiments
+            if (!isSameExperiment) {
+                runsEnvFilters = {};
+                runsSort = { col: 'started_at', dir: 'desc' };
+                chartXRange = null;
+            }
+            const anyHasEnvVars = validData.some(d => d.env_vars && Object.keys(d.env_vars).length > 0);
+            runsIsSweep = isSweep || isBucketView() || anyHasEnvVars;
+
+            detailsEl.innerHTML = `
+                <div class="stats-runs-block">
+                    <div class="runs-header-row">
+                        <h4 class="runs-header-clickable" onclick="copyRunsAsMarkdown()" title="Click to copy as markdown">Runs</h4>
+                        <div class="stats-hero">
+                            <div class="stat-box">
+                                <span class="stat-label">${isMultiple ? 'Mean Loss' : 'Val Loss'}</span>
+                                <span class="stat-value ${meanValLoss && meanValLoss < 3.3 ? 'good' : ''}">${meanValLoss ? meanValLoss.toFixed(4) : 'n/a'}</span>
+                                ${isMultiple && valLosses.length > 1 ? `<span class="stat-range">(${Math.min(...valLosses).toFixed(4)}-${Math.max(...valLosses).toFixed(4)})</span>` : ''}
+                            </div>
+                            <div class="stat-box">
+                                <span class="stat-label">${isMultiple ? 'Mean Time' : 'Train Time'}</span>
+                                <span class="stat-value">${meanTrainTime ? (meanTrainTime / 1000).toFixed(1) + 's' : 'n/a'}</span>
+                                ${isMultiple && trainTimes.length > 1 ? `<span class="stat-range">(${(Math.min(...trainTimes)/1000).toFixed(1)}s-${(Math.max(...trainTimes)/1000).toFixed(1)}s)</span>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                    <div id="runs-filters"></div>
+                    <div id="runs-table-container" class="runs-table"></div>
+                </div>
+            `;
+
+            // Store validData for runs table rendering and metrics table switching
+            currentValidData = validData;
+            currentTotalSteps = Math.max(...validData.map(d => d.total_steps || 0));
+
+            renderRunsTable();
+
+            // Set up chart views
+            const eligibleViews = getEligibleViews(validData);
+            const metaChartBlock = document.querySelector('.meta-chart-block');
+
+            if (eligibleViews.length === 0) {
+                // No views available, hide the chart component
+                metaChartBlock.classList.add('no-views');
+                // Clear chart param from URL
+                const url = new URL(window.location);
+                url.searchParams.delete('chart');
+                window.history.replaceState({}, '', url);
+            } else {
+                metaChartBlock.classList.remove('no-views');
+                updateViewSwitcher(eligibleViews);
+                // Check URL for preferred chart view, then current view, fallback to first eligible
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlChartView = urlParams.get('chart');
+                const viewToShow = (urlChartView && eligibleViews.includes(urlChartView))
+                    ? urlChartView
+                    : (currentChartView && eligibleViews.includes(currentChartView))
+                        ? currentChartView
+                        : eligibleViews[0];
+                switchChartView(viewToShow);
+            }
+
+            // Keep run/cell selection across refreshes when still valid
+            const validIds = new Set(validData.map(d => d.id));
+            if (selectedCellExpIds) {
+                const filteredCellIds = selectedCellExpIds.filter(id => validIds.has(id));
+                selectedCellExpIds = filteredCellIds.length > 0 ? filteredCellIds : null;
+            }
+            if (selectedRunId && !validIds.has(selectedRunId)) {
+                selectedRunId = null;
+            }
+
+            // Update metrics table with preserved selection when possible
+            if (selectedCellExpIds) {
+                showAveragedMetricsForCell(selectedCellExpIds);
+            } else if (selectedRunId) {
+                const exp = validData.find(d => d.id === selectedRunId);
+                if (exp) {
+                    updateMetricsTable(exp.loss_curve, false, selectedRunId);
+                }
+            } else if (isMultiple) {
+                const allCurves = validData.map(d => d.loss_curve);
+                const averaged = computeAveragedMetrics(allCurves);
+                updateMetricsTable(averaged, true, null);
+            } else {
+                updateMetricsTable(primary.loss_curve, false, null);
+            }
+
+            // Keep URL in sync with selection
+            const runUrl = new URL(window.location);
+            if (selectedRunId) {
+                runUrl.searchParams.set('run', selectedRunId);
+            } else {
+                runUrl.searchParams.delete('run');
+            }
+            window.history.replaceState({}, '', runUrl);
+
+            // Restore row/heatmap highlights after re-render
+            updateRunRowHighlights();
+            updateHeatmapHighlights();
+
+            // Load code diff and notes (skip for bucket — mixed scripts)
+            if (!isBucketView()) {
+                loadDiff(primary.code_hash);
+                loadNotes(primary.script);
+            }
+
+            // On mobile, auto-navigate to detail view only on new selection (not refresh)
+            if (!isSameExperiment && isMobile()) switchMobilePanel('detail');
+        }
+
+        function handleRunRowClick(event, expId) {
+            if (event.metaKey || event.ctrlKey) {
+                event.preventDefault();
+                toggleBucketItem(expId);
+                // Re-render to update in-bucket styling
+                if (!isBucketView()) renderRunsTable();
+                return;
+            }
+            showMetricsForRun(expId);
+        }
+
+        function computeAveragedMetrics(allLossCurves) {
+            // Group metrics by step across all runs
+            const byStep = {};
+            allLossCurves.forEach(curve => {
+                (curve || []).forEach(m => {
+                    if (!byStep[m.step]) {
+                        byStep[m.step] = { val_losses: [], train_times: [], step_avgs: [] };
+                    }
+                    if (m.val_loss != null) byStep[m.step].val_losses.push(m.val_loss);
+                    if (m.train_time_ms != null) byStep[m.step].train_times.push(m.train_time_ms);
+                    if (m.step_avg_ms != null) byStep[m.step].step_avgs.push(m.step_avg_ms);
+                });
+            });
+
+            // Compute averages
+            const avgMetrics = Object.entries(byStep).map(([step, data]) => ({
+                step: parseInt(step),
+                val_loss: data.val_losses.length ? data.val_losses.reduce((a,b) => a+b, 0) / data.val_losses.length : null,
+                train_time_ms: data.train_times.length ? data.train_times.reduce((a,b) => a+b, 0) / data.train_times.length : null,
+                step_avg_ms: data.step_avgs.length ? data.step_avgs.reduce((a,b) => a+b, 0) / data.step_avgs.length : null,
+                n: data.val_losses.length
+            }));
+
+            return avgMetrics.sort((a, b) => a.step - b.step);
+        }
+
+        function showMetricsForRun(expId) {
+            if (!currentValidData) return;
+            const url = new URL(window.location);
+
+            // Clear cell selection when clicking individual rows
+            selectedCellExpIds = null;
+
+            // Toggle: if same run clicked again, deselect it
+            if (selectedRunId === expId) {
+                selectedRunId = null;
+                url.searchParams.delete('run');
+                window.history.replaceState({}, '', url);
+                // Show averaged metrics if multiple runs, or single run metrics
+                if (currentValidData.length > 1) {
+                    showAveragedMetrics();
+                } else {
+                    updateMetricsTable(currentValidData[0].loss_curve, false, null);
+                }
+                updateRunRowHighlights();
+                updateHeatmapHighlights();
+                return;
+            }
+
+            const exp = currentValidData.find(d => d.id === expId);
+            if (exp) {
+                selectedRunId = expId;
+                updateMetricsTable(exp.loss_curve, false, expId);
+                // Update URL with run param (keeps exp param)
+                url.searchParams.set('run', expId);
+                window.history.replaceState({}, '', url);
+                updateRunRowHighlights();
+                updateHeatmapHighlights();
+            }
+        }
+
+        function updateHeatmapHighlights() {
+            document.querySelectorAll('.heatmap-cell').forEach(cell => {
+                const expIds = (cell.dataset.expIds || '').split(',').map(id => parseInt(id)).filter(id => !isNaN(id));
+                const isSelected = selectedCellExpIds
+                    ? expIds.some(id => selectedCellExpIds.includes(id))
+                    : expIds.includes(selectedRunId);
+                cell.classList.toggle('selected', isSelected);
+            });
+        }
+
+        function updateRunRowHighlights() {
+            document.querySelectorAll('.run-row').forEach(row => {
+                const rowExpId = parseInt(row.dataset.expId);
+                const isSelected = selectedCellExpIds
+                    ? selectedCellExpIds.includes(rowExpId)
+                    : rowExpId === selectedRunId;
+                row.classList.toggle('selected', isSelected);
+            });
+        }
+
+        function showAveragedMetrics() {
+            if (!currentValidData) return;
+            const allCurves = currentValidData.map(d => d.loss_curve);
+            const averaged = computeAveragedMetrics(allCurves);
+            updateMetricsTable(averaged, true, null);
+        }
+
+        // Store current metrics data for clipboard copy
+        let currentMetricsData = null;
+
+        function copyMetricsAsMarkdown() {
+            if (!currentMetricsData || currentMetricsData.length === 0) return;
+
+            // Build markdown table
+            const lines = [
+                '| Step | Val Loss | Time | Step Avg |',
+                '|------|----------|------|----------|'
+            ];
+
+            currentMetricsData.forEach(m => {
+                const step = m.step;
+                const valLoss = m.val_loss ? m.val_loss.toFixed(4) : '-';
+                const time = m.train_time_ms ? formatTime(m.train_time_ms) : '-';
+                const stepAvg = m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-';
+                lines.push(`| ${step} | ${valLoss} | ${time} | ${stepAvg} |`);
+            });
+
+            const markdown = lines.join('\n');
+            copyToClipboard(markdown, document.querySelector('.metrics-header-clickable'));
+        }
+
+        function getVisibleRuns() {
+            if (!currentValidData || currentValidData.length === 0) return [];
+            let data = currentValidData.slice();
+
+            // Apply env var filters
+            const filterKeys = Object.keys(runsEnvFilters);
+            if (filterKeys.length > 0) {
+                data = data.filter(d => {
+                    const env = d.env_vars || {};
+                    return filterKeys.every(k => String(env[k] ?? '') === String(runsEnvFilters[k]));
+                });
+            }
+
+            // Sort
+            const col = runsSort.col;
+            const dir = runsSort.dir === 'asc' ? 1 : -1;
+            data.sort((a, b) => {
+                let va, vb;
+                if (col === 'started_at') {
+                    va = a.started_at || ''; vb = b.started_at || '';
+                } else if (col === 'val_loss') {
+                    va = a.final_val_loss ?? Infinity; vb = b.final_val_loss ?? Infinity;
+                } else if (col === 'time') {
+                    va = a.final_train_time_ms ?? Infinity; vb = b.final_train_time_ms ?? Infinity;
+                } else if (col === 'status') {
+                    va = a.status || ''; vb = b.status || '';
+                } else if (col === 'id') {
+                    va = a.id; vb = b.id;
+                } else if (col === 'script') {
+                    va = a.script || ''; vb = b.script || '';
+                } else {
+                    va = 0; vb = 0;
+                }
+                return va < vb ? -dir : va > vb ? dir : 0;
+            });
+
+            return data.slice(0, runsLimit);
+        }
+
+        function copyRunsAsMarkdown() {
+            const runs = getVisibleRuns();
+            if (runs.length === 0) return;
+
+            const hasEnvVars = runs.some(d => d.env_vars && Object.keys(d.env_vars).length > 0);
+            const bucket = isBucketView();
+
+            let header, separator;
+            if (bucket && hasEnvVars) {
+                header = '| Script | Run | Env | Val Loss | Time |';
+                separator = '|--------|-----|-----|----------|------|';
+            } else if (bucket) {
+                header = '| Script | Run | Val Loss | Time |';
+                separator = '|--------|-----|----------|------|';
+            } else if (hasEnvVars) {
+                header = '| Run | Env | Val Loss | Time |';
+                separator = '|-----|-----|----------|------|';
+            } else {
+                header = '| Run | Val Loss | Time |';
+                separator = '|-----|----------|------|';
+            }
+            const lines = [header, separator];
+
+            runs.forEach(d => {
+                const runId = d.remote_run_id || `#${d.id}`;
+                const valLoss = d.final_val_loss ? d.final_val_loss.toFixed(4) : '-';
+                const time = d.final_train_time_ms ? (d.final_train_time_ms / 1000).toFixed(1) + 's' : '-';
+                const script = d.script ? d.script.split('/').pop().replace('.py', '') : d.name;
+                const env = Object.entries(d.env_vars || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '-';
+
+                if (bucket && hasEnvVars) {
+                    lines.push(`| ${script} | ${runId} | ${env} | ${valLoss} | ${time} |`);
+                } else if (bucket) {
+                    lines.push(`| ${script} | ${runId} | ${valLoss} | ${time} |`);
+                } else if (hasEnvVars) {
+                    lines.push(`| ${runId} | ${env} | ${valLoss} | ${time} |`);
+                } else {
+                    lines.push(`| ${runId} | ${valLoss} | ${time} |`);
+                }
+            });
+
+            const markdown = lines.join('\n');
+            copyToClipboard(markdown, document.querySelector('.runs-header-clickable'));
+        }
+
+        function toggleRunsSort(col) {
+            if (runsSort.col === col) {
+                runsSort.dir = runsSort.dir === 'asc' ? 'desc' : 'asc';
+            } else {
+                runsSort.col = col;
+                runsSort.dir = col === 'started_at' ? 'desc' : 'asc';
+            }
+            renderRunsTable();
+        }
+
+        function toggleEnvFilter(key, value) {
+            if (runsEnvFilters[key] === value) {
+                delete runsEnvFilters[key];
+            } else {
+                runsEnvFilters[key] = value;
+            }
+            renderRunsTable();
+        }
+
+        function clearEnvFilters() {
+            runsEnvFilters = {};
+            renderRunsTable();
+        }
+
+        function setRunsLimit(val) {
+            const n = parseInt(val);
+            if (!isNaN(n) && n > 0) runsLimit = n;
+            renderRunsTable();
+        }
+
+        function makeRunsLimitEditable(el) {
+            const current = runsLimit;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = current;
+            input.className = 'runs-limit-inline';
+            input.size = String(current).length || 2;
+
+            const commit = () => {
+                const n = parseInt(input.value);
+                if (!isNaN(n) && n > 0) {
+                    runsLimit = n;
+                }
+                renderRunsTable();
+            };
+
+            input.addEventListener('keydown', e => {
+                if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                if (e.key === 'Escape') { e.preventDefault(); renderRunsTable(); }
+            });
+            input.addEventListener('blur', commit);
+
+            el.replaceWith(input);
+            input.focus();
+            input.select();
+        }
+
+        function renderRunsTable() {
+            if (!currentValidData) return;
+            const container = document.getElementById('runs-table-container');
+            const filtersEl = document.getElementById('runs-filters');
+            if (!container) return;
+
+            const bucketSet = new Set(getBucket());
+            const limited = getVisibleRuns();
+            const filterKeys = Object.keys(runsEnvFilters);
+            // Total before limit (need to recount for "Showing X of Y")
+            let totalFiltered = currentValidData.length;
+            if (filterKeys.length > 0) {
+                totalFiltered = currentValidData.filter(d => {
+                    const env = d.env_vars || {};
+                    return filterKeys.every(k => String(env[k] ?? '') === String(runsEnvFilters[k]));
+                }).length;
+            }
+            const total = totalFiltered;
+
+            // Sort indicator helper
+            const sortCls = (c) => runsSort.col === c ? 'sortable sort-active' : 'sortable';
+
+            // Render active filters bar
+            if (filtersEl) {
+                if (filterKeys.length > 0) {
+                    filtersEl.innerHTML = `<div class="runs-active-filters">
+                        ${filterKeys.map(k => `<span class="runs-filter-chip active" onclick="toggleEnvFilter('${k}', '${runsEnvFilters[k]}')">${k}=${runsEnvFilters[k]} ✕</span>`).join('')}
+                        <span class="runs-filter-clear" onclick="clearEnvFilters()">Clear all</span>
+                    </div>`;
+                } else {
+                    filtersEl.innerHTML = '';
+                }
+            }
+
+            // Render table
+            container.innerHTML = `
+                <div class="runs-table-controls">
+                    <span class="runs-count">Showing <span class="runs-limit-editable" onclick="makeRunsLimitEditable(this)" title="Click to edit">${Math.min(runsLimit, total)}</span> of ${total} runs</span>
+                </div>
+                <table>
+                <thead>
+                    <tr>
+                        ${isBucketView() ? `<th class="${sortCls('script')}" onclick="toggleRunsSort('script')">Script</th>` : `<th class="${sortCls('id')}" onclick="toggleRunsSort('id')">Exp</th>`}
+                        <th>Run ID</th>
+                        <th class="${sortCls('status')}" onclick="toggleRunsSort('status')">Status</th>
+                        <th class="${sortCls('started_at')}" onclick="toggleRunsSort('started_at')">Started</th>
+                        ${runsIsSweep ? `<th>Env</th>` : ''}
+                        <th class="${sortCls('val_loss')}" onclick="toggleRunsSort('val_loss')">Val Loss</th>
+                        <th class="${sortCls('time')}" onclick="toggleRunsSort('time')">Time</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${limited.map(d => {
+                        const envEntries = Object.entries(d.env_vars || {});
+                        const envHtml = runsIsSweep ? `<td class="sweep-env">${envEntries.map(([k,v]) => {
+                            const isFiltered = runsEnvFilters[k] === String(v);
+                            return `<span class="env-chip${isFiltered ? ' active' : ''}" onclick="event.stopPropagation(); toggleEnvFilter('${k}', '${v}')">${k}=${v}</span>`;
+                        }).join(' ') || 'default'}</td>` : '';
+                        return `
+                        <tr class="run-row${selectedRunId === d.id ? ' selected' : ''}${bucketSet.has(d.id) ? ' in-bucket' : ''}" data-exp-id="${d.id}" onclick="handleRunRowClick(event, ${d.id})" title="Click to view metrics · ⌘+click to add to bucket">
+                            <td>${isBucketView() ? `<span class="exp-track">${d.track || 'untracked'}</span>/${d.script ? d.script.split('/').pop().replace('.py', '') : d.name}` : `#${d.id}`}</td>
+                            <td>
+                                ${d.remote_run_id
+                                    ? `<a href="/api/logs/${d.remote_run_id}" target="_blank" class="meta-run-id" title="View log file" onclick="event.stopPropagation()">${d.remote_run_id}</a>`
+                                    : '<span class="meta-hash-missing">none</span>'}${d.status === 'failed' && d.crash_log
+                                    ? `<span class="log-sep">|</span><a href="/api/crash/${d.id}" target="_blank" class="crash-log-link" onclick="event.stopPropagation()">CRASH LOG</a>`
+                                    : ''}
+                            </td>
+                            <td><span class="status-badge-sm ${d.status}">${d.status}</span></td>
+                            <td class="started-at">${formatStartedAt(d.started_at)}</td>
+                            ${envHtml}
+                            <td class="val-loss">${d.final_val_loss ? d.final_val_loss.toFixed(4) : 'n/a'}</td>
+                            <td>${d.final_train_time_ms ? (d.final_train_time_ms/1000).toFixed(1) + 's' : 'n/a'}</td>
+                            <td>${isBucketView()
+                                ? `<button class="delete-icon bucket-remove" onclick="event.stopPropagation(); removeFromBucket(${d.id})" title="Remove from bucket"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`
+                                : `<button class="delete-icon" onclick="event.stopPropagation(); deleteExperiment(${d.id}, '${d.name.replace(/'/g, "\\'")}', this.closest('tr'))" title="Delete"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`}</td>
+                        </tr>`;
+                    }).join('')}
+                </tbody>
+                </table>`;
+
+            // Update chart to reflect filtered data
+            if (currentChartView) {
+                switchChartView(currentChartView, false);
+            }
+        }
+
+        function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) {
+            const tableEl = document.getElementById('metrics-table');
+
+            if (!lossData || lossData.length === 0) {
+                tableEl.innerHTML = '<h3>Metrics History</h3><p class="placeholder">No metrics recorded yet</p>';
+                currentMetricsData = null;
+                return;
+            }
+
+            // Show most recent first
+            const recentData = lossData.slice().reverse();
+            const isMultiple = currentValidData && currentValidData.length > 1;
+
+            // Store for clipboard copy (full data, not just recent)
+            currentMetricsData = lossData.slice().reverse();
+
+            tableEl.innerHTML = `
+                <h3 class="metrics-header-clickable" onclick="copyMetricsAsMarkdown()" title="Click to copy as markdown">Metrics History</h3>
+                ${isMultiple ? `<div class="metrics-header">
+                    <span class="metrics-label">${isAveraged ? 'Averaged across ' + currentValidData.length + ' runs' : 'Run #' + selectedExpId}</span>
+                </div>` : ''}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Step</th>
+                            <th>Val Loss</th>
+                            <th>Time</th>
+                            <th>Step Avg</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${recentData.map(m => `
+                            <tr>
+                                <td>${m.step}</td>
+                                <td class="val-loss">${m.val_loss ? m.val_loss.toFixed(4) : '-'}</td>
+                                <td>${m.train_time_ms ? formatTime(m.train_time_ms) : '-'}</td>
+                                <td>${m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-'}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+                ${lossData.length > 20 ? `<p class="table-note">${lossData.length - 20} earlier checkpoints not shown</p>` : ''}
+            `;
+        }
+
+        function updateChart(lossData, totalSteps) {
+            updateChartMultiple([{ name: 'Run', data: lossData, env_vars: {} }], totalSteps);
+        }
+
+        const CHART_COLORS = ['#5a9a5e', '#5a8ab8', '#c9a054', '#b05a7a', '#7a5a9a', '#5a9a9a', '#c9b854', '#8a7058'];
+
+        // Compute heatmap data from sweep experiments (supports 1D, 2D, and 3D+ sweeps)
+        // selectedVars: array of var names to use as axes (max 2). If null, auto-select.
+        function computeHeatmapData(validData, selectedVars = null) {
+            // Only include completed experiments
+            const completedData = validData.filter(d => d.status === 'completed');
+            if (completedData.length < 1) return null;
+
+            // Collect all env var keys and their unique values
+            const envVarValues = {};
+            completedData.forEach(exp => {
+                const envVars = exp.env_vars || {};
+                Object.entries(envVars).forEach(([key, value]) => {
+                    if (!envVarValues[key]) envVarValues[key] = new Set();
+                    envVarValues[key].add(String(value));
+                });
+            });
+
+            // Sort values numerically if possible, otherwise alphabetically
+            const sortValues = (values) => {
+                const arr = Array.from(values);
+                const allNumeric = arr.every(v => !isNaN(parseFloat(v)));
+                if (allNumeric) {
+                    return arr.sort((a, b) => parseFloat(a) - parseFloat(b));
+                }
+                return arr.sort();
+            };
+
+            // Filter to only keys with multiple values (actually being swept)
+            const sweptVars = Object.entries(envVarValues)
+                .filter(([key, values]) => values.size > 1)
+                .map(([key, values]) => ({ key, values: sortValues(values) }));
+
+            if (sweptVars.length === 0) return null;
+
+            // Determine which vars to use as axes
+            let activeVars;
+            if (selectedVars && selectedVars.length > 0) {
+                // Filter to only valid swept vars
+                activeVars = selectedVars
+                    .filter(name => sweptVars.some(v => v.key === name))
+                    .slice(0, 2);  // Max 2
+            } else {
+                // Auto-select first 2 (or 1 if only 1 swept var)
+                activeVars = sweptVars.slice(0, 2).map(v => v.key);
+            }
+
+            if (activeVars.length === 0) return null;
+
+            // Sort activeVars to match sweptVars order (consistent axis orientation)
+            const sweptVarOrder = sweptVars.map(v => v.key);
+            activeVars.sort((a, b) => sweptVarOrder.indexOf(a) - sweptVarOrder.indexOf(b));
+
+            // Get the full var info for active vars
+            const getVarInfo = (name) => sweptVars.find(v => v.key === name);
+
+            // Find min/max loss for color scaling (across all completed data)
+            const allLosses = completedData.map(e => e.final_val_loss).filter(v => v != null);
+            if (allLosses.length === 0) return null;
+            const minLoss = Math.min(...allLosses);
+            const maxLoss = Math.max(...allLosses);
+
+            // 1D case: single axis
+            if (activeVars.length === 1) {
+                const varX = getVarInfo(activeVars[0]);
+                const cellLosses = {};  // cellLosses[x] = [loss1, loss2, ...]
+                const cellExps = {};    // cellExps[x] = [exp1, exp2, ...]
+
+                completedData.forEach(exp => {
+                    const envVars = exp.env_vars || {};
+                    const xVal = envVars[varX.key] !== undefined ? String(envVars[varX.key]) : undefined;
+                    if (xVal !== undefined) {
+                        if (!cellLosses[xVal]) cellLosses[xVal] = [];
+                        if (!cellExps[xVal]) cellExps[xVal] = [];
+                        if (exp.final_val_loss != null) {
+                            cellLosses[xVal].push(exp.final_val_loss);
+                        }
+                        cellExps[xVal].push(exp);
+                    }
+                });
+
+                // Compute mean for each cell
+                const values = {};
+                const cellData = {};
+                varX.values.forEach(xVal => {
+                    const losses = cellLosses[xVal] || [];
+                    values[xVal] = losses.length > 0
+                        ? losses.reduce((a, b) => a + b, 0) / losses.length
+                        : null;
+                    cellData[xVal] = {
+                        exp: cellExps[xVal]?.[0],
+                        count: cellExps[xVal]?.length || 0,
+                        allExps: cellExps[xVal] || []
+                    };
+                });
+
+                return {
+                    dim: 1,
+                    varX: varX.key,
+                    xValues: varX.values,
+                    values,
+                    cellData,
+                    minLoss,
+                    maxLoss,
+                    sweptVars
+                };
+            }
+
+            // 2D case: two axes (averaging over any unselected vars)
+            const varX = getVarInfo(activeVars[0]);
+            const varY = getVarInfo(activeVars[1]);
+
+            const cellLosses = {};  // cellLosses[y][x] = [loss1, loss2, ...]
+            const cellExps = {};    // cellExps[y][x] = [exp1, exp2, ...]
+
+            completedData.forEach(exp => {
+                const envVars = exp.env_vars || {};
+                const xVal = envVars[varX.key] !== undefined ? String(envVars[varX.key]) : undefined;
+                const yVal = envVars[varY.key] !== undefined ? String(envVars[varY.key]) : undefined;
+                if (xVal !== undefined && yVal !== undefined) {
+                    if (!cellLosses[yVal]) cellLosses[yVal] = {};
+                    if (!cellExps[yVal]) cellExps[yVal] = {};
+                    if (!cellLosses[yVal][xVal]) cellLosses[yVal][xVal] = [];
+                    if (!cellExps[yVal][xVal]) cellExps[yVal][xVal] = [];
+                    if (exp.final_val_loss != null) {
+                        cellLosses[yVal][xVal].push(exp.final_val_loss);
+                    }
+                    cellExps[yVal][xVal].push(exp);
+                }
+            });
+
+            // Compute mean for each cell
+            const matrix = {};
+            const cellData = {};
+            varY.values.forEach(yVal => {
+                matrix[yVal] = {};
+                cellData[yVal] = {};
+                varX.values.forEach(xVal => {
+                    const losses = cellLosses[yVal]?.[xVal] || [];
+                    matrix[yVal][xVal] = losses.length > 0
+                        ? losses.reduce((a, b) => a + b, 0) / losses.length
+                        : null;
+                    cellData[yVal][xVal] = {
+                        exp: cellExps[yVal]?.[xVal]?.[0],
+                        count: cellExps[yVal]?.[xVal]?.length || 0,
+                        allExps: cellExps[yVal]?.[xVal] || []
+                    };
+                });
+            });
+
+            return {
+                dim: 2,
+                varX: varX.key,
+                varY: varY.key,
+                xValues: varX.values,
+                yValues: varY.values,
+                matrix,
+                cellData,
+                minLoss,
+                maxLoss,
+                sweptVars
+            };
+        }
+
+        // Get color for a val_loss value (green = low/good, red = high/bad)
+        function getHeatmapColor(valLoss, minLoss, maxLoss) {
+            if (valLoss == null) return 'var(--bg-dark)';
+
+            // Normalize to 0-1 range
+            const range = maxLoss - minLoss;
+            const normalized = range > 0 ? (valLoss - minLoss) / range : 0.5;
+
+            // Green (good) to Red (bad) gradient
+            // Low loss (0) = green (#5a9a5e), High loss (1) = red (#e07570)
+            const r = Math.round(90 + normalized * (224 - 90));
+            const g = Math.round(154 - normalized * (154 - 117));
+            const b = Math.round(94 - normalized * (94 - 112));
+
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        // Render variable toggle controls for heatmap
+        function renderHeatmapControls(sweptVars, selectedVars) {
+            if (!sweptVars || sweptVars.length < 2) return '';
+
+            return `
+                <div class="heatmap-var-toggles">
+                    ${sweptVars.map(v => {
+                        const isActive = selectedVars.includes(v.key);
+                        return `<button class="heatmap-var-toggle${isActive ? ' active' : ''}"
+                            onclick="toggleHeatmapVar('${v.key}')">${v.key}</button>`;
+                    }).join('')}
+                </div>
+            `;
+        }
+
+        // Toggle a var on/off for heatmap display
+        function toggleHeatmapVar(varName) {
+            const idx = heatmapSelectedVars.indexOf(varName);
+            if (idx >= 0) {
+                // Already selected - remove it (but keep at least 1)
+                if (heatmapSelectedVars.length > 1) {
+                    heatmapSelectedVars.splice(idx, 1);
+                }
+            } else {
+                // Not selected - add it
+                if (heatmapSelectedVars.length >= 2) {
+                    // Remove oldest selection to make room
+                    heatmapSelectedVars.shift();
+                }
+                heatmapSelectedVars.push(varName);
+            }
+            // Re-render heatmap with new selection
+            switchChartView('heatmap', false);
+        }
+
+        // Render the heatmap (1D or 2D)
+        function renderHeatmap(heatmapData) {
+            if (!heatmapData) return '';
+
+            const { dim, sweptVars, minLoss, maxLoss } = heatmapData;
+
+            // Get selected var names for controls
+            const selectedVarNames = dim === 1
+                ? [heatmapData.varX]
+                : [heatmapData.varX, heatmapData.varY];
+
+            const controls = renderHeatmapControls(sweptVars, selectedVarNames);
+
+            if (dim === 1) {
+                return renderHeatmap1D(heatmapData, controls);
+            } else {
+                return renderHeatmap2D(heatmapData, controls);
+            }
+        }
+
+        // Render 1D heatmap (horizontal row)
+        function renderHeatmap1D(heatmapData, controls) {
+            const { varX, xValues, values, cellData, minLoss, maxLoss } = heatmapData;
+
+            // Find best (lowest) val_loss
+            let bestX = null, bestLoss = Infinity;
+            xValues.forEach(x => {
+                const loss = values[x];
+                if (loss != null && loss < bestLoss) {
+                    bestLoss = loss;
+                    bestX = x;
+                }
+            });
+
+            const compact = xValues.length > 6 ? ' heatmap-compact' : '';
+
+            return `
+                <div class="heatmap-panel${compact}">
+                    <div class="heatmap-content">
+                        ${controls}
+                        <div class="heatmap-1d">
+                            <div class="heatmap-1d-label">${varX}</div>
+                            <div class="heatmap-1d-cells">
+                                ${xValues.map(x => {
+                                    const val = values[x];
+                                    const color = getHeatmapColor(val, minLoss, maxLoss);
+                                    const isBest = (x === bestX);
+                                    const cell = cellData[x];
+                                    const count = cell?.count || 0;
+                                    const allExpIds = cell?.allExps?.map(e => e.id) || [];
+                                    const isSelected = selectedCellExpIds
+                                        ? allExpIds.some(id => selectedCellExpIds.includes(id))
+                                        : allExpIds.includes(selectedRunId);
+                                    const countLabel = count > 1 ? ` (n=${count})` : '';
+                                    const title = val != null
+                                        ? `${varX}=${x}\nMean Val Loss: ${val.toFixed(4)}${countLabel}`
+                                        : `${varX}=${x}\nNo data`;
+                                    const countDisplay = count > 1 ? `<span class="cell-count">${count}</span>` : '';
+                                    return `
+                                        <div class="heatmap-1d-cell-wrapper">
+                                            <div class="heatmap-cell${isBest ? ' best' : ''}${isSelected ? ' selected' : ''}"
+                                                style="background-color: ${color}"
+                                                title="${title}"
+                                                data-exp-ids="${allExpIds.join(',')}"
+                                                ${allExpIds.length > 0 ? `onclick="selectHeatmapCell([${allExpIds.join(',')}])"` : ''}>
+                                                ${val != null ? val.toFixed(4) : '-'}${countDisplay}
+                                            </div>
+                                            <div class="heatmap-1d-col-label">${x}</div>
+                                        </div>`;
+                                }).join('')}
+                            </div>
+                            <div class="heatmap-legend">
+                                <span class="legend-label">${maxLoss.toFixed(4)}</span>
+                                <div class="legend-gradient"></div>
+                                <span class="legend-label">${minLoss.toFixed(4)}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Render 2D heatmap (grid)
+        function renderHeatmap2D(heatmapData, controls) {
+            const { varX, varY, xValues, yValues, matrix, cellData, minLoss, maxLoss } = heatmapData;
+
+            // Find the best (lowest) val_loss coordinates
+            let bestX = null, bestY = null, bestLoss = Infinity;
+            yValues.forEach(y => {
+                xValues.forEach(x => {
+                    const loss = matrix[y]?.[x];
+                    if (loss != null && loss < bestLoss) {
+                        bestLoss = loss;
+                        bestX = x;
+                        bestY = y;
+                    }
+                });
+            });
+
+            const numCols = xValues.length;
+            const compact = numCols > 6 ? ' heatmap-compact' : '';
+            // Reverse Y values so larger values are at top
+            const yValuesReversed = [...yValues].reverse();
+            return `
+                <div class="heatmap-panel${compact}">
+                    <div class="heatmap-content">
+                        ${controls}
+                        <div class="heatmap-container">
+                            <div class="heatmap-main">
+                                <div class="heatmap-grid-row">
+                                    <div class="heatmap-y-label">${varY}</div>
+                                    <div class="heatmap-grid" style="grid-template-columns: auto repeat(${numCols}, minmax(0, 1fr));">
+                                        ${yValuesReversed.map(y => `
+                                            <div class="heatmap-row-label">${y}</div>
+                                            ${xValues.map(x => {
+                                                const val = matrix[y]?.[x];
+                                                const color = getHeatmapColor(val, minLoss, maxLoss);
+                                                const isBest = (x === bestX && y === bestY);
+                                                const cell = cellData[y]?.[x];
+                                                const count = cell?.count || 0;
+                                                const allExpIds = cell?.allExps?.map(e => e.id) || [];
+                                                const isSelected = selectedCellExpIds
+                                                    ? allExpIds.some(id => selectedCellExpIds.includes(id))
+                                                    : allExpIds.includes(selectedRunId);
+                                                const countLabel = count > 1 ? ` (n=${count})` : '';
+                                                const title = val != null
+                                                    ? `${varX}=${x}, ${varY}=${y}\nMean Val Loss: ${val.toFixed(4)}${countLabel}`
+                                                    : `${varX}=${x}, ${varY}=${y}\nNo data`;
+                                                const countDisplay = count > 1 ? `<span class="cell-count">${count}</span>` : '';
+                                                return `<div class="heatmap-cell${isBest ? ' best' : ''}${isSelected ? ' selected' : ''}"
+                                                    style="background-color: ${color}"
+                                                    title="${title}"
+                                                    data-exp-ids="${allExpIds.join(',')}"
+                                                    ${allExpIds.length > 0 ? `onclick="selectHeatmapCell([${allExpIds.join(',')}])"` : ''}>
+                                                    ${val != null ? val.toFixed(4) : '-'}${countDisplay}
+                                                </div>`;
+                                            }).join('')}
+                                        `).join('')}
+                                        <div class="heatmap-row-label"></div>
+                                        ${xValues.map(x => `<div class="heatmap-col-label">${x}</div>`).join('')}
+                                    </div>
+                                    <div class="heatmap-legend">
+                                        <span class="legend-label">${maxLoss.toFixed(4)}</span>
+                                        <div class="legend-gradient"></div>
+                                        <span class="legend-label">${minLoss.toFixed(4)}</span>
+                                    </div>
+                                </div>
+                                <div class="heatmap-x-label">${varX}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function selectHeatmapCell(expIds) {
+            // expIds is an array of all experiment IDs in this cell
+            if (!expIds || expIds.length === 0) return;
+
+            if (expIds.length === 1) {
+                // Single experiment - use existing logic
+                showMetricsForRun(expIds[0]);
+            } else {
+                // Multiple experiments - select all of them
+                // Toggle off if same cell is clicked again
+                const sameCell = selectedCellExpIds &&
+                    selectedCellExpIds.length === expIds.length &&
+                    expIds.every(id => selectedCellExpIds.includes(id));
+
+                if (sameCell) {
+                    // Deselect - show averaged across all runs
+                    selectedCellExpIds = null;
+                    selectedRunId = null;
+                    const url = new URL(window.location);
+                    url.searchParams.delete('run');
+                    window.history.replaceState({}, '', url);
+                    showAveragedMetrics();
+                } else {
+                    // Select this cell's experiments
+                    selectedCellExpIds = expIds;
+                    selectedRunId = null;  // Clear individual selection
+                    const url = new URL(window.location);
+                    url.searchParams.delete('run');
+                    window.history.replaceState({}, '', url);
+                    // Show averaged metrics for just these runs
+                    showAveragedMetricsForCell(expIds);
+                }
+                updateRunRowHighlights();
+                updateHeatmapHighlights();
+            }
+        }
+
+        function showAveragedMetricsForCell(expIds) {
+            if (!currentValidData) return;
+            const cellData = currentValidData.filter(d => expIds.includes(d.id));
+            if (cellData.length === 0) return;
+            const allCurves = cellData.map(d => d.loss_curve);
+            const averaged = computeAveragedMetrics(allCurves);
+            updateMetricsTable(averaged, true, null);
+        }
+
+        // Chart view management
+        let currentChartView = null;
+        let currentTotalSteps = 0;
+        let heatmapSelectedVars = [];  // Track selected vars for heatmap (max 2)
+        let heatmapDefaults = {};      // { varName: defaultValue } for partial env vars
+        let currentCodeHash = null;    // Code hash of currently selected experiment
+
+        // Detect env var keys that are present in some but not all completed experiments
+        function detectPartialVars(validData) {
+            const completedData = validData.filter(d => d.status === 'completed');
+            if (completedData.length < 2) return [];
+            const keyCounts = {};
+            completedData.forEach(exp => {
+                Object.keys(exp.env_vars || {}).forEach(key => {
+                    keyCounts[key] = (keyCounts[key] || 0) + 1;
+                });
+            });
+            return Object.entries(keyCounts)
+                .filter(([key, count]) => count > 0 && count < completedData.length)
+                .map(([key]) => key);
+        }
+
+        // Fill in missing env vars for partial vars (with user-specified default or "(default)" marker)
+        function applyHeatmapDefaults(validData, defaults, partialVars) {
+            if (!partialVars || partialVars.length === 0) return validData;
+            return validData.map(d => {
+                const envVars = { ...(d.env_vars || {}) };
+                let changed = false;
+                for (const key of partialVars) {
+                    if (envVars[key] === undefined) {
+                        envVars[key] = (defaults[key] !== undefined && defaults[key] !== '')
+                            ? defaults[key]
+                            : '(default)';
+                        changed = true;
+                    }
+                }
+                return changed ? { ...d, env_vars: envVars } : d;
+            });
+        }
+
+        // Get preprocessed data with defaults applied
+        function getHeatmapData(validData) {
+            const partialVars = detectPartialVars(validData);
+            const processed = applyHeatmapDefaults(validData, heatmapDefaults, partialVars);
+            return { processed, partialVars };
+        }
+
+        // Load/save heatmap defaults from localStorage
+        function loadHeatmapDefaults(codeHash) {
+            if (!codeHash) return {};
+            try {
+                return JSON.parse(localStorage.getItem(`heatmap_defaults_${codeHash}`) || '{}');
+            } catch { return {}; }
+        }
+        function saveHeatmapDefaults(codeHash, defaults) {
+            if (!codeHash) return;
+            const cleaned = Object.fromEntries(
+                Object.entries(defaults).filter(([k, v]) => v !== undefined && v !== '')
+            );
+            if (Object.keys(cleaned).length > 0) {
+                localStorage.setItem(`heatmap_defaults_${codeHash}`, JSON.stringify(cleaned));
+            } else {
+                localStorage.removeItem(`heatmap_defaults_${codeHash}`);
+            }
+        }
+
+        function getEligibleViews(validData) {
+            const views = [];
+            const completedData = validData.filter(d => d.status === 'completed');
+            const runningOrCompleted = validData.filter(d =>
+                d.status === 'running' || d.status === 'completed'
+            );
+
+            // Heatmap: 1+ swept vars (including partial vars with defaults applied), ≥1 completed
+            // Disabled in bucket view — hyperparams from different scripts don't mix
+            if (!isBucketView()) {
+                const { processed } = getHeatmapData(validData);
+                if (computeHeatmapData(processed)) views.push('heatmap');
+            }
+
+            // Residual: ≥2 completed
+            if (completedData.length >= 2) views.push('residual');
+
+            // Line: ≥1 running/completed
+            if (runningOrCompleted.length >= 1) views.push('line');
+
+            return views;
+        }
+
+        function computeResidualData(validData) {
+            // Filter to completed experiments only
+            const completedData = validData.filter(d => d.status === 'completed');
+            if (completedData.length < 2) return null;
+
+            // Collect all loss curves
+            const curves = completedData.map(d => ({
+                id: d.id,
+                name: d.name,
+                script: d.script,
+                env_vars: d.env_vars,
+                data: d.loss_curve || []
+            })).filter(c => c.data.length > 0);
+
+            if (curves.length < 2) return null;
+
+            // Group losses by step across all curves
+            const lossesByStep = {};
+            curves.forEach(curve => {
+                curve.data.forEach(point => {
+                    if (!lossesByStep[point.step]) lossesByStep[point.step] = [];
+                    lossesByStep[point.step].push({
+                        curveId: curve.id,
+                        loss: point.val_loss
+                    });
+                });
+            });
+
+            // Only keep steps where we have at least 2 runs
+            const validSteps = Object.keys(lossesByStep)
+                .map(s => parseInt(s))
+                .filter(step => lossesByStep[step].length >= 2)
+                .sort((a, b) => a - b);
+
+            if (validSteps.length === 0) return null;
+
+            // Compute median at each step
+            const medianByStep = {};
+            validSteps.forEach(step => {
+                const losses = lossesByStep[step].map(d => d.loss).filter(l => l != null).sort((a, b) => a - b);
+                if (losses.length > 0) {
+                    const mid = Math.floor(losses.length / 2);
+                    medianByStep[step] = losses.length % 2 === 0
+                        ? (losses[mid - 1] + losses[mid]) / 2
+                        : losses[mid];
+                }
+            });
+
+            // Build residual data for each curve
+            const residualCurves = curves.map(curve => {
+                const residuals = curve.data
+                    .filter(point => medianByStep[point.step] !== undefined && point.val_loss != null)
+                    .map(point => ({
+                        step: point.step,
+                        residual: point.val_loss - medianByStep[point.step]
+                    }));
+                return {
+                    id: curve.id,
+                    name: curve.name,
+                    script: curve.script,
+                    env_vars: curve.env_vars,
+                    residuals
+                };
+            }).filter(c => c.residuals.length > 0);
+
+            return residualCurves;
+        }
+
+        function updateViewSwitcher(eligibleViews) {
+            const switcher = document.getElementById('chart-view-switcher');
+            const buttons = switcher.querySelectorAll('.chart-view-btn');
+
+            buttons.forEach(btn => {
+                const view = btn.dataset.view;
+                if (eligibleViews.includes(view)) {
+                    btn.classList.remove('hidden');
+                } else {
+                    btn.classList.add('hidden');
+                }
+            });
+
+            // Hide switcher entirely if only one view available
+            if (eligibleViews.length <= 1) {
+                switcher.style.display = 'none';
+            } else {
+                switcher.style.display = 'flex';
+            }
+        }
+
+        function switchChartView(viewName, updateUrl = true) {
+            if (!currentValidData) return;
+
+            currentChartView = viewName;
+
+            // Update URL with chart param
+            if (updateUrl) {
+                const url = new URL(window.location);
+                url.searchParams.set('chart', viewName);
+                window.history.replaceState({}, '', url);
+            }
+
+            // Update button highlights
+            const buttons = document.querySelectorAll('.chart-view-btn');
+            buttons.forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === viewName);
+            });
+
+            const chartContainer = document.querySelector('.chart-container');
+            const canvas = document.getElementById('loss-chart');
+            const heatmapContainer = document.getElementById('chart-heatmap-container');
+
+            // Toggle view classes for proper sizing
+            chartContainer.classList.toggle('heatmap-view', viewName === 'heatmap');
+            chartContainer.classList.toggle('residual-view', viewName === 'residual');
+
+            // Clear legend and range when not in line/residual view
+            const legendEl = document.getElementById('chart-legend');
+            const rangeEl = document.getElementById('chart-range');
+            if (viewName !== 'line' && viewName !== 'residual') {
+                if (legendEl) legendEl.innerHTML = '';
+            }
+            if (viewName !== 'line' && viewName !== 'residual') {
+                if (rangeEl) rangeEl.innerHTML = '';
+            }
+
+            switch (viewName) {
+                case 'heatmap':
+                    canvas.style.display = 'none';
+                    heatmapContainer.style.display = 'block';
+                    // Apply defaults for partial env vars before computing heatmap
+                    const { processed: heatmapProcessed, partialVars } = getHeatmapData(getVisibleRuns());
+                    // First compute with null to get sweptVars, then init selectedVars if needed
+                    const initialData = computeHeatmapData(heatmapProcessed, null);
+                    if (initialData && initialData.sweptVars) {
+                        // Initialize selectedVars if empty or invalid
+                        const validVarNames = initialData.sweptVars.map(v => v.key);
+                        const validSelected = heatmapSelectedVars.filter(v => validVarNames.includes(v));
+                        if (validSelected.length === 0) {
+                            // Auto-select first 2 (or 1)
+                            heatmapSelectedVars = validVarNames.slice(0, 2);
+                        } else {
+                            heatmapSelectedVars = validSelected;
+                        }
+                    }
+                    const heatmapData = computeHeatmapData(heatmapProcessed, heatmapSelectedVars);
+                    heatmapContainer.innerHTML = renderHeatmap(heatmapData);
+                    break;
+                case 'residual':
+                    canvas.style.display = 'block';
+                    heatmapContainer.style.display = 'none';
+                    renderResidualChart(computeResidualData(getVisibleRuns()));
+                    break;
+                case 'line':
+                    canvas.style.display = 'block';
+                    heatmapContainer.style.display = 'none';
+                    const runs = getVisibleRuns().map(d => ({
+                        name: d.name,
+                        script: d.script,
+                        data: d.loss_curve,
+                        env_vars: d.env_vars
+                    }));
+                    updateChartMultiple(runs, currentTotalSteps);
+                    break;
+            }
+        }
+
+        function renderResidualChart(residualData) {
+            const ctx = document.getElementById('loss-chart').getContext('2d');
+
+            if (lossChart) {
+                lossChart.destroy();
+            }
+
+            if (!residualData || residualData.length === 0) {
+                return;
+            }
+
+            const multiRun = residualData.length > 1;
+
+            // Sort by env vars for consistent colors
+            const diffKeys = getDifferingKeys(residualData);
+            if (multiRun && diffKeys.length > 0) {
+                residualData.sort((a, b) => {
+                    for (const k of diffKeys) {
+                        const va = (a.env_vars || {})[k] ?? '';
+                        const vb = (b.env_vars || {})[k] ?? '';
+                        const na = parseFloat(va), nb = parseFloat(vb);
+                        if (!isNaN(na) && !isNaN(nb)) {
+                            if (na !== nb) return na - nb;
+                        } else {
+                            if (va < vb) return -1;
+                            if (va > vb) return 1;
+                        }
+                    }
+                    return 0;
+                });
+            }
+
+            // Render legend
+            renderChartLegend(residualData);
+
+            const labels = computeSmartLabels(residualData);
+
+            // Find step range
+            const allSteps = residualData.flatMap(c => c.residuals.map(r => r.step));
+            const dataXMin = Math.min(...allSteps);
+            const maxStep = Math.max(...allSteps);
+
+            // Initialize x range if not set
+            if (!chartXRange) chartXRange = { min: dataXMin, max: maxStep };
+
+            // Render range controls
+            const rangeEl = document.getElementById('chart-range');
+            if (rangeEl && multiRun) {
+                rangeEl.innerHTML = `<div class="chart-range-controls">
+                    <span class="chart-range-text">Step
+                        <span class="runs-limit-editable" onclick="makeChartRangeEditable(this, 'min')" title="Click to edit">${chartXRange.min}</span>
+                        –
+                        <span class="runs-limit-editable" onclick="makeChartRangeEditable(this, 'max')" title="Click to edit">${chartXRange.max}</span>
+                    </span>
+                </div>`;
+            }
+
+            // Create datasets
+            const datasets = residualData.map((curve, i) => {
+                const color = CHART_COLORS[i % CHART_COLORS.length];
+
+                return {
+                    label: multiRun ? labels[i] : 'Residual',
+                    data: curve.residuals.map(d => ({ x: d.step, y: d.residual })),
+                    borderColor: color,
+                    backgroundColor: color,
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    fill: false,
+                    tension: 0.1
+                };
+            });
+
+            // Add zero line as a dataset (no plugin needed)
+            datasets.push({
+                label: 'Median',
+                data: [{ x: 0, y: 0 }, { x: maxStep, y: 0 }],
+                borderColor: '#666',
+                borderWidth: 1,
+                borderDash: [5, 5],
+                pointRadius: 0,
+                fill: false
+            });
+
+            // Find residual range - tight fit with minimal padding
+            const allResiduals = residualData.flatMap(c => c.residuals.map(r => r.residual));
+            const minResidual = Math.min(...allResiduals);
+            const maxResidual = Math.max(...allResiduals);
+            const absMax = Math.max(Math.abs(minResidual), Math.abs(maxResidual));
+            const yRange = Math.max(absMax * 1.05, 0.02); // 5% padding, min 0.02 range
+
+            const stepInterval = detectStepInterval(residualData.map(c => ({ data: c.residuals.map(r => ({ step: r.step })) })));
+
+            lossChart = new Chart(ctx, {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: false },
+                            grid: { color: '#333' },
+                            ticks: {
+                                color: '#888',
+                                stepSize: stepInterval,
+                                callback: (v) => Number.isInteger(v) ? v.toLocaleString() : ''
+                            },
+                            min: chartXRange.min,
+                            max: chartXRange.max
+                        },
+                        y: {
+                            title: { display: true, text: 'Residual (Loss - Median)', color: '#888' },
+                            grid: { color: '#333' },
+                            ticks: { color: '#888' },
+                            min: -yRange,
+                            max: yRange
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false,
+                            labels: {
+                                color: '#aaa',
+                                usePointStyle: true,
+                                pointStyle: 'line',
+                                filter: (item) => item.text !== 'Median'
+                            },
+                            onHover: (e) => { e.native.target.style.cursor = 'pointer'; },
+                            onLeave: (e) => { e.native.target.style.cursor = 'default'; }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: (ctx) => {
+                                    if (ctx.dataset.label === 'Median') return null;
+                                    return `${ctx.dataset.label}: ${ctx.parsed.y >= 0 ? '+' : ''}${ctx.parsed.y.toFixed(4)}`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function detectStepInterval(runs) {
+            // Try to detect measurement frequency from the data
+            for (const run of runs) {
+                if (run.data && run.data.length >= 2) {
+                    const steps = run.data.map(d => d.step).sort((a, b) => a - b);
+                    // Find the most common interval between consecutive steps
+                    const intervals = [];
+                    for (let i = 1; i < steps.length; i++) {
+                        const interval = steps[i] - steps[i - 1];
+                        if (interval > 0) intervals.push(interval);
+                    }
+                    if (intervals.length > 0) {
+                        // Use the most common interval (mode)
+                        const counts = {};
+                        intervals.forEach(i => counts[i] = (counts[i] || 0) + 1);
+                        const mode = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+                        if (mode) return parseInt(mode[0]);
+                    }
+                }
+            }
+            return 250; // Default fallback
+        }
+
+        // Find env var keys whose values differ across runs
+        function getDifferingKeys(runs) {
+            const allKeys = new Set();
+            runs.forEach(r => Object.keys(r.env_vars || {}).forEach(k => allKeys.add(k)));
+            const differing = [];
+            for (const key of allKeys) {
+                const vals = new Set(runs.map(r => String((r.env_vars || {})[key] ?? '')));
+                if (vals.size > 1) differing.push(key);
+            }
+            return differing;
+        }
+
+        // Compute smart labels: only env var values that differ across runs
+        function computeSmartLabels(runs) {
+            if (runs.length <= 1) return runs.map(() => 'Validation Loss');
+            const differingKeys = getDifferingKeys(runs);
+
+            return runs.map((run, i) => {
+                const env = run.env_vars || {};
+                const scriptLabel = run.script ? run.script.split('/').pop().replace('.py', '') : run.name;
+                if (differingKeys.length === 0) {
+                    return isBucketView() ? scriptLabel : `Run ${i + 1}`;
+                }
+                const parts = differingKeys.map(k => env[k] ?? '').join(', ');
+                return isBucketView() ? `${scriptLabel} (${parts})` : parts;
+            });
+        }
+
+        let chartXRange = null;  // { min, max } or null for auto
+
+        function renderChartLegend(runs) {
+            const legendEl = document.getElementById('chart-legend');
+            if (!legendEl || runs.length <= 1) {
+                if (legendEl) legendEl.innerHTML = '';
+                return;
+            }
+            const diffKeys = getDifferingKeys(runs);
+            const showScript = isBucketView() || new Set(runs.map(r => r.script || r.name)).size > 1;
+            let headerCols = showScript ? '<th>Script</th>' : '';
+            headerCols += diffKeys.length > 0
+                ? diffKeys.map(k => `<th>${k}</th>`).join('')
+                : (!showScript ? '<th>Run</th>' : '');
+            const rows = runs.map((run, i) => {
+                const color = CHART_COLORS[i % CHART_COLORS.length];
+                const env = run.env_vars || {};
+                const scriptCell = showScript ? `<td>${run.script ? run.script.split('/').pop().replace('.py', '') : run.name}</td>` : '';
+                const envCells = diffKeys.length > 0
+                    ? diffKeys.map(k => `<td>${env[k] ?? ''}</td>`).join('')
+                    : (!showScript ? `<td>${run.script ? run.script.split('/').pop().replace('.py', '') : run.name}</td>` : '');
+                return `<tr class="chart-legend-row" data-idx="${i}" onclick="toggleChartDataset(${i})" onmouseenter="highlightChartDataset(${i})" onmouseleave="unhighlightChartDataset()">
+                    <td class="chart-legend-swatch-cell"><span class="chart-legend-swatch" style="background:${color}"></span></td>
+                    ${scriptCell}${envCells}
+                </tr>`;
+            }).join('');
+            legendEl.innerHTML = `<table class="chart-legend-table">
+                <thead><tr><th></th>${headerCols}</tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        }
+
+        function updateChartMultiple(runs, totalSteps = 0) {
+            const ctx = document.getElementById('loss-chart').getContext('2d');
+
+            if (lossChart) {
+                lossChart.destroy();
+            }
+
+            const legendEl = document.getElementById('chart-legend');
+            const rangeEl = document.getElementById('chart-range');
+
+            // Filter runs with data
+            const validRuns = runs.filter(r => r.data && r.data.length > 0);
+            if (validRuns.length === 0) {
+                legendEl.innerHTML = '';
+                rangeEl.innerHTML = '';
+                return;
+            }
+
+            const isMulti = validRuns.length > 1;
+
+            // Sort runs by differing env var values for consistent color assignment
+            const diffKeys = getDifferingKeys(validRuns);
+            if (isMulti && diffKeys.length > 0) {
+                validRuns.sort((a, b) => {
+                    for (const k of diffKeys) {
+                        const va = (a.env_vars || {})[k] ?? '';
+                        const vb = (b.env_vars || {})[k] ?? '';
+                        const na = parseFloat(va), nb = parseFloat(vb);
+                        if (!isNaN(na) && !isNaN(nb)) {
+                            if (na !== nb) return na - nb;
+                        } else {
+                            if (va < vb) return -1;
+                            if (va > vb) return 1;
+                        }
+                    }
+                    return 0;
+                });
+            }
+
+            const labels = computeSmartLabels(validRuns);
+
+            // Create datasets
+            const datasets = validRuns.map((run, i) => {
+                const color = CHART_COLORS[i % CHART_COLORS.length];
+                return {
+                    label: labels[i],
+                    data: run.data.map(d => ({ x: d.step, y: d.val_loss })),
+                    borderColor: color,
+                    backgroundColor: color + '20',
+                    fill: !isMulti,
+                    tension: 0.1,
+                    pointRadius: isMulti ? 0 : 3,
+                    borderWidth: isMulti ? 1.5 : 2,
+                };
+            });
+
+            // Compute x range for slider
+            const allSteps = validRuns.flatMap(r => r.data.map(d => d.step));
+            const dataXMin = Math.min(...allSteps);
+            const dataXMax = Math.max(...allSteps);
+            const xMax = totalSteps > 0 ? Math.max(totalSteps, dataXMax) : dataXMax;
+
+            // Initialize range if not set
+            if (!chartXRange) chartXRange = { min: dataXMin, max: xMax };
+
+            const stepInterval = detectStepInterval(validRuns);
+
+            // Render compact legend table
+            renderChartLegend(validRuns);
+
+            // Render range controls (inline-editable)
+            rangeEl.innerHTML = `
+                <div class="chart-range-controls">
+                    <span class="chart-range-text">Step
+                        <span class="runs-limit-editable" onclick="makeChartRangeEditable(this, 'min')" title="Click to edit">${chartXRange.min}</span>
+                        –
+                        <span class="runs-limit-editable" onclick="makeChartRangeEditable(this, 'max')" title="Click to edit">${chartXRange.max}</span>
+                    </span>
+                </div>
+            `;
+
+            lossChart = new Chart(ctx, {
+                type: 'line',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                        mode: 'x',
+                        intersect: false
+                    },
+                    hover: {
+                        mode: 'x',
+                        intersect: false
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: false },
+                            min: chartXRange.min,
+                            max: chartXRange.max,
+                            ticks: { stepSize: stepInterval, callback: (v) => Number.isInteger(v) ? v.toLocaleString() : '' },
+                            grid: { color: 'rgba(255, 255, 255, 0.15)', lineWidth: 1 }
+                        },
+                        y: {
+                            title: { display: false },
+                            grid: { color: 'rgba(255, 255, 255, 0.15)', lineWidth: 1 }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            mode: 'x',
+                            intersect: false,
+                            callbacks: {
+                                title: function(items) {
+                                    return items.length > 0 ? 'Step ' + items[0].parsed.x : '';
+                                },
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    return value !== null ? context.dataset.label + ': ' + value.toFixed(4) : null;
+                                },
+                                labelColor: function(context) {
+                                    return { borderColor: context.dataset.borderColor, backgroundColor: context.dataset.borderColor };
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function toggleChartDataset(idx) {
+            if (!lossChart) return;
+            const meta = lossChart.getDatasetMeta(idx);
+            meta.hidden = !meta.hidden;
+            lossChart.update();
+            const rows = document.querySelectorAll('.chart-legend-row');
+            if (rows[idx]) rows[idx].classList.toggle('hidden', meta.hidden);
+        }
+
+        let _chartOriginalColors = [];
+
+        function highlightChartDataset(idx) {
+            if (!lossChart) return;
+            if (_chartOriginalColors.length === 0) {
+                _chartOriginalColors = lossChart.data.datasets.map(ds => ds.borderColor);
+            }
+            lossChart.data.datasets.forEach((ds, i) => {
+                if (i === idx) {
+                    ds.borderWidth = 3;
+                    ds.borderColor = _chartOriginalColors[i];
+                } else {
+                    ds.borderWidth = 0.5;
+                    ds.borderColor = _chartOriginalColors[i] + '33';
+                }
+            });
+            lossChart.update('none');
+        }
+
+        function unhighlightChartDataset() {
+            if (!lossChart) return;
+            const isMulti = lossChart.data.datasets.length > 1;
+            lossChart.data.datasets.forEach((ds, i) => {
+                ds.borderWidth = isMulti ? 1.5 : 2;
+                if (_chartOriginalColors[i]) ds.borderColor = _chartOriginalColors[i];
+            });
+            _chartOriginalColors = [];
+            lossChart.update('none');
+        }
+
+        function makeChartRangeEditable(el, which) {
+            const current = chartXRange ? chartXRange[which] : 0;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = current;
+            input.className = 'runs-limit-inline';
+            input.size = String(current).length || 4;
+
+            const commit = () => {
+                const n = parseInt(input.value);
+                if (!isNaN(n) && n >= 0 && chartXRange) {
+                    chartXRange[which] = n;
+                    if (chartXRange.min > chartXRange.max) {
+                        const tmp = chartXRange.min;
+                        chartXRange.min = chartXRange.max;
+                        chartXRange.max = tmp;
+                    }
+                    if (lossChart) {
+                        lossChart.options.scales.x.min = chartXRange.min;
+                        lossChart.options.scales.x.max = chartXRange.max;
+                        lossChart.update('none');
+                    }
+                }
+                // Re-render range text
+                if (currentChartView) switchChartView(currentChartView, false);
+            };
+
+            input.addEventListener('keydown', e => {
+                if (e.key === 'Enter') { e.preventDefault(); commit(); }
+                if (e.key === 'Escape') { e.preventDefault(); if (currentChartView) switchChartView(currentChartView, false); }
+            });
+            input.addEventListener('blur', commit);
+
+            el.replaceWith(input);
+            input.focus();
+            input.select();
+        }
+
+        async function deleteExperiment(expId, expName, rowElement) {
+            // Prevent auto-refresh from racing with delete
+            deleteInProgress = true;
+
+            try {
+                const response = await fetch(`/api/experiment/${expId}`, { method: 'DELETE' });
+                const data = await response.json();
+
+                if (data.success) {
+                    // Update selectedExperimentIds to remove deleted experiment
+                    if (selectedExperimentIds) {
+                        selectedExperimentIds = selectedExperimentIds.filter(id => id !== expId);
+                    }
+
+                    // Update currentValidData to remove deleted experiment
+                    if (currentValidData) {
+                        currentValidData = currentValidData.filter(d => d.id !== expId);
+                    }
+
+                    // Clear selectedRunId if it was the deleted experiment
+                    if (selectedRunId === expId) {
+                        selectedRunId = null;
+                    }
+
+                    // Remove the row from DOM immediately
+                    if (rowElement) {
+                        const tbody = rowElement.closest('tbody');
+                        rowElement.remove();
+
+                        // Check if all experiments in group are now deleted
+                        if (!selectedExperimentIds || selectedExperimentIds.length === 0 || (tbody && tbody.children.length === 0)) {
+                            // Clear selection and refresh to update sidebar
+                            selectedExperiment = null;
+                            selectedExperimentIds = null;
+                            currentValidData = null;
+                            await refreshExperiments();
+                        }
+                    } else {
+                        // Fallback: refresh if no row element
+                        if (!selectedExperimentIds || selectedExperimentIds.length === 0) {
+                            selectedExperiment = null;
+                            currentValidData = null;
+                        }
+                        await refreshExperiments();
+                    }
+                } else {
+                    alert('Failed to delete: ' + (data.error || 'Unknown error'));
+                }
+            } finally {
+                deleteInProgress = false;
+            }
+        }
+
+        function toggleSidebar() {
+            if (isMobile()) return;
+            document.getElementById('experiments-panel').classList.toggle('collapsed');
+        }
+
+        async function copyChartAsImage() {
+            const btn = document.querySelector('.chart-copy-btn');
+            const titleInput = document.getElementById('chart-copy-title');
+            const title = titleInput ? titleInput.value.trim() : '';
+
+            let blob;
+            if (currentChartView === 'heatmap') {
+                blob = await copyHeatmapAsImage(title);
+            } else {
+                blob = await copyLineChartAsImage(title);
+            }
+
+            if (blob) {
+                try {
+                    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+                    if (btn) {
+                        btn.classList.add('copied');
+                        setTimeout(() => btn.classList.remove('copied'), 400);
+                    }
+                } catch (e) {
+                    console.error('Failed to copy:', e);
+                }
+            }
+        }
+
+        async function copyLineChartAsImage(title) {
+            if (!lossChart) return null;
+            const chartCanvas = lossChart.canvas;
+            const w = chartCanvas.width;
+            const h = chartCanvas.height;
+            const hasTitle = title.length > 0;
+
+            const pad = { top: hasTitle ? 44 : 10, right: 20, bottom: 44, left: 28 };
+            const offscreen = document.createElement('canvas');
+            offscreen.width = w + pad.left + pad.right;
+            offscreen.height = h + pad.top + pad.bottom;
+            const ctx = offscreen.getContext('2d');
+
+            ctx.fillStyle = '#0f1218';
+            ctx.fillRect(0, 0, offscreen.width, offscreen.height);
+
+            if (hasTitle) {
+                ctx.fillStyle = '#eef';
+                ctx.font = 'bold 24px SF Mono, Menlo, Monaco, monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(title, offscreen.width / 2, 30);
+            }
+
+            ctx.drawImage(chartCanvas, pad.left, pad.top);
+
+            ctx.fillStyle = '#aaa';
+            ctx.font = '18px SF Mono, Menlo, Monaco, monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Step', pad.left + w / 2, pad.top + h + 32);
+
+            ctx.save();
+            ctx.font = '18px SF Mono, Menlo, Monaco, monospace';
+            ctx.translate(16, pad.top + h / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText('Val Loss', 0, 0);
+            ctx.restore();
+
+            return new Promise(resolve => offscreen.toBlob(resolve, 'image/png'));
+        }
+
+        async function copyHeatmapAsImage(title) {
+            // Re-compute heatmap data from current visible runs
+            const { processed } = getHeatmapData(getVisibleRuns());
+            const data = computeHeatmapData(processed, heatmapSelectedVars);
+            if (!data) return null;
+
+            const font = '16px SF Mono, Menlo, Monaco, monospace';
+            const titleFont = 'bold 22px SF Mono, Menlo, Monaco, monospace';
+            const labelFont = '16px SF Mono, Menlo, Monaco, monospace';
+            const cellW = 100;
+            const cellH = 50;
+            const cellPad = 1;
+            const hasTitle = title.length > 0;
+            const pad = { top: hasTitle ? 60 : 20, right: 30, bottom: 50, left: 110 };
+
+            if (data.dim === 1) {
+                const nCols = data.xValues.length;
+                const w = pad.left + nCols * (cellW + cellPad) + pad.right;
+                const h = pad.top + cellH + pad.bottom;
+                const offscreen = document.createElement('canvas');
+                offscreen.width = w;
+                offscreen.height = h;
+                const ctx = offscreen.getContext('2d');
+
+                ctx.fillStyle = '#0f1218';
+                ctx.fillRect(0, 0, w, h);
+
+                if (hasTitle) {
+                    ctx.fillStyle = '#eef';
+                    ctx.font = titleFont;
+                    ctx.textAlign = 'center';
+                    ctx.fillText(title, w / 2, 34);
+                }
+
+                ctx.fillStyle = '#aaa';
+                ctx.font = labelFont;
+                ctx.textAlign = 'right';
+                ctx.fillText(data.varX, pad.left - 10, pad.top + cellH / 2 + 6);
+
+                data.xValues.forEach((xVal, xi) => {
+                    const x = pad.left + xi * (cellW + cellPad);
+                    const y = pad.top;
+                    const val = data.values[xVal];
+                    ctx.fillStyle = getHeatmapColor(val, data.minLoss, data.maxLoss);
+                    ctx.fillRect(x, y, cellW, cellH);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = font;
+                    ctx.textAlign = 'center';
+                    ctx.fillText(val != null ? val.toFixed(4) : '–', x + cellW / 2, y + cellH / 2 + 6);
+                    ctx.fillStyle = '#aaa';
+                    ctx.fillText(xVal, x + cellW / 2, y + cellH + 20);
+                });
+
+                return new Promise(resolve => offscreen.toBlob(resolve, 'image/png'));
+            }
+
+            // 2D case
+            const nCols = data.xValues.length;
+            const nRows = data.yValues.length;
+            const gridW = nCols * (cellW + cellPad);
+            const gridH = nRows * (cellH + cellPad);
+            const w = pad.left + gridW + pad.right;
+            const h = pad.top + gridH + pad.bottom;
+            const offscreen = document.createElement('canvas');
+            offscreen.width = w;
+            offscreen.height = h;
+            const ctx = offscreen.getContext('2d');
+
+            ctx.fillStyle = '#0f1218';
+            ctx.fillRect(0, 0, w, h);
+
+            if (hasTitle) {
+                ctx.fillStyle = '#eef';
+                ctx.font = titleFont;
+                ctx.textAlign = 'center';
+                ctx.fillText(title, w / 2, 34);
+            }
+
+            // X-axis label
+            ctx.fillStyle = '#aaa';
+            ctx.font = labelFont;
+            ctx.textAlign = 'center';
+            ctx.fillText(data.varX, pad.left + gridW / 2, h - 10);
+
+            // Y-axis label
+            ctx.save();
+            ctx.font = labelFont;
+            ctx.translate(16, pad.top + gridH / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.textAlign = 'center';
+            ctx.fillText(data.varY, 0, 0);
+            ctx.restore();
+
+            // Draw cells
+            data.yValues.forEach((yVal, yi) => {
+                const y = pad.top + yi * (cellH + cellPad);
+                ctx.fillStyle = '#aaa';
+                ctx.font = font;
+                ctx.textAlign = 'right';
+                ctx.fillText(yVal, pad.left - 8, y + cellH / 2 + 6);
+
+                data.xValues.forEach((xVal, xi) => {
+                    const x = pad.left + xi * (cellW + cellPad);
+                    const val = data.matrix[yVal]?.[xVal];
+                    ctx.fillStyle = getHeatmapColor(val, data.minLoss, data.maxLoss);
+                    ctx.fillRect(x, y, cellW, cellH);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = font;
+                    ctx.textAlign = 'center';
+                    ctx.fillText(val != null ? val.toFixed(4) : '–', x + cellW / 2, y + cellH / 2 + 6);
+                });
+            });
+
+            // X labels at bottom
+            data.xValues.forEach((xVal, xi) => {
+                const x = pad.left + xi * (cellW + cellPad);
+                ctx.fillStyle = '#aaa';
+                ctx.font = font;
+                ctx.textAlign = 'center';
+                ctx.fillText(xVal, x + cellW / 2, pad.top + gridH + 20);
+            });
+
+            return new Promise(resolve => offscreen.toBlob(resolve, 'image/png'));
+        }
+
+        function toggleChartFullscreen() {
+            const chartBlock = document.querySelector('.meta-chart-block');
+            chartBlock.classList.toggle('fullscreen');
+            // Resize chart to fit new container size
+            if (lossChart) {
+                setTimeout(() => lossChart.resize(), 50);
+            }
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            // Don't trigger shortcuts when typing in inputs
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+                return;
+            }
+
+            // Escape - close fullscreen chart
+            if (e.key === 'Escape') {
+                const chartBlock = document.querySelector('.meta-chart-block');
+                if (chartBlock.classList.contains('fullscreen')) {
+                    toggleChartFullscreen();
+                }
+            }
+
+            // B - toggle sidebar
+            if (e.key === 'b' || e.key === 'B') {
+                toggleSidebar();
+            }
+
+            // E - experiments view
+            if (e.key === 'e' || e.key === 'E') {
+                switchView('experiments');
+            }
+
+            // Q - queue view
+            if (e.key === 'q' || e.key === 'Q') {
+                switchView('queue');
+            }
+        });
+
+        async function revealInFinder(expId) {
+            try {
+                const response = await fetch(`/api/reveal/${expId}`, { method: 'POST' });
+                const data = await response.json();
+                if (!data.success) {
+                    console.error('Failed to reveal:', data.error);
+                }
+            } catch (e) {
+                console.error('Failed to reveal:', e);
+            }
+        }
+
+        async function copyToClipboard(text, element) {
+            try {
+                await navigator.clipboard.writeText(text);
+                if (element) {
+                    element.classList.add('copied');
+                    setTimeout(() => element.classList.remove('copied'), 150);
+                }
+            } catch (e) {
+                console.error('Failed to copy:', e);
+            }
+        }
+
+        // View switching
+        let currentView = 'experiments';
+
+        let selectedQueuedScript = null;
+
+        async function goToQueuedItem(scriptPath) {
+            if (!scriptPath) return;
+            selectedQueuedScript = scriptPath;
+            selectedExperiment = null;
+            selectedExperimentIds = null;
+            // Refresh queue to update highlight
+            refreshQueue();
+            // Show the script's diff and notes in the detail panel
+            const detailsEl = document.getElementById('experiment-details');
+            detailsEl.innerHTML = '';
+            document.getElementById('detail-title').textContent = scriptPath.split('/').pop();
+            document.getElementById('meta-row-container').innerHTML = `
+                <div class="meta-row">
+                    <span class="meta-item">${scriptPath}</span>
+                    <span class="meta-sep">·</span>
+                    <span class="meta-item" style="color: var(--warning)">queued</span>
+                </div>
+            `;
+            // Hide chart block and clear metrics
+            const chartBlock = document.querySelector('.meta-chart-block');
+            if (chartBlock) chartBlock.classList.add('no-views');
+            const metricsTable = document.getElementById('metrics-table');
+            if (metricsTable) metricsTable.innerHTML = '';
+
+            // Load diff and notes for this script
+            // Compute code hash from the script path to find a diff
+            try {
+                const resp = await fetch(`/api/env-defaults/${encodeURIComponent(scriptPath)}`);
+                // We just use this to verify the script exists
+            } catch {}
+            // Try loading notes
+            loadNotes(scriptPath);
+            // Try finding the most recent code_hash for this script to load diff
+            try {
+                const resp = await fetch(`/api/experiments?search=${encodeURIComponent(scriptPath.split('/').pop().replace('.py', ''))}&limit=1&aggregate=false`);
+                const data = await resp.json();
+                if (data.experiments && data.experiments.length > 0 && data.experiments[0].code_hash) {
+                    loadDiff(data.experiments[0].code_hash);
+                }
+            } catch {}
+            // Switch to diff tab
+            switchDiffNotesTab('diff');
+        }
+
+        async function goToExperiment(expId) {
+            if (!expId) return;
+            // Fetch this experiment's detail directly
+            try {
+                const resp = await fetch(`/api/experiment/${expId}`);
+                const exp = await resp.json();
+                if (exp.error) return;
+                // Use code_hash to find the full group, or fall back to single ID
+                const codeHash = exp.code_hash;
+                if (codeHash) {
+                    // Find the group from the already-loaded experiments list
+                    const listResp = await fetch(`/api/experiments?search=${codeHash}&limit=1`);
+                    const listData = await listResp.json();
+                    const match = listData.experiments.find(e => e.code_hash === codeHash);
+                    if (match) {
+                        await selectExperiment(match.code_hash, match.experiment_ids || [match.id]);
+                    } else {
+                        await selectExperiment(codeHash, [expId]);
+                    }
+                } else {
+                    await selectExperiment(expId, [expId]);
+                }
+            } catch {
+                await selectExperiment(expId, [expId]);
+            }
+            if (currentView === 'queue') refreshQueue();
+        }
+
+        function switchView(viewName) {
+            currentView = viewName;
+
+            // Update URL with view param
+            const url = new URL(window.location);
+            url.searchParams.set('view', viewName);
+            window.history.replaceState({}, '', url);
+
+            // Update buttons
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === viewName);
+            });
+
+            // Update views
+            document.querySelectorAll('.panel-view').forEach(view => {
+                view.classList.toggle('active', view.id === `${viewName}-view`);
+            });
+
+            // Refresh the active view
+            if (viewName === 'queue') {
+                refreshQueue();
+            } else {
+                refreshExperiments();
+            }
+        }
+
+        async function refreshQueueCount() {
+            try {
+                const response = await fetch('/api/queue');
+                const data = await response.json();
+                const runningList = data.running_list || (data.running ? [data.running] : []);
+                const queueCount = (data.queued ? data.queued.length : 0) + runningList.length;
+                const queueBtn = document.querySelector('.view-btn[data-view="queue"]');
+                if (queueBtn) queueBtn.textContent = queueCount > 0 ? `Queue (${queueCount})` : 'Queue';
+            } catch {}
+        }
+
+        async function refreshQueue() {
+            try {
+                const response = await fetch('/api/queue');
+                const data = await response.json();
+
+                const contentEl = document.getElementById('queue-content');
+                const stateBadge = document.getElementById('queue-state-badge');
+
+                // Update state badge
+                stateBadge.textContent = data.state;
+                stateBadge.className = `queue-state-badge ${data.state}`;
+
+                let html = '';
+
+                // Running experiments (may be multiple across sessions)
+                const runningList = data.running_list || (data.running ? [data.running] : []);
+                runningList.forEach(r => {
+                    const progress = r.total_steps ? (r.current_step / r.total_steps * 100) : 0;
+                    const envStr = Object.entries(r.env_vars || {}).map(([k,v]) => `${k}=${v}`).join(', ');
+                    const track = r.track || 'untracked';
+                    const scriptName = r.script ? r.script.split('/').pop() : r.name;
+                    const sessionLabel = r.session_name ? `<span class="queue-item-session">${r.session_name}</span>` : '';
+                    const isSelected = selectedExperimentIds && selectedExperimentIds.includes(r.id);
+                    html += `
+                        <div class="queue-running${isSelected ? ' selected' : ''}" onclick="goToExperiment(${r.id})" title="Click to view in Experiments">
+                            <div class="queue-running-top">
+                                <div class="queue-running-label">Running</div>
+                                <div class="queue-item-right">
+                                    ${r.gpus ? `<span class="queue-item-gpus">${r.gpus}x ${r.gpu_type || 'GPU'}</span>` : ''}
+                                    ${sessionLabel}
+                                </div>
+                            </div>
+                            <div class="queue-running-name"><span class="queue-item-track">${track}</span>/${scriptName}</div>
+                            ${envStr ? `<div class="queue-item-env">${envStr}</div>` : ''}
+                            <div class="queue-running-progress">
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: ${progress}%"></div>
+                                </div>
+                                <span class="progress-text">${r.current_step || 0}/${r.total_steps || '?'}</span>
+                            </div>
+                            ${r.val_loss ? `<div class="queue-running-loss">Val Loss: ${r.val_loss.toFixed(4)}</div>` : ''}
+                        </div>
+                    `;
+                });
+
+                // Queued experiments (interleaved from all sessions, per-session ordinals)
+                if (data.queued && data.queued.length > 0) {
+                    html += `<div class="queue-section-label">Queued (${data.queued.length})</div>`;
+                    data.queued.forEach((item) => {
+                        const scriptName = item.script.split('/').pop();
+                        const track = item.track || 'untracked';
+                        const envStr = Object.entries(item.env_vars || {}).map(([k,v]) => `${k}=${v}`).join(', ');
+                        const sessionLabel = item.session_name ? `<span class="queue-item-session">${item.session_name}</span>` : '';
+                        const isSelected = (selectedQueuedScript && selectedQueuedScript === item.script) || (selectedExperimentIds && selectedExperimentIds.includes(item.id));
+                        html += `
+                            <div class="queue-item${isSelected ? ' selected' : ''}" onclick="goToQueuedItem('${item.script.replace(/'/g, "\\'")}')" title="Click to view script diff">
+                                <span class="queue-item-index">${item.session_index || '?'}</span>
+                                <div class="queue-item-info">
+                                    <div class="queue-item-name"><span class="queue-item-track">${track}</span>/${scriptName}</div>
+                                    ${envStr ? `<div class="queue-item-env">${envStr}</div>` : ''}
+                                </div>
+                                <div class="queue-item-right">
+                                    <span class="queue-item-gpus">${item.gpus}x ${item.gpu_type}</span>
+                                    ${sessionLabel}
+                                </div>
+                            </div>
+                        `;
+                    });
+                } else if (runningList.length === 0) {
+                    html += `<div class="queue-empty">Queue is empty</div>`;
+                }
+
+                contentEl.innerHTML = html;
+
+                // Update queue button with count
+                const queueBtn = document.querySelector('.view-btn[data-view="queue"]');
+                const queueCount = (data.queued ? data.queued.length : 0) + runningList.length;
+                if (queueBtn) queueBtn.textContent = queueCount > 0 ? `Queue (${queueCount})` : 'Queue';
+            } catch (e) {
+                console.error('Failed to refresh queue:', e);
+            }
+        }
+
+        // Auto-refresh
+        async function startAutoRefresh() {
+            // Check URL for view param
+            const urlParams = new URLSearchParams(window.location.search);
+            const viewFromUrl = urlParams.get('view');
+            if (viewFromUrl === 'queue') {
+                currentView = 'queue';
+                document.querySelectorAll('.view-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.view === 'queue');
+                });
+                document.querySelectorAll('.panel-view').forEach(view => {
+                    view.classList.toggle('active', view.id === 'queue-view');
+                });
+                refreshQueue();
+            }
+
+            const experiments = await refreshExperiments();
+            refreshQueueCount();
+
+            // Check URL for selected experiment, run, and tab
+            const expFromUrl = urlParams.get('exp');
+            const runFromUrl = urlParams.get('run');
+            const tabFromUrl = urlParams.get('tab');
+
+            // Restore tab selection if present in URL
+            if (tabFromUrl && (tabFromUrl === 'diff' || tabFromUrl === 'notes')) {
+                currentDiffNotesTab = tabFromUrl;
+                switchDiffNotesTab(tabFromUrl);
+            }
+
+            if (expFromUrl && experiments && experiments.length > 0) {
+                // Find experiment matching URL param (by code_hash or id)
+                const match = experiments.find(e =>
+                    e.code_hash === expFromUrl || String(e.id) === expFromUrl
+                );
+                if (match) {
+                    await selectExperiment(match.code_hash || match.id, match.experiment_ids || [match.id]);
+                    // Restore run selection if present in URL
+                    if (runFromUrl) {
+                        const runId = parseInt(runFromUrl);
+                        if (currentValidData && currentValidData.find(d => d.id === runId)) {
+                            showMetricsForRun(runId);
+                        }
+                    }
+                }
+            } else if (!selectedExperiment && experiments && experiments.length > 0) {
+                // Auto-select the most recent experiment on initial load
+                const first = experiments[0];
+                selectExperiment(first.code_hash || first.id, first.experiment_ids || [first.id]);
+            }
+            refreshInterval = setInterval(() => {
+                // Skip refresh if delete is in progress to avoid race conditions
+                if (deleteInProgress) return;
+
+                // Refresh based on current view
+                if (currentView === 'queue') {
+                    refreshQueue();
+                } else {
+                    refreshExperiments();
+                    refreshQueueCount();
+                    if (selectedExperiment && selectedExperimentIds && selectedExperimentIds.length > 0) {
+                        // Refresh experiment data (selections are preserved since it's the same experiment)
+                        selectExperiment(selectedExperiment, selectedExperimentIds);
+                    }
+                }
+            }, 5000);
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadTracks();
+            startAutoRefresh();
+
+            // Initialize mobile panel state
+            function initMobileState() {
+                if (isMobile()) {
+                    const sidebar = document.getElementById('experiments-panel');
+                    const detail = document.querySelector('.detail-panel');
+                    // If neither panel has mobile-active, default to sidebar
+                    if (!sidebar.classList.contains('mobile-active') && !detail.classList.contains('mobile-active')) {
+                        sidebar.classList.add('mobile-active');
+                    }
+                } else {
+                    // On desktop, remove mobile-active classes so grid layout takes over
+                    document.getElementById('experiments-panel').classList.remove('mobile-active');
+                    document.querySelector('.detail-panel').classList.remove('mobile-active');
+                }
+            }
+
+            initMobileState();
+            window.addEventListener('resize', initMobileState);
+        });
+    </script>
+</body>
+</html>
