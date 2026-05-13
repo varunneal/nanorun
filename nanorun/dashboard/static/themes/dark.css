@@ -1,0 +1,71 @@
+:root {
+    /* Backgrounds */
+    --bg-dark: #0f1218;
+    --bg-card: #161a24;
+    --bg-hover: #1e2433;
+    --bg-card-hover: #0c0f14;
+    --bg-selected: #0a0d12;
+
+    /* Text */
+    --text-primary: #eef;
+    --text-secondary: #aaa;
+    --text-tertiary: #888;
+    --text-placeholder: #666;
+
+    /* Borders */
+    --border-subtle: #333;
+    --border: #444;
+    --border-hover: #555;
+    --border-active: #777;
+
+    /* Semantic */
+    --accent: #6aab6e;
+    --accent-dim: #4a7a4e;
+    --success: #6aab6e;
+    --warning: #e0b868;
+    --error: #e07570;
+    --info: #8fb4d8;
+    --selection: #bbb;
+
+    /* Experiment UI */
+    --track-color: #8fb4d8;
+    --hash-color: #9aa0a6;
+    --env-color: #8ab4f8;
+    --run-id-color: #f0b27a;
+    --sweep-color: #b388ff;
+    --session-color: #b8a0e8;
+    --n-runs-color: #ff6b6b;
+
+    /* Chart */
+    --chart-1: #5a9a5e;
+    --chart-2: #5a8ab8;
+    --chart-3: #c9a054;
+    --chart-4: #b05a7a;
+    --chart-5: #7a5a9a;
+    --chart-6: #5a9a9a;
+    --chart-7: #c9b854;
+    --chart-8: #8a7058;
+    --chart-grid: rgba(255, 255, 255, 0.15);
+
+    /* Heatmap — green (good) to red (bad) endpoints */
+    --heatmap-good: 90, 154, 94;
+    --heatmap-bad: 224, 117, 112;
+
+    /* Diff viewer */
+    --diff-bg: #0d1117;
+    --diff-text: #e6edf3;
+    --diff-hunk: #a5d6ff;
+    --diff-add: #aff5b4;
+    --diff-del: #ffa198;
+
+    /* Font stacks */
+    --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    --font-brand: 'Space Grotesk', sans-serif;
+
+    /* Font scale */
+    --font-xs: 0.65rem;
+    --font-sm: 0.72rem;
+    --font-base: 0.8rem;
+    --font-lg: 1rem;
+    --font-xl: 1.1rem;
+}

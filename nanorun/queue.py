@@ -29,6 +29,7 @@ class QueuedExperiment:
     gpus: int
     gpu_type: str
     name: Optional[str]
+    session_name: Optional[str] = None
 
     def to_line(self) -> str:
         """Serialize to a single line for queue file."""
@@ -82,16 +83,29 @@ def get_queue_state_path() -> Path:
     return config_dir / "queue_state.txt"
 
 
-def read_queue() -> List[QueuedExperiment]:
-    """Read all queued experiments from local cache (synced from remote daemon).
+def read_queue(session_name: Optional[str] = None) -> List[QueuedExperiment]:
+    """Read queued experiments from local cache (synced from remote daemon).
 
-    The canonical queue lives on the remote daemon. This reads from a local
-    cache that the local metrics daemon keeps in sync.
+    If session_name is given, reads only that session's queue.
+    If None, combines queues from all sessions.
     """
     from .local_daemon import safe_json_load, get_queue_cache_file
 
-    # Read queue from local cache (synced from remote daemon)
-    data = safe_json_load(get_queue_cache_file(), default={})
+    if session_name is not None:
+        return _read_session_queue(session_name)
+
+    # Combine all sessions
+    sessions = Config.list_sessions()
+    experiments = []
+    for sc in sessions:
+        experiments.extend(_read_session_queue(sc.name))
+    return experiments
+
+
+def _read_session_queue(session_name: str) -> List[QueuedExperiment]:
+    from .local_daemon import safe_json_load, get_queue_cache_file
+
+    data = safe_json_load(get_queue_cache_file(session_name), default={})
     queue_items = data.get("queue", []) if data else []
 
     experiments = []
@@ -103,6 +117,7 @@ def read_queue() -> List[QueuedExperiment]:
             gpus=item.get("gpus", 1),
             gpu_type=item.get("gpu_type", "H100"),
             name=item.get("name"),
+            session_name=session_name,
         ))
     return experiments
 

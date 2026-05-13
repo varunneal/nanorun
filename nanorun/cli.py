@@ -681,7 +681,7 @@ def job_status(daemon: bool, session_name):
 
     running = get_running_experiments(session_name=session_name)
     queue_state = get_queue_state()
-    queued = read_queue()
+    queued = read_queue(session_name)
 
     # Currently running experiment (local view)
     if running:
@@ -830,7 +830,7 @@ def job_ps(session_name):
 
 @job.group("queue", invoke_without_command=True)
 @click.option("--flat", is_flag=True, help="Plain text output (no table, no truncation)")
-@session_option
+@click.option("--session", "session_name", default=None, help="Session name (omit to show all sessions)")
 @click.pass_context
 def job_queue(ctx, flat, session_name):
     """Show or manage the experiment queue."""
@@ -842,7 +842,7 @@ def job_queue(ctx, flat, session_name):
     # Default behavior: show queue
     from .queue import read_queue, get_queue_state
 
-    queued = read_queue()
+    queued = read_queue(session_name)
     state = get_queue_state()
 
     console.print(f"[bold]Queue Status:[/bold] {state}")
@@ -854,6 +854,7 @@ def job_queue(ctx, flat, session_name):
         return
 
     if flat:
+        show_session = session_name is None and len(set(e.session_name for e in queued)) > 1
         for i, exp in enumerate(queued, 1):
             env_str = " ".join(f"{k}={v}" for k, v in exp.env_vars.items()) if exp.env_vars else ""
             parts = [f"{i}.", exp.script]
@@ -861,6 +862,8 @@ def job_queue(ctx, flat, session_name):
                 parts.append(env_str)
             if exp.track:
                 parts.append(f"[{exp.track}]")
+            if show_session and exp.session_name:
+                parts.append(f"({exp.session_name})")
             print(" ".join(parts))
         return
 
@@ -891,7 +894,7 @@ def job_clear(yes: bool, session_name):
     """Clear all queued experiments."""
     from .queue import clear_queue_via_daemon, read_queue
 
-    queued = read_queue()
+    queued = read_queue(session_name)
     if len(queued) == 0:
         console.print("[dim]Queue is already empty[/dim]")
         return
@@ -914,7 +917,7 @@ def job_remove(index: int, session_name):
     """Remove experiment at INDEX from queue (1-indexed)."""
     from .queue import remove_from_queue_via_daemon, read_queue
 
-    queued = read_queue()
+    queued = read_queue(session_name)
     if index < 1 or index > len(queued):
         console.print(f"[red]Invalid index: {index} (queue has {len(queued)} items)[/red]")
         return
@@ -982,12 +985,16 @@ def mark_crashes_seen(session_name: str = None):
     default=False,
     help="Run in background or foreground (default)",
 )
-def daemon_start(background: bool):
+@click.option("--no-dashboard", is_flag=True, help="Don't start the dashboard server")
+@click.option("--dashboard-port", "-p", default=8080, help="Dashboard port (default: 8080)")
+def local_daemon_start(background: bool, no_dashboard: bool, dashboard_port: int):
     """Start the local daemon.
 
     The daemon polls the remote for experiment status and syncs metrics
     to the local database. It automatically detects when experiments
     start (including from queue) and finish.
+
+    Also starts the web dashboard (localhost:8080) unless --no-dashboard is passed.
 
     Polling intervals: status/queue=1s, metrics=3s, logs=10s
     """
@@ -1001,8 +1008,13 @@ def daemon_start(background: bool):
 
     if background:
         # Run as background process
+        cmd = [sys.executable, "-m", "nanorun.local_daemon"]
+        if no_dashboard:
+            cmd.append("--no-dashboard")
+        if dashboard_port != 8080:
+            cmd.extend(["--dashboard-port", str(dashboard_port)])
         proc = subprocess.Popen(
-            [sys.executable, "-m", "nanorun.local_daemon"],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -1021,7 +1033,9 @@ def daemon_start(background: bool):
         # Run in foreground (blocking)
         console.print("[cyan]Starting local daemon in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        daemon_instance = LocalMetricsDaemon()
+        daemon_instance = LocalMetricsDaemon(
+            dashboard_port=dashboard_port, no_dashboard=no_dashboard
+        )
         daemon_instance.run()
 
 
@@ -1142,31 +1156,11 @@ def local_daemon_logs(tail: bool, num_lines: int, session_name: str):
 
 
 @local_daemon.command("restart")
-@click.option(
-    "--background/--foreground",
-    "background",
-    default=False,
-    help="Run in background or foreground (default)",
-)
-def local_daemon_restart(background: bool):
-    """Restart the local daemon."""
-    from .local_daemon import is_daemon_running, stop_daemon, restart_daemon, LocalMetricsDaemon
-
-    if is_daemon_running():
-        console.print("[dim]Stopping existing daemon...[/dim]")
-        stop_daemon()
-
-    if background:
-        pid = restart_daemon(skip_stop=True)
-        if pid:
-            console.print(f"[green]Local daemon restarted (PID: {pid})[/green]")
-        else:
-            console.print("[red]Failed to restart local daemon[/red]")
-    else:
-        console.print("[cyan]Starting local daemon in foreground...[/cyan]")
-        console.print("[dim]Press Ctrl+C to stop[/dim]")
-        daemon_instance = LocalMetricsDaemon()
-        daemon_instance.run()
+@click.pass_context
+def local_daemon_restart(ctx):
+    """Restart the local daemon (stop + start with same options)."""
+    ctx.invoke(local_daemon_stop)
+    ctx.invoke(local_daemon_start)
 
 
 @local_daemon.command("crashes")
@@ -1463,6 +1457,59 @@ def hub_weights(experiment_id: int, download: bool, output: str):
         console.print(f"  Downloading {f}...")
         hub_mod.download_weight(experiment_id, f, out_dir / f, exp.session_name)
     console.print(f"[green]Downloaded {len(filenames)} files to {out_dir}[/green]")
+
+
+# ============================================================================
+# Exec command
+# ============================================================================
+
+@cli.command("exec")
+@click.argument("command", nargs=-1)
+@click.option("-t", "--timeout", default=30, type=int, help="Timeout in seconds (0 = no timeout)")
+@session_option
+def exec_cmd(command: tuple, timeout: int, session_name):
+    """Run a command on the remote machine.
+
+    Reads from stdin if no command given (pipe mode):
+
+        echo "nvidia-smi" | nanorun exec
+
+        cat script.sh | nanorun exec
+
+    Or pass the command directly:
+
+        nanorun exec nvidia-smi
+
+        nanorun exec -- ls -la ~/nanorun/logs/
+    """
+    import sys
+
+    if command:
+        cmd_str = " ".join(command)
+    elif not sys.stdin.isatty():
+        cmd_str = sys.stdin.read().strip()
+        if not cmd_str:
+            console.print("[red]No command provided via stdin.[/red]")
+            raise SystemExit(1)
+    else:
+        console.print("[red]No command provided. Pass a command or pipe via stdin.[/red]")
+        console.print("[dim]Usage: nanorun exec <command>  or  echo 'cmd' | nanorun exec[/dim]")
+        raise SystemExit(1)
+
+    remote = require_session(session_name)
+    t = timeout if timeout > 0 else None
+    result = remote.run(cmd_str, timeout=t)
+
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+        if not result.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+        if not result.stderr.endswith("\n"):
+            sys.stderr.write("\n")
+
+    raise SystemExit(result.returncode)
 
 
 # ============================================================================

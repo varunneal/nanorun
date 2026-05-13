@@ -1,6 +1,10 @@
 """Local metrics daemon - event-driven, multi-session.
 
-One listener thread per session (WebSocket events + periodic metric sync).
+Two independent connections per session:
+  1. Remote daemon (SSH/WebSocket) — experiment events, queue state, RPC
+  2. HuggingFace Hub (HTTPS) — log/mapping sync
+
+These are decoupled: hub sync continues when SSH drops and vice versa.
 One main thread for session discovery and signal handling.
 """
 
@@ -113,6 +117,111 @@ def record_crash(session_name: str, experiment_id: int, crash_log: Optional[str]
 def _sync_all_logs(session_name: str):
     from . import hub
     hub.sync_logs_down(PATHS.logs_dir, session_name)
+
+
+class HubSyncer:
+    """Single HTTPS connection to Hub, syncs logs for all sessions.
+
+    Runs in its own thread, decoupled from SSH/RPC connections.
+    One instance per daemon (not per session) since it's a single auth/endpoint.
+    """
+
+    SYNC_INTERVAL = 10.0
+
+    def __init__(self, daemon: "LocalMetricsDaemon"):
+        self.daemon = daemon
+        self.running = True
+        self.status: str = "disconnected"  # disconnected, connected, error
+        self.last_error: Optional[str] = None
+        self.last_sync_at: Optional[str] = None
+        self._thread: Optional[threading.Thread] = None
+        self._was_connected: bool = False
+        self._consecutive_failures: int = 0
+        self._last_sync: float = 0
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._loop, name="hub-syncer", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def reconnectable(self) -> bool:
+        return not self.is_alive and self._was_connected
+
+    def event(self, message: str):
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] [hub] {message}"
+        print(line, flush=True)
+
+    def _loop(self):
+        log.info("[hub] Starting hub syncer")
+        self.event("Hub syncer starting")
+        from . import hub
+        try:
+            hub.ping()
+        except Exception as e:
+            self.status = "error"
+            self.last_error = str(e)
+            self.event(f"Hub connection failed: {self.last_error}")
+            return
+        self.status = "connected"
+        self._was_connected = True
+        self.event("Hub connected")
+        while self.running:
+            now = time.monotonic()
+            if now - self._last_sync >= self.SYNC_INTERVAL:
+                self._do_sync()
+                self._last_sync = now
+            time.sleep(1)
+        log.info("[hub] Syncer stopped")
+
+    def _check_connection(self) -> bool:
+        """Verify HTTPS connectivity to the hub."""
+        from . import hub
+        try:
+            if not hub.ping():
+                self.last_error = "Hub connection lost (will retry on reconnect)"
+                return False
+            self.last_error = None
+            self._consecutive_failures = 0
+            return True
+        except Exception as e:
+            self.last_error = f"Hub connection lost: {e}"
+            return False
+
+    def _do_sync(self):
+        sessions = list(self.daemon.trackers.keys())
+        for session_name in sessions:
+            try:
+                _sync_all_logs(session_name)
+            except Exception as e:
+                err_str = str(e)
+                self._consecutive_failures += 1
+                if "rate limit" in err_str.lower() or "429" in err_str:
+                    backoff = min(60.0 * self._consecutive_failures, 300.0)
+                    log.warning(f"[hub] Rate limited, backing off {backoff:.0f}s")
+                    self.event(f"Rate limited — backing off {backoff:.0f}s")
+                    self._last_sync = time.monotonic() + backoff - self.SYNC_INTERVAL
+                    return
+                if self._consecutive_failures == 1:
+                    log.warning(f"[hub] Sync failed for {session_name}: {e}")
+                if self._consecutive_failures >= 10:
+                    self.last_error = f"10 consecutive sync failures: {e}"
+                    self.status = "error"
+                    self.event(f"Hub sync failing repeatedly: {e}")
+                    self.running = False
+                return
+        self._consecutive_failures = 0
+        self.last_sync_at = datetime.now().strftime("%H:%M:%S")
 
 
 _log_offsets: dict[str, int] = {}
@@ -452,13 +561,7 @@ class SessionTracker:
         self.state.tracking_run_id = None
 
     def _sync_logs_and_metrics(self):
-        """Bulk-download logs + mappings from hub, discover experiments, reparse metrics."""
-        try:
-            _sync_all_logs(self.session_name)
-        except Exception as e:
-            log.warning(f"[{self.session_name}] Log sync failed: {e}")
-            return
-
+        """Process local log files (downloaded by HubSyncer) and reparse metrics."""
         # Process mappings.jsonl — discover new experiments, update statuses
         self._process_mappings_file()
 
@@ -572,8 +675,12 @@ class SessionTracker:
     # --- experiment helpers ---
 
     def _ensure_experiment(self, exp_id: int, data: dict):
-        if not get_experiment(exp_id):
+        exp = get_experiment(exp_id)
+        if not exp:
             self._create_experiment(exp_id, data)
+        elif exp.session_name != self.session_name:
+            update_experiment_metadata(exp_id, session_name=self.session_name)
+            log.info(f"[{self.session_name}] Claimed experiment {exp_id} from '{exp.session_name}'")
 
     def _create_experiment(self, exp_id: int, data: dict):
         if get_experiment(exp_id):
@@ -598,13 +705,18 @@ class SessionTracker:
 
 
 class LocalMetricsDaemon:
-    def __init__(self):
+    def __init__(self, dashboard_port: int = 8080, no_dashboard: bool = False):
         self.running = True
         self.trackers: Dict[str, SessionTracker] = {}
+        self.hub_syncer: Optional[HubSyncer] = None
         self.interactive = False
+        self.dashboard_port = dashboard_port
+        self.no_dashboard = no_dashboard
 
     def _discover_sessions(self) -> Dict[str, SessionConfig]:
         return {s.name: s for s in Config.list_sessions()}
+
+    # --- session trackers (SSH/RPC) ---
 
     def _start_tracker(self, config: SessionConfig):
         tracker = SessionTracker(config, self)
@@ -618,20 +730,91 @@ class LocalMetricsDaemon:
             tracker.stop()
             log.info(f"Stopped tracker for '{name}'")
 
+    # --- hub syncer (HTTPS, single instance) ---
+
+    def _start_hub_syncer(self):
+        self.hub_syncer = HubSyncer(self)
+        self.hub_syncer.start()
+        log.info("Started hub syncer")
+
+    def _stop_hub_syncer(self):
+        if self.hub_syncer:
+            self.hub_syncer.stop()
+            self.hub_syncer = None
+            log.info("Stopped hub syncer")
+
+    # --- dashboard ---
+
+    def _start_dashboard(self):
+        """Start the dashboard server in a daemon thread."""
+        import uvicorn
+        from .dashboard.app import app
+
+        app.state.daemon = self
+
+        config = uvicorn.Config(
+            app, host="0.0.0.0", port=self.dashboard_port, log_level="warning"
+        )
+        server = uvicorn.Server(config)
+
+        def _run_dashboard():
+            try:
+                server.run()
+            except Exception as e:
+                log.error(f"Dashboard crashed: {e}")
+                print(f"WARNING: Dashboard failed to start: {e}", file=sys.stderr)
+
+        thread = threading.Thread(target=_run_dashboard, name="dashboard", daemon=True)
+        thread.start()
+        log.info(f"Dashboard started on port {self.dashboard_port}")
+        print(f"\033[36mDashboard: http://localhost:{self.dashboard_port}\033[0m")
+        import webbrowser
+        webbrowser.open(f"http://localhost:{self.dashboard_port}")
+
+    # --- reconnect logic ---
+
     def _reconnectable_trackers(self) -> list[str]:
         """Dead trackers that were previously connected (not failed on first connect)."""
         return [name for name, t in self.trackers.items()
                 if t._thread and not t._thread.is_alive() and t._was_connected]
 
+    def _hub_reconnectable(self) -> bool:
+        return self.hub_syncer is not None and self.hub_syncer.reconnectable
+
+    def reconnect_session(self, name: str) -> bool:
+        """Restart a tracker for the given session."""
+        current = self._discover_sessions()
+        if name not in current:
+            return False
+        tracker = self.trackers.get(name)
+        if tracker and tracker._thread and tracker._thread.is_alive():
+            return False
+        self._stop_tracker(name)
+        self._start_tracker(current[name])
+        return True
+
+    def reconnect_hub(self) -> bool:
+        """Restart the hub syncer."""
+        if self.hub_syncer and self.hub_syncer.is_alive:
+            return False
+        self._stop_hub_syncer()
+        self._start_hub_syncer()
+        return True
+
     def _check_reconnect(self):
-        """In interactive mode, detect dead trackers and prompt for reconnect."""
-        reconnectable = self._reconnectable_trackers()
-        if not reconnectable:
+        """In interactive mode, detect dead connections and prompt for reconnect."""
+        reconnectable_sessions = self._reconnectable_trackers()
+        hub_dead = self._hub_reconnectable()
+        if not reconnectable_sessions and not hub_dead:
             self._reconnect_prompted = False
             return
         if not getattr(self, '_reconnect_prompted', False):
-            names = ", ".join(reconnectable)
-            print(f"\nSession(s) disconnected: {names}")
+            parts = []
+            if reconnectable_sessions:
+                parts.append(f"session(s): {', '.join(reconnectable_sessions)}")
+            if hub_dead:
+                parts.append("hub")
+            print(f"\nDisconnected — {'; '.join(parts)}")
             print("Press Enter to reconnect, or Ctrl+C to quit...", flush=True)
             self._reconnect_prompted = True
         import select
@@ -641,11 +824,16 @@ class LocalMetricsDaemon:
         sys.stdin.readline()
         self._reconnect_prompted = False
         current = self._discover_sessions()
-        for name in reconnectable:
+        for name in reconnectable_sessions:
             self._stop_tracker(name)
             if name in current:
-                print(f"Reconnecting {name}...")
+                print(f"Reconnecting session {name}...")
                 self._start_tracker(current[name])
+        if hub_dead:
+            print("Reconnecting hub...")
+            self.reconnect_hub()
+
+    # --- main loop ---
 
     def run(self):
         log.info("=" * 50)
@@ -665,6 +853,9 @@ class LocalMetricsDaemon:
                 print("No sessions configured. Run 'nanorun session start' first.", file=sys.stderr)
                 return
             print(f"Starting daemon with {len(sessions)} session(s): {', '.join(sessions.keys())}")
+            if not self.no_dashboard:
+                self._start_dashboard()
+            self._start_hub_syncer()
             for config in sessions.values():
                 self._start_tracker(config)
             tick = 0
@@ -684,6 +875,7 @@ class LocalMetricsDaemon:
         finally:
             for name in list(self.trackers):
                 self._stop_tracker(name)
+            self._stop_hub_syncer()
             remove_pid_file()
             log.info("Daemon stopped")
 
@@ -739,10 +931,18 @@ def restart_daemon(skip_stop: bool = False) -> Optional[int]:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-dashboard", action="store_true")
+    parser.add_argument("--dashboard-port", type=int, default=8080)
+    args = parser.parse_args()
+
     if is_daemon_running():
         print("Daemon is already running", file=sys.stderr)
         sys.exit(1)
-    LocalMetricsDaemon().run()
+    LocalMetricsDaemon(
+        dashboard_port=args.dashboard_port, no_dashboard=args.no_dashboard
+    ).run()
 
 if __name__ == "__main__":
     main()

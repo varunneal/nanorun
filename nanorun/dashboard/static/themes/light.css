@@ -1,0 +1,77 @@
+/*
+ * Light Theme
+ * Direct counterpart to dark.css.
+ *
+ * Same hue relationships, same accent green,
+ * same warm-neutral temperature — inverted luminance.
+ * Not "slap white on it" but a real complement:
+ * the greens, golds, and muted roses carry over,
+ * darkened to read on light backgrounds.
+ */
+
+:root {
+    /* Backgrounds — warm off-whites, not sterile */
+    --bg-dark: #f4f3f0;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f9f8f5;
+    --bg-hover: #eae8e4;
+    --bg-selected: #dddbd6;
+    /* Text — warm darks, not pure black */
+    --text-primary: #1a1d24;
+    --text-secondary: #4a4e58;
+    --text-tertiary: #70747e;
+    --text-placeholder: #9a9da6;
+    /* Borders — warm grays */
+    --border-subtle: #e0ded9;
+    --border: #ccc9c2;
+    --border-hover: #b0ada6;
+    --border-active: #8a8780;
+    /* Semantic — same hues, adjusted for light bg */
+    --accent: #3d7a40;
+    --accent-dim: #6aab6e;
+    --success: #3d7a40;
+    --warning: #9a7a18;
+    --error: #b84a46;
+    --info: #2474a8;
+    --selection: #1a1d24;
+    /* Experiment UI — darkened to read on white */
+    --track-color: #3a6a96;
+    --hash-color: #5a6068;
+    --env-color: #2e6cc2;
+    --run-id-color: #a0703a;
+    --sweep-color: #6a4ea0;
+    --session-color: #6a5090;
+    --n-runs-color: #c04040;
+    /* Heatmap — lighter pastels so dark text stays readable */
+    --heatmap-good: 180, 220, 180;
+    --heatmap-bad: 240, 180, 175;
+    /* Diff — darkened for light bg readability */
+    --diff-bg: #f6f4f0;
+    --diff-text: #1a1d24;
+    --diff-hunk: #2474a8;
+    --diff-add: #2a6e2e;
+    --diff-del: #b84a46;
+    /*
+     * Chart — same palette family as dark.css,
+     * saturation/value adjusted so they pop on white
+     * without going neon
+     */
+    --chart-1: #3d7a40;  /* green — matches accent */
+    --chart-2: #3a6a96;  /* blue */
+    --chart-3: #a08428;  /* gold */
+    --chart-4: #963a58;  /* rose */
+    --chart-5: #5a3a7a;  /* purple */
+    --chart-6: #2a7a7a;  /* teal */
+    --chart-7: #a09028;  /* warm yellow */
+    --chart-8: #6a5038;  /* brown */
+    --chart-grid: rgba(26, 29, 36, 0.10);
+    /* Font stacks — unchanged */
+    --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    --font-brand: 'Space Grotesk', sans-serif;
+    /* Font scale — unchanged */
+    --font-xs: 0.65rem;
+    --font-sm: 0.72rem;
+    --font-base: 0.8rem;
+    --font-lg: 1rem;
+    --font-xl: 1.1rem;
+}

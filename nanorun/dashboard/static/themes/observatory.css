@@ -1,0 +1,74 @@
+/*
+ * Observatory Theme
+ * "Late night, telescope dome, watching something converge."
+ *
+ * Deep navy backgrounds, cool blue-white accents,
+ * chart colors drawn from stellar classification.
+ */
+
+:root {
+    /* Backgrounds — deep navy, not gray-black */
+    --bg-dark: #0b0e1a;
+    --bg-card: #101528;
+    --bg-card-hover: #0a0d18;
+    --bg-hover: #182040;
+    --bg-selected: #070a14;
+    /* Text — cooler whites, blue-tinted secondaries */
+    --text-primary: #e2e6f0;
+    --text-secondary: #8e99b8;
+    --text-tertiary: #5e6a8a;
+    --text-placeholder: #3e4a6a;
+    /* Borders — blue-tinted grays */
+    --border-subtle: #1e2844;
+    --border: #2a3558;
+    --border-hover: #384870;
+    --border-active: #4a6090;
+    /* Semantic — that astronomical blue-white */
+    --accent: #a8c4e0;
+    --accent-dim: #5e7a9a;
+    --success: #78c090;
+    --warning: #e8c56a;
+    --error: #d46a6a;
+    --info: #6aafe8;
+    --selection: #a8c4e0;
+    /* Experiment UI — cooler, more atmospheric variants */
+    --track-color: #7aaad0;
+    --hash-color: #6a7a96;
+    --env-color: #6a9ad8;
+    --run-id-color: #d4a06a;
+    --sweep-color: #9a82cc;
+    --session-color: #8a7ab8;
+    --n-runs-color: #d46a78;
+    /* Heatmap — cool-tinted green/red */
+    --heatmap-good: 80, 150, 110;
+    --heatmap-bad: 200, 100, 100;
+    /* Diff — cool-tinted to match observatory atmosphere */
+    --diff-bg: #080c18;
+    --diff-text: #e2e6f0;
+    --diff-hunk: #6aafe8;
+    --diff-add: #8fd8a0;
+    --diff-del: #e08080;
+    /*
+     * Chart — stellar classification palette
+     *   O-type blue-white → M-type deep red
+     *   with nebula accents
+     */
+    --chart-1: #a8c4e0;  /* O/B-type blue-white — the signature color */
+    --chart-2: #e8e2c0;  /* A/F-type pale yellow-white */
+    --chart-3: #e8c86a;  /* G-type solar yellow */
+    --chart-4: #d4906a;  /* K-type orange */
+    --chart-5: #c46a6a;  /* M-type cool red */
+    --chart-6: #6ab8b8;  /* planetary nebula teal */
+    --chart-7: #9a82cc;  /* reflection nebula violet */
+    --chart-8: #78a86a;  /* aurora green — the odd one out */
+    --chart-grid: rgba(168, 196, 224, 0.08);
+    /* Font stacks — Space Mono everything, mission control */
+    --font-mono: 'Space Mono', 'SF Mono', 'Menlo', monospace;
+    --font-brand: 'Space Mono', 'SF Mono', monospace;
+    /* Font scale — unchanged */
+    --font-xs: 0.65rem;
+    --font-sm: 0.72rem;
+    --font-base: 0.8rem;
+    --font-lg: 1rem;
+    --font-xl: 1.1rem;
+}

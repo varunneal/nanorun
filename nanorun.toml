@@ -1,0 +1,22 @@
+[repo]
+# Your fork's SSH clone URL (used by `nanorun session setup` to clone on remote machines)
+url = "git@github.com:YOUR_USERNAME/nanorun.git"
+
+[hub]
+# Backend: "hf" (HuggingFace Buckets, default) or "s3" (any S3-compatible storage)
+# backend = "hf"
+
+# --- HuggingFace Buckets (default) ---
+# Bucket is created automatically on first use
+bucket_id = "YOUR_USERNAME/nanorun"
+
+# --- S3-compatible storage ---
+# backend = "s3"
+# bucket_id = "my-nanorun-bucket"
+# prefix = ""                          # optional key prefix
+# endpoint_url = ""                    # optional, for R2/MinIO/GCS
+# region = "us-east-1"                 # optional
+
+# --- Local filesystem ---
+# backend = "local"
+# path = "/mnt/shared/nanorun-logs"    # or ~/.nanorun/hub

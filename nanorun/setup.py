@@ -45,10 +45,10 @@ def _cuda_version_to_torch_tag(version: str) -> str:
     major = int(major_minor[0])
     minor = int(major_minor[1]) if len(major_minor) > 1 else 0
 
-    if major >= 13:
+    if major >= 13 and minor >= 2:
+        return "cu132"
+    elif major >= 13:
         return "cu130"
-    elif major == 12 and minor >= 8:
-        return "cu128"
     elif major == 12 and minor >= 6:
         return "cu126"
     elif major == 12 and minor >= 4:
@@ -99,15 +99,20 @@ def detect_sudo(remote: RemoteSession) -> bool:
     return result.success
 
 
-TORCH_VERSION = "2.10.0"
+TORCH_VERSION = "2.12.0"
+
+# Only these CUDA tags have dedicated PyTorch wheel indexes
+_INDEXED_CUDA_TAGS = {"cu126", "cu130", "cu132"}
 
 
 def get_torch_install_cmd(cuda_version: str) -> str:
     """Get the pip install command for torch with correct CUDA."""
-    return (
-        f"uv pip install torch=={TORCH_VERSION}+{cuda_version} "
-        f"--index-url https://download.pytorch.org/whl/{cuda_version}"
-    )
+    if cuda_version in _INDEXED_CUDA_TAGS:
+        return (
+            f"uv pip install torch=={TORCH_VERSION}+{cuda_version} "
+            f"--index-url https://download.pytorch.org/whl/{cuda_version}"
+        )
+    return f"uv pip install torch=={TORCH_VERSION}"
 
 
 def get_flash_attn_install_cmd(cuda_version: str) -> str:
@@ -222,10 +227,12 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
                 console.print(f"  [yellow]Pull issue: {result.stderr}[/yellow]")
     else:
         if confirm("  Clone nanorun repository?", default=True):
+            from .project_config import get_repo_url
+            repo_url = get_repo_url() or "git@github.com:varunneal/nanorun-private.git"
             # Use GIT_SSH_COMMAND to auto-accept GitHub's host key
             clone_cmd = (
                 f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
-                f"git clone git@github.com:varunneal/nanorun-private.git nanorun"
+                f"git clone {repo_url} nanorun"
             )
             console.print("  [dim]Cloning...[/dim]")
             result = remote.run_with_agent(clone_cmd, timeout=60)

@@ -1,0 +1,77 @@
+/*
+ * Solarized Research Theme
+ * Based on Ethan Schoonover's Solarized palette.
+ *
+ * Using the dark variant — base03/base02 backgrounds,
+ * Solarized accents mapped to experiment semantics.
+ * Every color here is a canonical Solarized value or
+ * a direct opacity/mix of two canonical values.
+ */
+
+:root {
+    /* Backgrounds — Solarized base03/base02 */
+    --bg-dark: #002b36;
+    --bg-card: #073642;
+    --bg-card-hover: #002530;  /* between base03 and base02 */
+    --bg-hover: #0a4050;       /* base02 nudged slightly lighter for hover */
+    --bg-selected: #001e27;    /* base03 deepened for selection contrast */
+    /* Text — Solarized content tones */
+    --text-primary: #fdf6e3;   /* base3 — max contrast for dark bg */
+    --text-secondary: #93a1a1; /* base1 */
+    --text-tertiary: #657b83;  /* base00 */
+    --text-placeholder: #586e75; /* base01 */
+    /* Borders — between base02 and base01 */
+    --border-subtle: #0a4050;
+    --border: #2a5a66;
+    --border-hover: #457b85;
+    --border-active: #657b83;  /* base00 */
+    /* Semantic — Solarized accent colors */
+    --accent: #2aa198;         /* cyan — primary action */
+    --accent-dim: #1a7a73;     /* cyan dimmed */
+    --success: #859900;        /* green */
+    --warning: #b58900;        /* yellow */
+    --error: #dc322f;          /* red */
+    --info: #268bd2;           /* blue */
+    --selection: #eee8d5;      /* base2 */
+    /* Experiment UI — each gets a distinct Solarized accent */
+    --track-color: #268bd2;    /* blue */
+    --hash-color: #657b83;     /* base00 — neutral/structural */
+    --env-color: #2aa198;      /* cyan */
+    --run-id-color: #cb4b16;   /* orange */
+    --sweep-color: #6c71c4;    /* violet */
+    --session-color: #d33682;  /* magenta */
+    --n-runs-color: #dc322f;   /* red */
+    /* Heatmap — Solarized green/red */
+    --heatmap-good: 133, 153, 0;
+    --heatmap-bad: 220, 50, 47;
+    /* Diff — canonical Solarized accents */
+    --diff-bg: #00232e;
+    --diff-text: #fdf6e3;      /* base3 */
+    --diff-hunk: #268bd2;      /* blue */
+    --diff-add: #859900;       /* green */
+    --diff-del: #dc322f;       /* red */
+    /*
+     * Chart — the full Solarized accent ring
+     * Ordered for maximum adjacent-color distinction
+     */
+    --chart-1: #268bd2;        /* blue */
+    --chart-2: #2aa198;        /* cyan */
+    --chart-3: #b58900;        /* yellow */
+    --chart-4: #dc322f;        /* red */
+    --chart-5: #6c71c4;        /* violet */
+    --chart-6: #859900;        /* green */
+    --chart-7: #cb4b16;        /* orange */
+    --chart-8: #d33682;        /* magenta */
+    --chart-grid: rgba(147, 161, 161, 0.12); /* base1 at low opacity */
+    /* Font stacks — serif body, mono for code */
+    --font-body: 'New York', 'Times New Roman', 'Times', serif;
+    --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    --font-brand: 'New York', 'Times New Roman', 'Times', serif;
+    /* Typography — wider, airier for serif */
+    --letter-spacing: 0.03em;
+    --font-xs: 0.7rem;
+    --font-sm: 0.78rem;
+    --font-base: 0.85rem;
+    --font-lg: 1.05rem;
+    --font-xl: 1.15rem;
+}

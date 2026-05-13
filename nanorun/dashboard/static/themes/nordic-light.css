@@ -1,0 +1,73 @@
+/*
+ * Nordic Light Theme
+ * "Overcast fjord morning, snow on birch bark."
+ *
+ * Cool gray-white backgrounds, slate text,
+ * same Nord accent family adjusted for light bg readability.
+ */
+
+:root {
+    /* Backgrounds — snow and birch whites */
+    --bg-dark: #eceff4;
+    --bg-card: #f8f9fb;
+    --bg-card-hover: #e8ecf2;
+    --bg-hover: #e0e5ec;
+    --bg-selected: #d8dee8;
+    /* Text — slate darks, not warm */
+    --text-primary: #2e3440;
+    --text-secondary: #4c566a;
+    --text-tertiary: #6b7a8e;
+    --text-placeholder: #9aa5b4;
+    /* Borders — cool grays */
+    --border-subtle: #e0e5ec;
+    --border: #cdd4de;
+    --border-hover: #b0b8c6;
+    --border-active: #7a8696;
+    /* Semantic — darkened Nord accents */
+    --accent: #4a8a96;
+    --accent-dim: #88c0d0;
+    --success: #5a8a5a;
+    --warning: #a67c28;
+    --error: #a03a42;
+    --info: #4a7098;
+    --selection: #2e3440;
+    /* Experiment UI — darkened for light bg */
+    --track-color: #4a7098;
+    --hash-color: #5a6878;
+    --env-color: #3a7a88;
+    --run-id-color: #a06040;
+    --sweep-color: #7a5a80;
+    --session-color: #5a7848;
+    --n-runs-color: #a03a42;
+    /* Heatmap — pastel for dark text readability */
+    --heatmap-good: 190, 218, 190;
+    --heatmap-bad: 230, 178, 178;
+    /* Diff — darkened accents on light bg */
+    --diff-bg: #f0f3f8;
+    --diff-text: #2e3440;
+    --diff-hunk: #4a7098;
+    --diff-add: #4a7848;
+    --diff-del: #a03a42;
+    /*
+     * Chart — Nord accent ring, saturation
+     * bumped for visibility on snow-white bg
+     */
+    --chart-1: #4a8a96;  /* frost blue darkened */
+    --chart-2: #5a8a5a;  /* aurora green darkened */
+    --chart-3: #a08428;  /* gold */
+    --chart-4: #a03a42;  /* muted red */
+    --chart-5: #7a5a80;  /* violet */
+    --chart-6: #3a7a78;  /* teal */
+    --chart-7: #a06040;  /* warm orange */
+    --chart-8: #3a5a8a;  /* fjord blue */
+    --chart-grid: rgba(46, 52, 64, 0.10);
+    /* Font stacks — Atkinson Hyperlegible pair */
+    --font-mono: 'Atkinson Hyperlegible Mono', 'SF Mono', 'Menlo', monospace;
+    --font-brand: 'Atkinson Hyperlegible Next', sans-serif;
+    /* Font scale */
+    --font-xs: 0.65rem;
+    --font-sm: 0.72rem;
+    --font-base: 0.8rem;
+    --font-lg: 1rem;
+    --font-xl: 1.1rem;
+}

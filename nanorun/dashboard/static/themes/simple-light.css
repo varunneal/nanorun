@@ -1,0 +1,68 @@
+/*
+ * Simple Light Theme
+ * Pure white, black, and gray. No color whatsoever.
+ */
+
+:root {
+    /* Backgrounds */
+    --bg-dark: #ffffff;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f8f8f8;
+    --bg-hover: #f0f0f0;
+    --bg-selected: #e8e8e8;
+    /* Text */
+    --text-primary: #000000;
+    --text-secondary: #333333;
+    --text-tertiary: #666666;
+    --text-placeholder: #999999;
+    /* Borders */
+    --border-subtle: #e0e0e0;
+    --border: #c0c0c0;
+    --border-hover: #999999;
+    --border-active: #666666;
+    /* Semantic — all grayscale */
+    --accent: #3a3a3a;
+    --accent-dim: #707070;
+    --success: #3d7a40;
+    --warning: #606060;
+    --error: #b84a46;
+    --info: #4a4a4a;
+    --selection: #1a1a1a;
+    /* Experiment UI — gray scale for differentiation */
+    --track-color: #4a4a4a;
+    --hash-color: #808080;
+    --env-color: #3a3a3a;
+    --run-id-color: #606060;
+    --sweep-color: #707070;
+    --session-color: #505050;
+    --n-runs-color: #404040;
+    /* Heatmap — pastel green/red, the one splash of color */
+    --heatmap-good: 180, 220, 180;
+    --heatmap-bad: 240, 180, 175;
+    /* Diff */
+    --diff-bg: #fafafa;
+    --diff-text: #1a1a1a;
+    --diff-hunk: #606060;
+    --diff-add: #3a3a3a;
+    --diff-del: #909090;
+    /* Chart — evenly spaced grays */
+    --chart-1: #1a1a1a;
+    --chart-2: #4a4a4a;
+    --chart-3: #7a7a7a;
+    --chart-4: #a0a0a0;
+    --chart-5: #333333;
+    --chart-6: #606060;
+    --chart-7: #8a8a8a;
+    --chart-8: #b0b0b0;
+    --chart-grid: rgba(0, 0, 0, 0.08);
+    /* Font stacks — clean serif body, mono for code */
+    --font-body: 'Georgia', 'Times New Roman', serif;
+    --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    --font-brand: 'Georgia', 'Times New Roman', serif;
+    /* Font scale */
+    --font-xs: 0.7rem;
+    --font-sm: 0.78rem;
+    --font-base: 0.85rem;
+    --font-lg: 1.05rem;
+    --font-xl: 1.15rem;
+}

@@ -1,0 +1,77 @@
+/* * Solarized Lab Light Theme
+ * A high-end, "academic" aesthetic for data-heavy applications.
+ * Inspired by mid-century NASA documentation and the Solarized color palette.
+ */
+
+:root {
+    /* Backgrounds - Warm, paper-like tones */
+    --bg-dark: #fdf6e3;      /* Base background */
+    --bg-card: #eee8d5;      /* Elevated surface */
+    --bg-card-hover: #e6dfcc; /* Card hover (slightly darker than card) */
+    --bg-hover: #e2dac2;     /* Subtle interactive states */
+    --bg-selected: #dcd5c1;  /* Active/Focused states */
+
+    /* Text - High readability with a soft blue-grey tint */
+    --text-primary: #3c3c3c;     /* Deep charcoal-indigo */
+    --text-secondary: #586e75;   /* Secondary descriptive text */
+    --text-tertiary: #839496;    /* Tertiary / Meta text */
+    --text-placeholder: #93a1a1; /* Input hints */
+
+    /* Borders - Soft, tactile separation */
+    --border-subtle: #e8e2cf;
+    --border: #d3ccba;
+    --border-hover: #93a1a1;
+    --border-active: #586e75;
+
+    /* Semantic - Professional tones with an "analog-digital" feel */
+    --accent: #268bd2;        /* Scientific blue */
+    --accent-dim: #2aa198;    /* Muted teal */
+    --success: #859900;       /* Green */
+    --warning: #b58900;       /* Warm ochre */
+    --error: #dc322f;         /* Deep crimson */
+    --info: #268bd2;          /* Standard info blue */
+    --selection: #f7f1df;     /* Soft text highlight */
+
+    /* Experiment UI - Distinct, scholarly categorical colors */
+    --track-color: #586e75;   /* Slate */
+    --hash-color: #859900;    /* Olive */
+    --env-color: #2aa198;     /* Cyan */
+    --run-id-color: #cb4b16;  /* Rust Orange */
+    --sweep-color: #6c71c4;   /* Violet */
+    --session-color: #d33682; /* Magenta */
+    --n-runs-color: #dc322f;  /* Red */
+
+    /* Heatmap — lighter Solarized pastels for dark text readability */
+    --heatmap-good: 200, 220, 160;
+    --heatmap-bad: 240, 180, 175;
+    /* Diff — canonical Solarized accents, readable on light */
+    --diff-bg: #fdf6e3;       /* base3 */
+    --diff-text: #073642;     /* base02 */
+    --diff-hunk: #268bd2;     /* blue */
+    --diff-add: #859900;      /* green */
+    --diff-del: #dc322f;      /* red */
+
+    /* Chart Palette - Adjusted for light background clarity */
+    --chart-1: #268bd2;       /* Blue */
+    --chart-2: #2aa198;       /* Teal */
+    --chart-3: #859900;       /* Green */
+    --chart-4: #cb4b16;       /* Orange */
+    --chart-5: #6c71c4;       /* Violet */
+    --chart-6: #d33682;       /* Magenta */
+    --chart-7: #b58900;       /* Yellow/Gold */
+    --chart-8: #586e75;       /* Slate */
+    --chart-grid: rgba(0, 0, 0, 0.08);
+
+    /* Font stacks — serif body, mono for code */
+    --font-body: 'New York', 'Times New Roman', 'Times', serif;
+    --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    --font-brand: 'New York', 'Times New Roman', 'Times', serif;
+
+    /* Typography — wider, airier for serif */
+    --letter-spacing: 0.03em;
+    --font-xs: 0.7rem;
+    --font-sm: 0.78rem;
+    --font-base: 0.85rem;
+    --font-lg: 1.05rem;
+    --font-xl: 1.15rem;
+}

@@ -133,7 +133,9 @@ When the dashboard is running (`nanorun dashboard`), these endpoints are availab
 | `/api/crash/{exp_id}` | Crash/output log |
 | `/api/queue` | Queue state: running + queued items across all sessions |
 
-### Hub (HuggingFace Buckets)
+### Hub (Log/Weight Storage)
+
+The hub supports two backends: HuggingFace Buckets (default) or S3-compatible storage. Configured in `nanorun.toml`. The public API is identical regardless of backend.
 
 | Command | Description |
 |---------|-------------|

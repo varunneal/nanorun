@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -38,6 +38,13 @@ BOOT_VERSION = str(int(time.time()))
 async def index(request: Request):
     """Main dashboard page."""
     return templates.TemplateResponse("index.html", {"request": request, "v": BOOT_VERSION})
+
+
+@app.get("/api/themes")
+async def list_themes():
+    """List available themes from the themes directory."""
+    themes_dir = DASHBOARD_DIR / "static" / "themes"
+    return [p.stem for p in sorted(themes_dir.glob("*.css"))]
 
 
 def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
@@ -278,6 +285,110 @@ async def get_queue_status():
     }
 
 
+@app.get("/api/sessions")
+async def get_sessions():
+    """Get session statuses + hub syncer state, sorted disconnected-first."""
+    from ..local_daemon import SessionState
+
+    sessions = Config.list_sessions()
+    daemon = getattr(app.state, "daemon", None)
+    hub = daemon.hub_syncer if daemon else None
+    result = []
+    for sc in sessions:
+        state = SessionState.load(sc.name)
+        result.append({
+            "name": sc.name,
+            "host": f"{sc.user}@{sc.host}:{sc.port}",
+            "gpu_type": sc.gpu_type,
+            "gpu_count": sc.gpu_count,
+            "status": state.status,
+            "last_error": state.last_error,
+            "metrics_synced": state.metrics_synced,
+            "tracking_experiment_id": state.tracking_experiment_id,
+        })
+    result.sort(key=lambda s: (0 if s["status"] == "disconnected" else 1, s["name"]))
+    return {
+        "sessions": result,
+        "hub": {
+            "status": hub.status if hub else "unknown",
+            "last_error": hub.last_error if hub else None,
+            "last_sync_at": hub.last_sync_at if hub else None,
+        },
+    }
+
+
+@app.post("/api/sessions/{name}/reconnect")
+async def reconnect_session(name: str):
+    """Trigger a reconnect attempt for a disconnected session."""
+    daemon = app.state.daemon
+    if not daemon:
+        return JSONResponse({"error": "Daemon not available"}, status_code=503)
+    ok = daemon.reconnect_session(name)
+    return {"success": ok, "message": "Reconnecting..." if ok else "Session not found"}
+
+
+@app.post("/api/hub/reconnect")
+async def reconnect_hub():
+    """Trigger a reconnect attempt for the hub syncer."""
+    daemon = app.state.daemon
+    if not daemon:
+        return JSONResponse({"error": "Daemon not available"}, status_code=503)
+    ok = daemon.reconnect_hub()
+    return {"success": ok, "message": "Hub reconnecting..." if ok else "Hub syncer already running"}
+
+
+@app.delete("/api/sessions/{name}")
+async def delete_session(name: str):
+    """Remove a session (only if disconnected)."""
+    import shutil
+    from ..local_daemon import SessionState
+
+    state = SessionState.load(name)
+    if state.status == "connected":
+        return JSONResponse(
+            {"error": "Cannot remove a connected session. Disconnect first."},
+            status_code=400,
+        )
+    Config.delete_session(name)
+    state_dir = Config.get_session_state_dir(name)
+    if state_dir.exists():
+        shutil.rmtree(state_dir, ignore_errors=True)
+    daemon = getattr(app.state, "daemon", None)
+    if daemon and hasattr(daemon, "remove_session"):
+        daemon.remove_session(name)
+    return {"success": True, "message": f"Session '{name}' removed"}
+
+
+@app.post("/api/sessions/{name}/daemon-restart")
+async def restart_remote_daemon(name: str):
+    """Restart the remote daemon for a session (stop + start)."""
+    import threading
+    from ..remote_control import get_daemon_client, DaemonError
+
+    def _do_restart():
+        client = get_daemon_client(name)
+        if client:
+            with client:
+                try:
+                    client.restart_daemon()
+                except DaemonError:
+                    pass
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return {"success": True, "message": "Daemon restart initiated"}
+
+
+@app.get("/api/sessions/{name}/daemon-status")
+async def get_session_daemon_status(name: str):
+    """Get remote daemon status (experiment, queue, GPU) for a connected session."""
+    from ..queue import get_daemon_status
+
+    status = get_daemon_status(session_name=name)
+    if not status:
+        return JSONResponse({"error": "Could not reach daemon"}, status_code=503)
+    return status
+
+
 @app.get("/api/experiment/{exp_id}")
 async def get_experiment_detail(exp_id: int):
     """Get detailed data for a single experiment including loss curve."""
@@ -449,7 +560,7 @@ async def get_script_notes(script_path: str):
     notes_file = script_file.parent / f"{script_file.stem}.notes.md"
 
     if not notes_file.exists():
-        return JSONResponse({"error": "No notes file found"}, status_code=404)
+        return Response(status_code=204)
 
     try:
         content = notes_file.read_text()

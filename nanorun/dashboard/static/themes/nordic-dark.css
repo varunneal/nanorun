@@ -1,0 +1,74 @@
+/*
+ * Nordic Dark Theme
+ * "Polar night, aurora overhead, ice underfoot."
+ *
+ * Deep blue-charcoal backgrounds inspired by Nord palette,
+ * frost-blue accents, aurora greens and magentas in charts.
+ */
+
+:root {
+    /* Backgrounds — polar night blues */
+    --bg-dark: #1a1e2e;
+    --bg-card: #222738;
+    --bg-card-hover: #181c2a;
+    --bg-hover: #2a3048;
+    --bg-selected: #141828;
+    /* Text — frost whites and ice grays */
+    --text-primary: #e5e9f0;
+    --text-secondary: #9aa5b4;
+    --text-tertiary: #6b7a8e;
+    --text-placeholder: #4c5b6e;
+    /* Borders — slate blues */
+    --border-subtle: #2e3548;
+    --border: #3b4558;
+    --border-hover: #4c5a70;
+    --border-active: #6b7a8e;
+    /* Semantic — frost blue accent */
+    --accent: #88c0d0;
+    --accent-dim: #5e8a96;
+    --success: #a3be8c;
+    --warning: #ebcb8b;
+    --error: #bf616a;
+    --info: #81a1c1;
+    --selection: #e5e9f0;
+    /* Experiment UI — Nord accent palette */
+    --track-color: #81a1c1;
+    --hash-color: #6b7a8e;
+    --env-color: #88c0d0;
+    --run-id-color: #d08770;
+    --sweep-color: #b48ead;
+    --session-color: #a3be8c;
+    --n-runs-color: #bf616a;
+    /* Heatmap — aurora green to warm red */
+    --heatmap-good: 104, 168, 120;
+    --heatmap-bad: 191, 97, 106;
+    /* Diff — frost-tinted */
+    --diff-bg: #161a28;
+    --diff-text: #e5e9f0;
+    --diff-hunk: #81a1c1;
+    --diff-add: #a3be8c;
+    --diff-del: #bf616a;
+    /*
+     * Chart — aurora borealis palette
+     * Greens, blues, magentas — the colors you'd see
+     * looking up from Tromsø
+     */
+    --chart-1: #88c0d0;  /* frost blue */
+    --chart-2: #a3be8c;  /* aurora green */
+    --chart-3: #ebcb8b;  /* warm gold */
+    --chart-4: #bf616a;  /* muted red */
+    --chart-5: #b48ead;  /* aurora violet */
+    --chart-6: #8fbcbb;  /* teal frost */
+    --chart-7: #d08770;  /* warm orange */
+    --chart-8: #5e81ac;  /* deep fjord blue */
+    --chart-grid: rgba(229, 233, 240, 0.08);
+    /* Font stacks — Atkinson Hyperlegible pair */
+    --font-mono: 'Atkinson Hyperlegible Mono', 'SF Mono', 'Menlo', monospace;
+    --font-brand: 'Atkinson Hyperlegible Next', sans-serif;
+    /* Font scale */
+    --font-xs: 0.65rem;
+    --font-sm: 0.72rem;
+    --font-base: 0.8rem;
+    --font-lg: 1rem;
+    --font-xl: 1.1rem;
+}
