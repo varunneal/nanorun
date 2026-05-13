@@ -860,29 +860,33 @@ def job_queue(ctx, flat, session_name):
             parts = [f"{i}.", exp.script]
             if env_str:
                 parts.append(env_str)
-            if exp.track:
-                parts.append(f"[{exp.track}]")
             if show_session and exp.session_name:
                 parts.append(f"({exp.session_name})")
             print(" ".join(parts))
         return
 
+    show_session = session_name is None and len(set(e.session_name for e in queued)) > 1
     table = Table(title=f"Queued Experiments ({len(queued)})")
     table.add_column("#", style="dim", justify="right")
     table.add_column("Script", style="cyan")
     table.add_column("Env")
     table.add_column("Track")
     table.add_column("GPUs", justify="right")
+    if show_session:
+        table.add_column("Session", style="magenta")
 
     for i, exp in enumerate(queued, 1):
         env_str = ", ".join(f"{k}={v}" for k, v in exp.env_vars.items()) if exp.env_vars else "[dim]-[/dim]"
-        table.add_row(
+        row = [
             str(i),
             exp.script,
             env_str[:30] + "..." if len(env_str) > 30 else env_str,
             exp.track or "[dim]-[/dim]",
             f"{exp.gpus}x {exp.gpu_type}",
-        )
+        ]
+        if show_session:
+            row.append(exp.session_name or "-")
+        table.add_row(*row)
 
     console.print(table)
 

@@ -460,6 +460,20 @@ class SessionTracker:
 
     def _start_tracking(self, exp_id: int, run_id: Optional[str]):
         exp = get_experiment(exp_id)
+        if not exp:
+            # Experiment not in DB yet — fetch mapping from remote and create it
+            if self.rpc:
+                try:
+                    r = self.rpc.call(Method.GET_MAPPING, experiment_id=exp_id, timeout=10)
+                    if r.get("success") and r.get("mapping"):
+                        self._create_experiment(exp_id, r["mapping"])
+                        exp = get_experiment(exp_id)
+                except Exception as e:
+                    log.warning(f"[{self.session_name}] Failed to fetch mapping for {exp_id}: {e}")
+            if not exp:
+                # Still not available — process local mappings as fallback
+                self._process_mappings_file()
+                exp = get_experiment(exp_id)
         name = Path(exp.script).name if exp and getattr(exp, "script", None) else None
         self.event(f"Tracking experiment {exp_id}" + (f" ({name})" if name else ""))
         conn = get_db()
