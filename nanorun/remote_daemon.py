@@ -37,7 +37,7 @@ try:
 except Exception:
     HUB_AVAILABLE = False
 
-REPO_DIR = Path.home() / "nanorun"
+REPO_DIR = Path.cwd()
 DAEMON_DIR = REPO_DIR / ".daemon"
 MAPPINGS_DIR = DAEMON_DIR / "mappings"
 OUTPUT_DIR = DAEMON_DIR / "output"
