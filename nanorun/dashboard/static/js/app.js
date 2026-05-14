@@ -648,7 +648,7 @@ function renderSessionChips() {
     if (!hubContainer) return;
     const hubStatus = _hubData.status || 'unknown';
     const hubClass = hubStatus === 'connected' ? 'connected' : 'disconnected';
-    const hubSuffix = hubStatus === 'error' ? ' <span class="chip-suffix connecting">paused</span>' : '';
+    const hubSuffix = hubStatus !== 'connected' ? ' <span class="chip-suffix connecting">paused</span>' : '';
     hubContainer.innerHTML = `<div class="session-chip ${hubClass}" onclick="onHubChipClick()" data-hub="hub"><span class="chip-icon">↓</span>logs${hubSuffix}</div>`;
 }
 
@@ -665,7 +665,7 @@ function openHubPopover() {
     popover.id = 'session-popover';
     popover.onclick = e => e.stopPropagation();
     const h = _hubData;
-    let body = `<div class="sp-header"><span class="sp-name">logs</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info">HF Hub log sync</div>`;
+    let body = `<div class="sp-header"><span class="sp-name">logs</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info">Hub log sync</div>`;
     if (h.status === 'connected') {
         const syncLabel = h.last_sync_at ? `Last sync: ${h.last_sync_at}` : 'Syncing...';
         body += `<div class="sp-info" style="color:var(--accent)">${syncLabel}</div>`;

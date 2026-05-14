@@ -374,7 +374,7 @@ class NanorunDaemon:
     def _kernels_symlink_cmd(self, script_path: str, kernels_path: str) -> str:
         script_dir = Path(script_path).parent
         kernels_dir = Path(kernels_path).parent
-        target = Path(kernels_path).name if str(kernels_dir) == str(script_dir) else f"$HOME/nanorun/{kernels_path}"
+        target = Path(kernels_path).name if str(kernels_dir) == str(script_dir) else str(Path.cwd() / kernels_path)
         return f"ln -sf {target} {script_dir}/triton_kernels.py"
 
     # --- tmux ---
@@ -446,7 +446,7 @@ class NanorunDaemon:
         if cmd_prefix:
             torchrun = f"{cmd_prefix} {torchrun}"
         output_file = OUTPUT_DIR / f"{exp_id}.txt"
-        parts = ["source $HOME/.local/bin/env", "source .venv/bin/activate"]
+        parts = ["source .venv/bin/activate"]
         if symlink_cmd:
             parts.append(symlink_cmd)
         parts.append(f"{env_str}{torchrun} 2>&1 | tee {output_file}")

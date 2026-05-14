@@ -28,6 +28,7 @@ class SessionConfig:
     tmux_session: str = "nanorun"
     key_file: Optional[str] = None  # Path to SSH private key (-i flag)
     ssh_options: Optional[List[str]] = None  # Extra SSH -o options (e.g. ["IdentitiesOnly=yes"])
+    use_pty: bool = False  # Request PTY for exec (needed for RunPod SSH proxy)
 
 
 @dataclass

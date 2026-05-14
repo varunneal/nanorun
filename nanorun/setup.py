@@ -57,6 +57,27 @@ def _cuda_version_to_torch_tag(version: str) -> str:
         return f"cu{major}{minor}"
 
 
+def resolve_repo_path(remote: RemoteSession, configured_path: str) -> str:
+    """Resolve repo path to an absolute path on the remote.
+
+    Some providers (e.g. Jarvis Labs) set HOME incorrectly (/home instead of /root),
+    so we resolve ~ by querying the remote's actual home directory via getent.
+    """
+    if not configured_path.startswith("~"):
+        return configured_path
+    # getent passwd is authoritative — reads /etc/passwd regardless of env vars
+    result = remote.run("getent passwd $(whoami) | cut -d: -f6")
+    if result.success and result.stdout.strip():
+        home = result.stdout.strip()
+        if home and home != "/":
+            return configured_path.replace("~", home, 1)
+    # Fallback for root (some minimal containers lack getent)
+    result = remote.run("id -u")
+    if result.success and result.stdout.strip() == "0":
+        return configured_path.replace("~", "/root", 1)
+    return configured_path
+
+
 def detect_gpu_type(remote: RemoteSession) -> str:
     """Detect GPU type from nvidia-smi output."""
     result = remote.run("nvidia-smi --query-gpu=name --format=csv,noheader | head -1")
@@ -188,8 +209,8 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     # Step 3: Install uv
     console.print("\n[bold]Step 3: Install uv[/bold]")
 
-    # Check if uv already installed
-    result = remote.run("which uv || ~/.local/bin/uv --version")
+    # Check if uv already installed (search common locations since ~ may be broken)
+    result = remote.run("which uv || /root/.local/bin/uv --version 2>/dev/null || find /usr/local/bin /root/.local/bin -name uv 2>/dev/null | head -1")
     if result.success:
         console.print("  [green]uv already installed[/green]")
     else:
@@ -202,12 +223,28 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
             else:
                 console.print(f"  [red]Failed: {result.stderr}[/red]")
 
-    # Get repo path for use in subsequent steps
-    repo_path = config.session.repo_path.replace("~", "$HOME")
+    # Resolve repo path — some providers (Jarvis Labs) set HOME incorrectly
+    repo_path = resolve_repo_path(remote, config.session.repo_path)
+    if repo_path != config.session.repo_path:
+        console.print(f"  [yellow]HOME is misconfigured on remote, using absolute path: {repo_path}[/yellow]")
+        config.session.repo_path = repo_path
+        config.save()
+
+    # Derive home_dir from resolved repo_path (parent of /root/nanorun -> /root)
+    from pathlib import PurePosixPath
+    home_dir = str(PurePosixPath(repo_path).parent)
+
+    # Build a PATH prefix that finds uv regardless of where it's installed
+    # (some providers put it in ~/.local/bin, others in conda, etc.)
+    result = remote.run(f"which uv || find {home_dir}/.local/bin /usr/local/bin -name uv 2>/dev/null | head -1")
+    uv_dir = ""
+    if result.success and result.stdout.strip():
+        uv_dir = str(PurePosixPath(result.stdout.strip().splitlines()[0]).parent)
+    path_prefix = f"export PATH={uv_dir}:$PATH && " if uv_dir else ""
 
     # Ensure GitHub SSH uses IPv4 (IPv6/NAT64 can hang under load)
-    remote.run('mkdir -p ~/.ssh && grep -q "Host github.com" ~/.ssh/config 2>/dev/null '
-               '|| printf "Host github.com\\n    AddressFamily inet\\n" >> ~/.ssh/config')
+    remote.run(f'mkdir -p {home_dir}/.ssh && grep -q "Host github.com" {home_dir}/.ssh/config 2>/dev/null '
+               f'|| printf "Host github.com\\n    AddressFamily inet\\n" >> {home_dir}/.ssh/config')
 
     # Step 4: Clone repo (must happen before venv/packages)
     console.print("\n[bold]Step 4: Clone repository[/bold]")
@@ -245,7 +282,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     console.print("\n[bold]Step 5: Create Python environment[/bold]")
 
     # Source uv and create venv in repo directory
-    venv_cmd = f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && uv venv --python 3.12"
+    venv_cmd = f"{path_prefix}cd {repo_path} && uv venv --python 3.12"
     if confirm("  Create Python 3.12 venv?", default=True):
         console.print("  [dim]Creating venv in repo directory...[/dim]")
         result = remote.run(venv_cmd, timeout=60)
@@ -260,7 +297,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     console.print(f"  [dim]{torch_cmd}[/dim]")
 
     if confirm("  Install PyTorch nightly?", default=True):
-        full_cmd = f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && source .venv/bin/activate && {torch_cmd}"
+        full_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && {torch_cmd}"
         console.print("  [dim]Installing PyTorch (this may take a few minutes)...[/dim]")
         result = remote.run(full_cmd, timeout=300)
         if result.success:
@@ -274,7 +311,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     console.print(f"  [dim]{flash_cmd}[/dim]")
 
     if confirm("  Install flash_attn_3?", default=True):
-        full_cmd = f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && source .venv/bin/activate && {flash_cmd}"
+        full_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && {flash_cmd}"
         console.print("  [dim]Installing flash_attn_3...[/dim]")
         result = remote.run(full_cmd, timeout=300)
         if result.success:
@@ -284,17 +321,30 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
 
     # Step 8: Install other deps
     console.print("\n[bold]Step 8: Install dependencies[/bold]")
-    deps = "huggingface-hub websockets tqdm numpy kernels setuptools datasets tiktoken"
+    deps = "huggingface-hub websockets tqdm numpy kernels setuptools datasets tiktoken nvidia-cuda-nvcc"
     console.print(f"  [dim]Will install: {deps}[/dim]")
 
     if confirm("  Install dependencies?", default=True):
-        deps_cmd = f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && source .venv/bin/activate && uv pip install {deps}"
+        deps_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && uv pip install {deps}"
         console.print("  [dim]Installing...[/dim]")
         result = remote.run(deps_cmd, timeout=120)
         if result.success:
             console.print("  [green]Dependencies installed[/green]")
         else:
             console.print(f"  [red]Failed: {result.stderr}[/red]")
+
+        # Symlink /usr/local/cuda -> venv's nvidia CUDA package so torch can find headers
+        cuda_link_cmd = (
+            f"{path_prefix}cd {repo_path} && "
+            f"CUDA_PKG=$(python3 -c \"import nvidia.cu13; import os; print(os.path.dirname(nvidia.cu13.__file__))\" 2>/dev/null "
+            f"|| .venv/bin/python -c \"import nvidia.cu13; import os; print(os.path.dirname(nvidia.cu13.__file__))\") && "
+            f"{sudo_prefix}ln -sfn $CUDA_PKG /usr/local/cuda"
+        )
+        result = remote.run(cuda_link_cmd, timeout=30)
+        if result.success:
+            console.print("  [green]CUDA headers linked at /usr/local/cuda[/green]")
+        else:
+            console.print(f"  [yellow]CUDA symlink failed (non-critical): {result.stderr}[/yellow]")
 
     # Step 9: HuggingFace auth
     console.print("\n[bold]Step 9: HuggingFace authentication[/bold]")
@@ -306,10 +356,10 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
         if hf_token:
             # Write token to remote file, then login from it (avoids token in process list)
             hf_cmd = (
-                f"mkdir -p ~/.cache/huggingface && "
-                f"cat > ~/.cache/huggingface/token && "
-                f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && source .venv/bin/activate && "
-                f"hf auth login --token $(cat ~/.cache/huggingface/token) --add-to-git-credential"
+                f"mkdir -p {home_dir}/.cache/huggingface && "
+                f"cat > {home_dir}/.cache/huggingface/token && "
+                f"{path_prefix}cd {repo_path} && source .venv/bin/activate && "
+                f"hf auth login --token $(cat {home_dir}/.cache/huggingface/token) --add-to-git-credential"
             )
             console.print("  [dim]Logging in to HuggingFace on remote...[/dim]")
             # Use exec_command to pipe token via stdin
@@ -338,7 +388,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
 
     if confirm("  Download speedrun data?", default=True):
         data_cmd = (
-            f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && "
+            f"{path_prefix}cd {repo_path} && "
             f"source .venv/bin/activate && python data/cached_fineweb10B.py 24"
         )
         console.print("  [dim]Downloading data (this may take a while)...[/dim]")
@@ -355,7 +405,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     #
     # if confirm("  Download slowrun data?", default=True):
     #     data_cmd = (
-    #         f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && "
+    #         f"{path_prefix}cd {repo_path} && "
     #         f"source .venv/bin/activate && python data/prepare_slowrun_data.py"
     #     )
     #     console.print("  [dim]Downloading and tokenizing data (this may take a while)...[/dim]")
@@ -373,7 +423,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     # if confirm("  Download parameter golf data?", default=False):
     #     # sp1024 from official repo
     #     sp1024_cmd = (
-    #         f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && "
+    #         f"{path_prefix}cd {repo_path} && "
     #         f"source .venv/bin/activate && "
     #         f"uv pip install -q sentencepiece huggingface-hub && "
     #         f"python experiments/parameter-golf/cached_challenge_fineweb.py --variant sp1024 --train-shards 80"
@@ -387,7 +437,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     #
     #     # sp8192 from sproos/parameter-golf-tokenizers
     #     sp8192_cmd = (
-    #         f"export PATH=$HOME/.local/bin:$PATH && cd {repo_path} && "
+    #         f"{path_prefix}cd {repo_path} && "
     #         f"source .venv/bin/activate && "
     #         f"python -c \""
     #         f"from huggingface_hub import snapshot_download; "
@@ -421,7 +471,8 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
 def verify_setup(remote: RemoteSession) -> bool:
     """Verify that the remote machine is properly set up."""
     config = Config.load()
-    repo_path = config.session.repo_path if config.session else "~/nanorun"
+    configured_path = config.session.repo_path if config.session else "~/nanorun"
+    repo_path = resolve_repo_path(remote, configured_path)
 
     console.print(Panel.fit(
         "[bold cyan]Verifying setup...[/bold cyan]",

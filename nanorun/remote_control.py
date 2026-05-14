@@ -98,6 +98,75 @@ class RemoteSession:
             self._client = client
             return client
 
+    def _run_via_shell(self, client: paramiko.SSHClient, command: str, timeout: Optional[int]) -> CommandResult:
+        """Execute command via interactive shell (for proxies that reject exec_command)."""
+        import re
+        transport = client.get_transport()
+        channel = transport.open_session()
+        if timeout:
+            channel.settimeout(timeout)
+        channel.get_pty(term='dumb', width=200, height=50)
+        channel.invoke_shell()
+
+        # Drain login banner
+        time.sleep(1)
+        while channel.recv_ready():
+            channel.recv(65536)
+
+        # Disable echo and bracket-paste mode for clean output parsing
+        channel.sendall(b"stty -echo; bind 'set enable-bracketed-paste off' 2>/dev/null\n")
+        time.sleep(0.5)
+        while channel.recv_ready():
+            channel.recv(65536)
+
+        # Send command wrapped in markers to extract output and exit code
+        marker = f"__NANORUN_{id(channel)}__"
+        wrapped = f"echo {marker}_START; {command}; EC=$?; echo {marker}_END_$EC\n"
+        channel.sendall(wrapped.encode())
+
+        # Read until we see the end marker
+        output = b""
+        deadline = time.time() + (timeout or 30)
+        while time.time() < deadline:
+            if channel.recv_ready():
+                output += channel.recv(65536)
+                if f"{marker}_END_".encode() in output:
+                    # Give a moment for any trailing data
+                    time.sleep(0.1)
+                    while channel.recv_ready():
+                        output += channel.recv(65536)
+                    break
+            else:
+                time.sleep(0.1)
+
+        channel.close()
+
+        # Parse output between markers
+        decoded = output.decode('utf-8', errors='replace')
+        decoded = decoded.replace('\r\n', '\n')
+        # Strip ANSI escape sequences
+        decoded = re.sub(r'\x1b\[[^m]*m|\x1b\][^\x07]*\x07|\x1b\[\?[0-9]*[hl]', '', decoded)
+
+        start_marker = f"{marker}_START\n"
+        end_marker_prefix = f"{marker}_END_"
+
+        stdout_str = ""
+        returncode = -1
+
+        start_idx = decoded.find(start_marker)
+        if start_idx >= 0:
+            after_start = decoded[start_idx + len(start_marker):]
+            end_idx = after_start.find(end_marker_prefix)
+            if end_idx >= 0:
+                stdout_str = after_start[:end_idx]
+                # Extract exit code
+                rest = after_start[end_idx + len(end_marker_prefix):]
+                code_match = re.match(r'(\d+)', rest)
+                if code_match:
+                    returncode = int(code_match.group(1))
+
+        return CommandResult(stdout=stdout_str, stderr="", returncode=returncode)
+
     def close(self):
         """Close the SSH connection."""
         with self._lock:
@@ -116,6 +185,9 @@ class RemoteSession:
         """Run a command on the remote machine."""
         try:
             client = self._get_client()
+
+            if self.config.use_pty:
+                return self._run_via_shell(client, command, timeout)
 
             # Execute command
             stdin, stdout, stderr = client.exec_command(
@@ -455,8 +527,9 @@ class DaemonClient:
         # tee to a persistent log so we still have errors after tmux scrollback
         # is lost on restart. -u makes Python unbuffered so output lands promptly.
         session_name = self.remote.config.name
+        repo_path = self.remote.config.repo_path
         daemon_cmd = (
-            f"cd ~/nanorun && mkdir -p .daemon && source .venv/bin/activate && "
+            f"cd {repo_path} && mkdir -p .daemon && source .venv/bin/activate && "
             f"python -u -m nanorun.remote_daemon --session {session_name} 2>&1 "
             f"| tee -a .daemon/daemon.log"
         )

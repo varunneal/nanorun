@@ -139,16 +139,19 @@ class HubSyncer:
 
     SYNC_INTERVAL = 10.0
 
+    STALE_THRESHOLD = 30.0  # seconds without successful sync = stale
+
     def __init__(self, daemon: "LocalMetricsDaemon"):
         self.daemon = daemon
         self.running = True
-        self.status: str = "disconnected"  # disconnected, connected, error
+        self.status: str = "disconnected"  # disconnected, connected, error, stale
         self.last_error: Optional[str] = None
         self.last_sync_at: Optional[str] = None
         self._thread: Optional[threading.Thread] = None
         self._was_connected: bool = False
         self._consecutive_failures: int = 0
         self._last_sync: float = 0
+        self._last_successful_sync: float = 0
 
     def start(self):
         self._thread = threading.Thread(
@@ -187,11 +190,18 @@ class HubSyncer:
         self.status = "connected"
         self._was_connected = True
         self.event("Hub connected")
+        self._last_successful_sync = time.monotonic()
         while self.running:
             now = time.monotonic()
             if now - self._last_sync >= self.SYNC_INTERVAL:
                 self._do_sync()
                 self._last_sync = now
+            # If no successful sync in 30s, disconnect and wait for user reconnect
+            if now - self._last_successful_sync > self.STALE_THRESHOLD:
+                self.status = "error"
+                self.last_error = "Hub sync stale (no successful sync in 30s)"
+                self.event("Hub disconnected — sync stale")
+                return
             time.sleep(1)
         log.info("[hub] Syncer stopped")
 
@@ -209,11 +219,18 @@ class HubSyncer:
             self.last_error = f"Hub connection lost: {e}"
             return False
 
+    SYNC_TIMEOUT = 20.0  # kill sync call if it hangs longer than this
+
     def _do_sync(self):
         sessions = list(self.daemon.trackers.keys())
         for session_name in sessions:
             try:
-                _sync_all_logs(session_name)
+                self._sync_with_timeout(session_name)
+            except TimeoutError:
+                self._consecutive_failures += 1
+                if self._consecutive_failures == 1:
+                    log.warning(f"[hub] Sync timed out for {session_name}")
+                return
             except Exception as e:
                 err_str = str(e)
                 self._consecutive_failures += 1
@@ -232,7 +249,26 @@ class HubSyncer:
                     self.running = False
                 return
         self._consecutive_failures = 0
+        self._last_successful_sync = time.monotonic()
         self.last_sync_at = datetime.now().strftime("%H:%M:%S")
+
+    def _sync_with_timeout(self, session_name: str):
+        """Run sync in a worker thread with a timeout to prevent hanging."""
+        exc_box = [None]
+
+        def _worker():
+            try:
+                _sync_all_logs(session_name)
+            except Exception as e:
+                exc_box[0] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=self.SYNC_TIMEOUT)
+        if t.is_alive():
+            raise TimeoutError(f"Sync for {session_name} hung for >{self.SYNC_TIMEOUT}s")
+        if exc_box[0]:
+            raise exc_box[0]
 
 
 _log_offsets: dict[str, int] = {}

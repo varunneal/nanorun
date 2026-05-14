@@ -31,13 +31,18 @@ def _resolve_session(ctx, param, value):
             console.print(f"[red]Session '{value}' not found.[/red]")
             raise SystemExit(1)
         return value
-    name = Config.get_active_session_name()
-    if name:
-        return name
+    from .local_daemon import SessionState
     from .remote_control import _find_sole_connected_session
+    name = Config.get_active_session_name()
+    if name and SessionState.load(name).status == "connected":
+        return name
+    # Active session is disconnected or unset — try sole connected session
     sole = _find_sole_connected_session()
     if sole:
         return sole
+    # Fall back to active even if disconnected (commands will fail with SSH error)
+    if name:
+        return name
     console.print("[red]No active session. Run 'nanorun session start <host>' first.[/red]")
     raise SystemExit(1)
 
@@ -104,7 +109,8 @@ def session():
 @click.option("--key-file", "-i", default=None, help="Path to SSH private key file")
 @click.option("--ssh-option", "-o", multiple=True, help="Extra SSH -o options (e.g. -o IdentitiesOnly=yes)")
 @click.option("--name", "-n", default=None, help="Session name (auto-generated if not specified)")
-def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str):
+@click.option("--pty", is_flag=True, help="Request PTY for commands (needed for RunPod SSH proxy)")
+def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str, pty: bool):
     """Connect to a remote machine.
 
     HOST should be in format user@hostname or just hostname (defaults to root@).
@@ -138,6 +144,7 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
         port=port,
         key_file=key_file,
         ssh_options=list(ssh_option) if ssh_option else None,
+        use_pty=pty,
     )
 
     remote = RemoteSession(session_config)
@@ -163,6 +170,13 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
     gpu_count = detect_gpu_count(remote)
     session_config.gpu_count = gpu_count
     console.print(f"[dim]GPU count: {gpu_count} (detected)[/dim]")
+
+    # Resolve repo_path to absolute if HOME is misconfigured
+    from .setup import resolve_repo_path
+    resolved_path = resolve_repo_path(remote, session_config.repo_path)
+    if resolved_path != session_config.repo_path:
+        session_config.repo_path = resolved_path
+        console.print(f"[yellow]HOME is misconfigured on remote, using: {resolved_path}[/yellow]")
 
     # Check for tmux
     if not remote.check_tmux():
@@ -279,7 +293,6 @@ def session_status(session_name):
 def session_list():
     """List all saved sessions."""
     sessions = Config.list_sessions()
-    active_name = Config.get_active_session_name()
 
     if not sessions:
         console.print("[yellow]No sessions found.[/yellow]")
@@ -287,6 +300,15 @@ def session_list():
         return
 
     from .local_daemon import SessionState
+    from .remote_control import _find_sole_connected_session
+
+    # Determine the effective active session (matches _resolve_session logic)
+    active_name = Config.get_active_session_name()
+    states = {s.name: SessionState.load(s.name) for s in sessions}
+    if active_name and states.get(active_name, SessionState()).status == "connected":
+        effective_active = active_name
+    else:
+        effective_active = _find_sole_connected_session() or active_name
 
     table = Table(title="Sessions")
     table.add_column("Name", style="cyan")
@@ -296,8 +318,8 @@ def session_list():
     table.add_column("Active", justify="center")
 
     for s in sessions:
-        is_active = "[green]*[/green]" if s.name == active_name else ""
-        state = SessionState.load(s.name)
+        is_active = "[green]*[/green]" if s.name == effective_active else ""
+        state = states[s.name]
         status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
         status_str = f"[{status_color}]{state.status}[/{status_color}]"
         table.add_row(
