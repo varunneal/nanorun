@@ -705,7 +705,7 @@ template<typename T> __device__ constexpr T CEIL_DIV(T a, T b) { return (a + b -
 //  return 1.0f / (1.0f + __expf(-x));
 //}
 __device__ float sigmoid(float x) {
-  return 0.5f + __tanhf(x * 0.5f) * 0.5f;
+  return 0.5f + tanhf(x * 0.5f) * 0.5f;
 }
 
 extern "C"
