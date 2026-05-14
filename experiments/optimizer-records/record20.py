@@ -109,7 +109,7 @@ ATTN_SOAP_FADE_END_STEP = 1000000000
 NO_CONTRA_PARAM = ""
 NO_SOFTMUON_PARAM = ""
 TRAIN_PROGRESS_INTERVAL = 0
-LOG_DIR = Path("experiment-logs/all-runs/2026-05-09/validation-ceil-0.8")
+LOG_DIR = Path("logs")
 
 
 ########################################

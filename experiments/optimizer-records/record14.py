@@ -366,8 +366,8 @@ assert 8 % dist.get_world_size() == 0
 
 # logging setup
 if dist.get_rank() == 0:
-    os.makedirs("logs_v18", exist_ok=True)
-    logfile = f"logs_v18/{uuid.uuid4()}.txt"
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{uuid.uuid4()}.txt"
     print(logfile)
 def print0(s, console=False, log=True):
     if dist.get_rank() == 0:

@@ -334,7 +334,7 @@ function renderRunsTable() {
                     <td>
                         ${d.remote_run_id
                             ? `<span class="meta-run-id copyable" title="Click to copy · ⌘+click to open log" onclick="event.stopPropagation(); if (event.metaKey || event.ctrlKey) { window.open('/api/logs/${d.remote_run_id}', '_blank'); } else { copyToClipboard('${d.remote_run_id}', this); }">${d.remote_run_id}</span>`
-                            : '<span class="meta-hash-missing">none</span>'}${d.status === 'failed' && d.crash_log
+                            : '<span class="meta-hash-missing">none</span>'}${d.status === 'failed'
                             ? `<span class="log-sep">|</span><a href="/api/crash/${d.id}" target="_blank" class="crash-log-link" onclick="event.stopPropagation()">CRASH LOG</a>`
                             : ''}
                     </td>

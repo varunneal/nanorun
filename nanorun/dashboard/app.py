@@ -514,9 +514,22 @@ async def list_tracks():
 async def get_log_file(run_id: str):
     """Get the log file content for a remote run."""
     logs_dir = Config.get_config_dir() / "logs"
-    log_file = logs_dir / f"{run_id}.txt"
+    # Logs are stored per-session: logs/{session}/{run_id}.txt
+    # Also check flat dir for pre-migration logs
+    log_file = None
+    flat = logs_dir / f"{run_id}.txt"
+    if flat.exists():
+        log_file = flat
+    else:
+        for session_dir in logs_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            candidate = session_dir / f"{run_id}.txt"
+            if candidate.exists():
+                log_file = candidate
+                break
 
-    if not log_file.exists():
+    if not log_file:
         return JSONResponse({"error": f"Log file not found: {run_id}.txt"}, status_code=404)
 
     try:

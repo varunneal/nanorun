@@ -114,9 +114,20 @@ def record_crash(session_name: str, experiment_id: int, crash_log: Optional[str]
         pass
 
 
+def _append_queue_history(session_name: str, ts: str, queue_items: list):
+    history_file = PATHS._config_dir / "queue_history.jsonl"
+    entry = json.dumps({"ts": ts, "session": session_name, "queue": queue_items})
+    with open(history_file, "a") as f:
+        f.write(entry + "\n")
+
+
 def _sync_all_logs(session_name: str):
     from . import hub
-    hub.sync_logs_down(PATHS.logs_dir, session_name)
+    # Sync into a session-specific subdir to prevent mapping file collisions
+    # (log .txt files use UUIDs so don't collide, but mappings/*.jsonl have
+    # generic names that would overwrite across sessions in a shared dir)
+    session_logs_dir = PATHS.logs_dir / session_name
+    hub.sync_logs_down(session_logs_dir, session_name)
 
 
 class HubSyncer:
@@ -226,18 +237,17 @@ class HubSyncer:
 
 _log_offsets: dict[str, int] = {}
 
-def _parse_local_metrics(experiment_id: int, run_id: str) -> tuple[int, bool]:
+def _parse_local_metrics(experiment_id: int, run_id: str, log_path: Path) -> tuple[int, bool]:
     """Parse metrics from local log file. Marks experiment completed if final step found.
     Returns (count, found_final)."""
-    local_log = PATHS.logs_dir / f"{run_id}.txt"
-    if not local_log.exists():
+    if not log_path.exists():
         return 0, False
-    file_size = local_log.stat().st_size
+    file_size = log_path.stat().st_size
     offset = _log_offsets.get(run_id, 0)
     if file_size <= offset:
         return 0, False
 
-    with open(local_log) as f:
+    with open(log_path) as f:
         f.seek(offset)
         new_content = f.read()
         new_offset = f.tell()
@@ -589,13 +599,19 @@ class SessionTracker:
         known = {row["remote_run_id"]: row["id"] for row in rows}
 
         # Reparse known experiments whose log files have new bytes
+        session_logs = PATHS.logs_dir / self.session_name
         for run_id, exp_id in known.items():
-            local_log = PATHS.logs_dir / f"{run_id}.txt"
+            local_log = session_logs / f"{run_id}.txt"
             if not local_log.exists():
-                continue
+                # Fallback: pre-migration flat dir
+                flat = PATHS.logs_dir / f"{run_id}.txt"
+                if flat.exists():
+                    local_log = flat
+                else:
+                    continue
             if local_log.stat().st_size <= _log_offsets.get(run_id, 0):
                 continue
-            recorded, _ = _parse_local_metrics(exp_id, run_id)
+            recorded, _ = _parse_local_metrics(exp_id, run_id, local_log)
             if recorded:
                 self.state.metrics_synced += recorded
                 self.event(f"Synced {recorded} new metric steps for experiment {exp_id}")
@@ -618,14 +634,16 @@ class SessionTracker:
                     pass
 
     def _process_mappings_file(self):
-        """Read mappings from hub — dual-read legacy mappings.jsonl and segmented files.
+        """Read mappings from session-specific log directory.
 
-        Segments live under logs/mappings/mappings-NNNNNN.jsonl (sealed once full,
+        Segments live under logs/{session}/mappings/mappings-NNNNNN.jsonl (sealed once full,
         so xet sync doesn't choke on a growing tail). Legacy file is still processed
         so older remote daemons' data isn't lost.
         """
+        session_logs = PATHS.logs_dir / self.session_name
+
         # Legacy flat file — kept for dual-read until all remotes are on segments
-        legacy = PATHS.logs_dir / "mappings.jsonl"
+        legacy = session_logs / "mappings.jsonl"
         if legacy.exists():
             size = legacy.stat().st_size
             if size > self._mappings_offset:
@@ -636,7 +654,7 @@ class SessionTracker:
                 self._ingest_mapping_lines(new_content)
 
         # Segmented files — process in index order
-        segments_dir = PATHS.logs_dir / "mappings"
+        segments_dir = session_logs / "mappings"
         if segments_dir.exists():
             for path in sorted(segments_dir.glob("mappings-*.jsonl")):
                 size = path.stat().st_size
@@ -682,9 +700,11 @@ class SessionTracker:
         if self._last_queue_key == queue_key:
             return
         self._last_queue_key = queue_key
+        now = datetime.now(timezone.utc).isoformat()
         PATHS.queue_cache_file(self.session_name).write_text(json.dumps({
-            "synced_at": datetime.now(timezone.utc).isoformat(), "queue": queue_items,
+            "synced_at": now, "queue": queue_items,
         }, indent=2))
+        _append_queue_history(self.session_name, now, queue_items)
 
     # --- experiment helpers ---
 

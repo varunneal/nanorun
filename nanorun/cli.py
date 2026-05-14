@@ -916,10 +916,10 @@ def job_clear(yes: bool, session_name):
 
 @job.command("remove")
 @click.argument("index", type=int)
-@session_option
+@click.option("--session", "session_name", default=None, help="Session name (omit to use combined queue index)")
 def job_remove(index: int, session_name):
     """Remove experiment at INDEX from queue (1-indexed)."""
-    from .queue import remove_from_queue_via_daemon, read_queue
+    from .queue import remove_from_queue_via_daemon, read_queue, _read_session_queue
 
     queued = read_queue(session_name)
     if index < 1 or index > len(queued):
@@ -927,8 +927,24 @@ def job_remove(index: int, session_name):
         return
 
     exp = queued[index - 1]
-    # Convert 1-indexed to 0-indexed for daemon
-    if remove_from_queue_via_daemon(index - 1, session_name=session_name):
+    target_session = exp.session_name or session_name
+    if not target_session:
+        console.print("[red]Cannot determine session for this item[/red]")
+        return
+
+    # Find the item's index within its own session's queue
+    session_queue = _read_session_queue(target_session)
+    session_index = None
+    for i, sq_exp in enumerate(session_queue):
+        if sq_exp.script == exp.script and sq_exp.env_vars == exp.env_vars:
+            session_index = i
+            break
+
+    if session_index is None:
+        console.print("[red]Could not find item in session queue[/red]")
+        return
+
+    if remove_from_queue_via_daemon(session_index, session_name=target_session):
         console.print(f"[green]Removed: {exp.script}[/green]")
     else:
         console.print("[red]Failed to remove from queue - daemon not reachable[/red]")
@@ -1412,7 +1428,7 @@ def hub_logs(experiment_id: int):
         console.print(f"[red]Experiment {experiment_id} has no session_name[/red]")
         return
 
-    local_path = Config.get_config_dir() / "logs" / f"{exp.remote_run_id}.txt"
+    local_path = Config.get_config_dir() / "logs" / exp.session_name / f"{exp.remote_run_id}.txt"
     try:
         hub_mod.download_log(exp.remote_run_id, local_path, exp.session_name)
         print(local_path.read_text())
