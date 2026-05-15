@@ -206,6 +206,13 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
             if not confirm("  Continue anyway?", default=False):
                 return
 
+    # Ensure hostname resolves (Docker providers like Jarvis Labs set hostname
+    # to container ID without adding it to /etc/hosts, breaking torchrun)
+    result = remote.run("python3 -c \"import socket; socket.gethostbyname(socket.gethostname())\"")
+    if not result.success:
+        remote.run(f"{sudo_prefix}sh -c 'echo \"127.0.0.1 $(hostname)\" >> /etc/hosts'")
+        console.print("  [yellow]Added hostname to /etc/hosts (was unresolvable)[/yellow]")
+
     # Step 3: Install uv
     console.print("\n[bold]Step 3: Install uv[/bold]")
 
