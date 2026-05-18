@@ -427,6 +427,7 @@ async def get_experiment_detail(exp_id: int):
         "git_commit": exp.git_commit,
         "tmux_window": exp.tmux_window,
         "crash_log": exp.crash_log,
+        "session_name": exp.session_name,
         "started_at": exp.started_at.isoformat() if exp.started_at else None,
         "finished_at": exp.finished_at.isoformat() if exp.finished_at else None,
         # Metrics summary

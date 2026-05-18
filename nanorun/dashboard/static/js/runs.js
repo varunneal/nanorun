@@ -303,6 +303,9 @@ function renderRunsTable() {
         }
     }
 
+    // Show session column if runs span multiple sessions
+    const showSession = new Set(limited.map(d => d.session_name).filter(Boolean)).size > 1;
+
     // Render table
     container.innerHTML = `
         <div class="runs-table-controls">
@@ -314,6 +317,7 @@ function renderRunsTable() {
                 ${isBucketView ? `<th class="${sortCls('script')}" onclick="toggleRunsSort('script')">Script</th>` : `<th class="${sortCls('id')}" onclick="toggleRunsSort('id')">Exp</th>`}
                 <th>Run ID</th>
                 <th class="${sortCls('status')}" onclick="toggleRunsSort('status')">Status</th>
+                ${showSession ? '<th>Session</th>' : ''}
                 <th class="${sortCls('started_at')}" onclick="toggleRunsSort('started_at')">Started</th>
                 ${runsIsSweep ? `<th>Env</th>` : ''}
                 <th class="${sortCls('val_loss')}" onclick="toggleRunsSort('val_loss')">Val Loss</th>
@@ -328,6 +332,7 @@ function renderRunsTable() {
                     const isFiltered = runsEnvFilters[k] === String(v);
                     return `<span class="env-chip${isFiltered ? ' active' : ''}" onclick="event.stopPropagation(); toggleEnvFilter('${k}', '${v}')">${k}=${v}</span>`;
                 }).join(' ') || 'default'}</td>` : '';
+                const sessionHtml = showSession ? `<td class="session-col">${d.session_name || '-'}</td>` : '';
                 return `
                 <tr class="run-row${selectedRunId === d.id ? ' selected' : ''}${bucketSet.has(d.id) ? ' in-bucket' : ''}" data-exp-id="${d.id}" onclick="handleRunRowClick(event, ${d.id})" title="Click to view metrics · ⌘+click to add to bucket">
                     <td>${isBucketView ? `<span class="exp-track">${d.track || 'untracked'}</span>/${d.script ? d.script.split('/').pop().replace('.py', '') : d.name}` : `#${d.id}`}</td>
@@ -339,6 +344,7 @@ function renderRunsTable() {
                             : ''}
                     </td>
                     <td><span class="status-badge-sm ${d.status}">${d.status}</span></td>
+                    ${sessionHtml}
                     <td class="started-at">${formatStartedAt(d.started_at)}</td>
                     ${envHtml}
                     <td class="val-loss">${d.final_val_loss ? d.final_val_loss.toFixed(4) : 'n/a'}</td>
