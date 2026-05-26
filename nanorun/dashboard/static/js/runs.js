@@ -436,37 +436,40 @@ function copyRunsAsMarkdown() {
     const isBucketView = State.get('selectedExp') === 'bucket';
     const hasEnvVars = runs.some(d => d.env_vars && Object.keys(d.env_vars).length > 0);
 
+    const statusLabel = (s) => s === 'running' ? 'in progress' : s === 'completed' ? 'success' : s;
+
     let header, separator;
     if (isBucketView && hasEnvVars) {
-        header = '| Script | Run | Env | Val Loss | Time |';
-        separator = '|--------|-----|-----|----------|------|';
+        header = '| Script | Run | Status | Env | Val Loss | Time |';
+        separator = '|--------|-----|--------|-----|----------|------|';
     } else if (isBucketView) {
-        header = '| Script | Run | Val Loss | Time |';
-        separator = '|--------|-----|----------|------|';
+        header = '| Script | Run | Status | Val Loss | Time |';
+        separator = '|--------|-----|--------|----------|------|';
     } else if (hasEnvVars) {
-        header = '| Run | Env | Val Loss | Time |';
-        separator = '|-----|-----|----------|------|';
+        header = '| Run | Status | Env | Val Loss | Time |';
+        separator = '|-----|--------|-----|----------|------|';
     } else {
-        header = '| Run | Val Loss | Time |';
-        separator = '|-----|----------|------|';
+        header = '| Run | Status | Val Loss | Time |';
+        separator = '|-----|--------|----------|------|';
     }
     const lines = [header, separator];
 
     runs.forEach(d => {
         const runId = d.remote_run_id || `#${d.id}`;
+        const status = statusLabel(d.status || 'unknown');
         const valLoss = d.final_val_loss ? d.final_val_loss.toFixed(4) : '-';
         const time = d.final_train_time_ms ? (d.final_train_time_ms / 1000).toFixed(1) + 's' : '-';
         const script = d.script ? d.script.split('/').pop().replace('.py', '') : d.name;
         const env = Object.entries(d.env_vars || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '-';
 
         if (isBucketView && hasEnvVars) {
-            lines.push(`| ${script} | ${runId} | ${env} | ${valLoss} | ${time} |`);
+            lines.push(`| ${script} | ${runId} | ${status} | ${env} | ${valLoss} | ${time} |`);
         } else if (isBucketView) {
-            lines.push(`| ${script} | ${runId} | ${valLoss} | ${time} |`);
+            lines.push(`| ${script} | ${runId} | ${status} | ${valLoss} | ${time} |`);
         } else if (hasEnvVars) {
-            lines.push(`| ${runId} | ${env} | ${valLoss} | ${time} |`);
+            lines.push(`| ${runId} | ${status} | ${env} | ${valLoss} | ${time} |`);
         } else {
-            lines.push(`| ${runId} | ${valLoss} | ${time} |`);
+            lines.push(`| ${runId} | ${status} | ${valLoss} | ${time} |`);
         }
     });
 
@@ -478,52 +481,39 @@ async function deleteExperiment(expId, expName, rowElement) {
     // Prevent auto-refresh from racing with delete
     State.set('deleteInProgress', true);
 
+    // Optimistic update: remove from state and re-render immediately
+    let selectedExpIds = State.get('selectedExpIds');
+    if (selectedExpIds) {
+        selectedExpIds = selectedExpIds.filter(id => id !== expId);
+        State.set('selectedExpIds', selectedExpIds);
+    }
+
+    let currentValidData = State.get('experimentData');
+    if (currentValidData) {
+        currentValidData = currentValidData.filter(d => d.id !== expId);
+        State.set('experimentData', currentValidData);
+    }
+
+    if (State.get('selectedRun') === expId) {
+        State.set('selectedRun', null);
+    }
+
+    if (!selectedExpIds || selectedExpIds.length === 0) {
+        State.update({ selectedExp: null, selectedExpIds: null });
+        State.set('experimentData', null);
+    }
+    renderRunsTable();
+
+    // Fire delete request (don't block UI on it)
     try {
         const response = await fetch(`/api/experiment/${expId}`, { method: 'DELETE' });
         const data = await response.json();
 
         if (data.success) {
-            // Update selectedExperimentIds to remove deleted experiment
-            let selectedExpIds = State.get('selectedExpIds');
-            if (selectedExpIds) {
-                selectedExpIds = selectedExpIds.filter(id => id !== expId);
-                State.set('selectedExpIds', selectedExpIds);
-            }
-
-            // Update experimentData to remove deleted experiment
-            let currentValidData = State.get('experimentData');
-            if (currentValidData) {
-                currentValidData = currentValidData.filter(d => d.id !== expId);
-                State.set('experimentData', currentValidData);
-            }
-
-            // Clear selectedRun if it was the deleted experiment
-            if (State.get('selectedRun') === expId) {
-                State.set('selectedRun', null);
-            }
-
-            // Remove the row from DOM immediately
-            if (rowElement) {
-                const tbody = rowElement.closest('tbody');
-                rowElement.remove();
-
-                // Check if all experiments in group are now deleted
-                if (!selectedExpIds || selectedExpIds.length === 0 || (tbody && tbody.children.length === 0)) {
-                    // Clear selection and refresh to update sidebar
-                    State.update({ selectedExp: null, selectedExpIds: null });
-                    State.set('experimentData', null);
-                    await refreshExperiments();
-                }
-            } else {
-                // Fallback: refresh if no row element
-                if (!selectedExpIds || selectedExpIds.length === 0) {
-                    State.update({ selectedExp: null, selectedExpIds: null });
-                    State.set('experimentData', null);
-                }
-                await refreshExperiments();
-            }
+            refreshExperiments();
         } else {
             alert('Failed to delete: ' + (data.error || 'Unknown error'));
+            // TODO: could roll back optimistic update here, but unlikely to fail
         }
     } finally {
         State.set('deleteInProgress', false);

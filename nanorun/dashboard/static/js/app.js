@@ -367,6 +367,7 @@ async function selectExperiment(codeHashOrId, experimentIds) {
                 ? `<span class="meta-item meta-hash" title="${primary.code_hash}">${primary.code_hash.substring(0, 8)}</span>`
                 : `<span class="meta-item meta-hash-missing">no code hash</span>`}
             ${isMultiple ? `<span class="meta-sep">·</span><span class="meta-item">${isSweep ? 'sweep' : 'n'}=${validData.length}</span>` : ''}
+            ${primary.session_name ? `<span class="meta-sep">·</span><span class="meta-item meta-session">${primary.session_name}</span>` : ''}
         </div>
     `;
 
@@ -853,9 +854,12 @@ async function startAutoRefresh() {
         } else {
             refreshExperiments();
             refreshQueueCount();
+            // Only re-fetch detail data if there's a running experiment (metrics changing)
             const sel = State.get('selectedExp');
             const selIds = State.get('selectedExpIds');
-            if (sel && selIds && selIds.length > 0) {
+            const expData = State.get('experimentData');
+            const hasRunning = expData && expData.some(d => d.status === 'running');
+            if (sel && selIds && selIds.length > 0 && hasRunning) {
                 selectExperiment(sel, selIds);
             }
         }

@@ -23,6 +23,15 @@ def _resolve_script_path(script: str) -> str:
         return script
 
 
+def _require_ssh_session(session_name: str) -> bool:
+    """Check that session is SSH type. Prints error and returns False for iris."""
+    sc = resolve_session_config(session_name)
+    if sc and sc.session_type == "iris":
+        console.print(f"[yellow]This command is not available for iris sessions.[/yellow]")
+        return False
+    return True
+
+
 def _resolve_session(ctx, param, value):
     """Click callback: resolve session name to active session if not specified."""
     if value:
@@ -31,18 +40,13 @@ def _resolve_session(ctx, param, value):
             console.print(f"[red]Session '{value}' not found.[/red]")
             raise SystemExit(1)
         return value
-    from .local_daemon import SessionState
-    from .remote_control import _find_sole_connected_session
     name = Config.get_active_session_name()
-    if name and SessionState.load(name).status == "connected":
+    if name:
         return name
-    # Active session is disconnected or unset — try sole connected session
+    from .remote_control import _find_sole_connected_session
     sole = _find_sole_connected_session()
     if sole:
         return sole
-    # Fall back to active even if disconnected (commands will fail with SSH error)
-    if name:
-        return name
     console.print("[red]No active session. Run 'nanorun session start <host>' first.[/red]")
     raise SystemExit(1)
 
@@ -109,8 +113,7 @@ def session():
 @click.option("--key-file", "-i", default=None, help="Path to SSH private key file")
 @click.option("--ssh-option", "-o", multiple=True, help="Extra SSH -o options (e.g. -o IdentitiesOnly=yes)")
 @click.option("--name", "-n", default=None, help="Session name (auto-generated if not specified)")
-@click.option("--pty", is_flag=True, help="Request PTY for commands (needed for RunPod SSH proxy)")
-def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str, pty: bool):
+def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str):
     """Connect to a remote machine.
 
     HOST should be in format user@hostname or just hostname (defaults to root@).
@@ -144,7 +147,6 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
         port=port,
         key_file=key_file,
         ssh_options=list(ssh_option) if ssh_option else None,
-        use_pty=pty,
     )
 
     remote = RemoteSession(session_config)
@@ -170,13 +172,6 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
     gpu_count = detect_gpu_count(remote)
     session_config.gpu_count = gpu_count
     console.print(f"[dim]GPU count: {gpu_count} (detected)[/dim]")
-
-    # Resolve repo_path to absolute if HOME is misconfigured
-    from .setup import resolve_repo_path
-    resolved_path = resolve_repo_path(remote, session_config.repo_path)
-    if resolved_path != session_config.repo_path:
-        session_config.repo_path = resolved_path
-        console.print(f"[yellow]HOME is misconfigured on remote, using: {resolved_path}[/yellow]")
 
     # Check for tmux
     if not remote.check_tmux():
@@ -293,6 +288,7 @@ def session_status(session_name):
 def session_list():
     """List all saved sessions."""
     sessions = Config.list_sessions()
+    active_name = Config.get_active_session_name()
 
     if not sessions:
         console.print("[yellow]No sessions found.[/yellow]")
@@ -300,15 +296,6 @@ def session_list():
         return
 
     from .local_daemon import SessionState
-    from .remote_control import _find_sole_connected_session
-
-    # Determine the effective active session (matches _resolve_session logic)
-    active_name = Config.get_active_session_name()
-    states = {s.name: SessionState.load(s.name) for s in sessions}
-    if active_name and states.get(active_name, SessionState()).status == "connected":
-        effective_active = active_name
-    else:
-        effective_active = _find_sole_connected_session() or active_name
 
     table = Table(title="Sessions")
     table.add_column("Name", style="cyan")
@@ -318,14 +305,22 @@ def session_list():
     table.add_column("Active", justify="center")
 
     for s in sessions:
-        is_active = "[green]*[/green]" if s.name == effective_active else ""
-        state = states[s.name]
-        status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
-        status_str = f"[{status_color}]{state.status}[/{status_color}]"
+        is_active = "[green]*[/green]" if s.name == active_name else ""
+        state = SessionState.load(s.name)
+        if s.session_type == "iris":
+            host_str = "[dim]iris controller[/dim]"
+            gpu_str = "TPU"
+            status_color = "green"
+            status_str = f"[{status_color}]iris[/{status_color}]"
+        else:
+            host_str = f"{s.user}@{s.host}:{s.port}"
+            gpu_str = f"{s.gpu_count}x {s.gpu_type}"
+            status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
+            status_str = f"[{status_color}]{state.status}[/{status_color}]"
         table.add_row(
             s.name,
-            f"{s.user}@{s.host}:{s.port}",
-            f"{s.gpu_count}x {s.gpu_type}",
+            host_str,
+            gpu_str,
             status_str,
             is_active,
         )
@@ -357,6 +352,8 @@ def session_switch(name: str):
 @session_option
 def session_attach(session_name):
     """Attach to the remote tmux session."""
+    if not _require_ssh_session(session_name):
+        return
     remote = require_session(session_name)
     if not remote.tmux_session_exists():
         console.print("[yellow]No tmux session. Creating one...[/yellow]")
@@ -370,6 +367,8 @@ def session_attach(session_name):
 @session_option
 def session_setup(verify: bool, interactive: bool, session_name):
     """Set up the remote machine for training."""
+    if not _require_ssh_session(session_name):
+        return
     from .setup import run_setup, verify_setup
 
     remote = require_session(session_name)
@@ -508,6 +507,8 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
         nanorun sync experiments/muon/train.py experiments/muon/utils.py
         nanorun sync --all -m "big refactor"
     """
+    if not _require_ssh_session(session_name):
+        return
     from .sync import push_code
     from pathlib import Path
 
@@ -544,63 +545,18 @@ def job():
     pass
 
 
-def _prepare_job_submission(script: str, gpus: int | None, session_name: str):
-    """Resolve script path, prompt to sync if needed, and fill in GPU/track defaults.
-
-    Returns (script_rel, gpus, gpu_type, track). Prints status for sync/gpu/track
-    exactly as the old inline code did.
-    """
-    from .sync import has_unsynced_changes, push_code
-
-    script_rel = _resolve_script_path(script)
-
-    if has_unsynced_changes(files=[script_rel]):
-        console.print(f"[yellow]{script_rel} not synced with remote.[/yellow]")
-        if click.confirm("Sync before adding?", default=True):
-            remote = require_session(session_name)
-            push_code(remote, message=None, files=[script_rel])
-        else:
-            console.print("[dim]Proceeding without sync...[/dim]")
-
-    sc = resolve_session_config(session_name)
-    gpu_type = sc.gpu_type if sc else "H100"
-    if gpus is None:
-        gpus = sc.gpu_count if sc else 1
-        console.print(f"[dim]GPUs: {gpus} (from session)[/dim]")
-
-    track = infer_track_from_path(script_rel)
-    if track:
-        console.print(f"[dim]Track: {track}[/dim]")
-
-    return script_rel, gpus, gpu_type, track
-
-
-def _enqueue_experiment(
-    script_rel: str, env_dict: dict, name: str, track: str | None,
-    gpus: int, gpu_type: str, prefix: str | None,
-    first: bool, auto_start: bool, session_name: str,
-):
-    """Generate an experiment ID and enqueue via the remote daemon. Returns the result."""
-    import time, random
-    from .queue import add_to_queue_via_daemon
-
-    # Timestamp + random suffix; local DB row is created later when the daemon sees it.
-    experiment_id = int(time.time() * 1000) + random.randint(0, 999)
-    return add_to_queue_via_daemon(
-        experiment_id, script_rel, env_dict, track, gpus, gpu_type, name, prefix,
-        first=first, auto_start=auto_start, session_name=session_name,
-    )
-
 
 @job.command("add")
-@click.argument("script", type=click.Path(exists=True))
+@click.argument("script")
 @click.option("--env", "-e", multiple=True, help="Environment variables (KEY=VALUE)")
 @click.option("--name", "-n", default=None, help="Experiment name")
 @click.option("--gpus", "-g", default=None, type=int, help="Number of GPUs (defaults to session gpu_count)")
 @click.option("--prefix", "-p", default=None, help="Command prefix (e.g., 'nsys profile --trace=cuda,nvtx -o trace')")
 @click.option("--first", "-f", is_flag=True, help="Add to front of queue instead of end")
+@click.option("--reserve", "-r", default=None, help="TPU reservation name (iris only)")
+@click.option("--module", "-m", "module", default=None, help="Python module to run (iris only, e.g. 'marin.train')")
 @session_option
-def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, first: bool, session_name):
+def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, first: bool, reserve: str, module: str, session_name):
     """Add an experiment to the queue.
 
     Track is auto-inferred from script path (if directory has .track.json).
@@ -611,35 +567,69 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
         nanorun job add experiments/lr/train.py --gpus 8
         nanorun job add train.py --prefix 'nsys profile --trace=cuda,nvtx -o trace'
         nanorun job add train.py --first  # Add to front of queue
+        nanorun job add experiments/grug/moe/launch.py --session marin --reserve v5p-8 -m experiments.grug.moe.launch
     """
-    script_rel, gpus, gpu_type, track = _prepare_job_submission(script, gpus, session_name)
+    from .session_connector import get_connector
+    from .config import Config
+
+    connector = get_connector(session_name)
+    script_rel = _resolve_script_path(script)
+
+    # Resolve gpus/gpu_type from session config if not explicitly provided
+    sc = Config.load_session(session_name)
+    if gpus is None:
+        gpus = sc.gpu_count if sc else 1
+        console.print(f"[dim]GPUs: {gpus} (from session)[/dim]")
+    gpu_type = sc.gpu_type if sc else "H100"
+
+    # Validate script exists (connector resolves against correct root)
+    if not connector.resolve_script(script_rel):
+        console.print(f"[red]Script not found: {script_rel}[/red]")
+        raise SystemExit(1)
 
     env_dict = dict(e.split("=", 1) for e in env) if env else {}
-    if not name:
-        name = Path(script).stem
+    exp_name = name or Path(script).stem
+    track = infer_track_from_path(script_rel)
+    if track:
+        console.print(f"[dim]Track: {track}[/dim]")
 
-    result = _enqueue_experiment(
-        script_rel, env_dict, name, track, gpus, gpu_type, prefix,
-        first=first, auto_start=True, session_name=session_name,
+    # Sync check (connector returns False if not applicable)
+    if connector.check_unsynced(script_rel):
+        console.print(f"[yellow]{script_rel} not synced with remote.[/yellow]")
+        if click.confirm("Sync before adding?", default=True):
+            connector.sync_file(script_rel)
+        else:
+            console.print("[dim]Proceeding without sync...[/dim]")
+
+    result = connector.submit(
+        script_rel, env_dict, exp_name, track, gpus=gpus, gpu_type=gpu_type,
+        prefix=prefix, first=first, reserve=reserve, module=module,
     )
-    if not result.success:
-        console.print(f"[red]Failed to add to queue: {result.error}[/red]")
+    if result.error:
+        console.print(f"[red]{result.error}[/red]")
         return
 
-    position_msg = "front" if first else f"position {result.position}"
-    console.print(f"[green]Added to queue ({position_msg})[/green]")
+    console.print(f"[green]Submitted[/green]")
+    if result.experiment_id:
+        console.print(f"  Experiment: [cyan]#{result.experiment_id}[/cyan]")
+    if result.job_id:
+        console.print(f"  Job ID: [dim]{result.job_id}[/dim]")
+    if result.position:
+        console.print(f"  Queue position: {result.position}")
     if result.started:
-        console.print("[cyan]Nothing was running - started experiment[/cyan]")
+        console.print("[cyan]Started immediately[/cyan]")
 
 
 @job.command("sweep")
-@click.argument("script", type=click.Path(exists=True))
+@click.argument("script")
 @click.option("--env", "-e", multiple=True, help="Environment variables with sweep values (KEY=V1,V2,V3)")
 @click.option("--name", "-n", default=None, help="Sweep name prefix")
 @click.option("--gpus", "-g", default=None, type=int, help="Number of GPUs (defaults to session gpu_count)")
 @click.option("--prefix", "-p", default=None, help="Command prefix (e.g., 'nsys profile --trace=cuda,nvtx -o trace')")
+@click.option("--reserve", "-r", default=None, help="TPU reservation name (iris only)")
+@click.option("--module", "-m", "module", default=None, help="Python module to run (iris only)")
 @session_option
-def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, session_name):
+def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, reserve: str, module: str, session_name):
     """Add a parameter sweep to the queue.
 
     Track is auto-inferred from script path (if directory has .track.json).
@@ -650,47 +640,84 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
         nanorun job sweep train.py --env LR=0.01,0.02 --env BETA=0.9,0.95
     """
     from .runner import parse_sweep_env, generate_sweep_configs
+    from .session_connector import get_connector
+    from .config import Config
 
-    script_rel, gpus, gpu_type, track = _prepare_job_submission(script, gpus, session_name)
+    connector = get_connector(session_name)
+    script_rel = _resolve_script_path(script)
+
+    # Resolve gpus/gpu_type from session config if not explicitly provided
+    sc = Config.load_session(session_name)
+    if gpus is None:
+        gpus = sc.gpu_count if sc else 1
+        console.print(f"[dim]GPUs: {gpus} (from session)[/dim]")
+    gpu_type = sc.gpu_type if sc else "H100"
+
+    if not connector.resolve_script(script_rel):
+        console.print(f"[red]Script not found: {script_rel}[/red]")
+        raise SystemExit(1)
+
+    track = infer_track_from_path(script_rel)
+    if track:
+        console.print(f"[dim]Track: {track}[/dim]")
+
+    if connector.check_unsynced(script_rel):
+        console.print(f"[yellow]{script_rel} not synced with remote.[/yellow]")
+        if click.confirm("Sync before sweeping?", default=True):
+            connector.sync_file(script_rel)
+        else:
+            console.print("[dim]Proceeding without sync...[/dim]")
 
     configs = generate_sweep_configs(parse_sweep_env(env))
     console.print(f"[cyan]Adding {len(configs)} configurations to queue[/cyan]")
 
-    exp_name = name if name else Path(script).stem
-    added = 0
-    started = False
-    for i, cfg in enumerate(configs):
-        result = _enqueue_experiment(
-            script_rel, cfg, exp_name, track, gpus, gpu_type, prefix,
-            first=False, auto_start=(i == 0), session_name=session_name,
-        )
-        if result.success:
-            added += 1
-            if result.started:
-                started = True
+    exp_name = name or Path(script).stem
+    results = connector.sweep(
+        script_rel, configs, exp_name, track, gpus=gpus, gpu_type=gpu_type,
+        prefix=prefix, reserve=reserve, module=module,
+    )
 
+    added = sum(1 for r in results if not r.error)
+    started = any(r.started for r in results)
     console.print(f"[green]Added {added} experiments to queue[/green]")
     if started:
-        console.print("[cyan]Nothing was running - started first experiment[/cyan]")
+        console.print("[cyan]Started immediately[/cyan]")
 
 
 @job.command("cancel")
+@click.argument("job_id", required=False)
 @session_option
-def job_cancel(session_name):
+def job_cancel(job_id: str, session_name):
     """Cancel current experiment and pause queue.
 
-    Use 'job resume' to start the next queued experiment.
+    For iris sessions, optionally provide a job ID. For SSH, cancels current.
+    Use 'job resume' to start the next queued experiment (SSH only).
     """
-    from .runner import cancel_experiment
-    cancel_experiment(start_next=False, session_name=session_name)
+    from .session_connector import get_connector
+
+    connector = get_connector(session_name)
+    result = connector.cancel(job_id)
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
+        return
+    if result.message:
+        console.print(f"[green]Cancelled: {result.message}[/green]")
+    else:
+        console.print("[green]Cancelled[/green]")
 
 
 @job.command("resume")
 @session_option
 def job_resume(session_name):
     """Resume queue processing (start next if paused)."""
-    from .runner import resume_queue
-    resume_queue(session_name=session_name)
+    from .session_connector import get_connector
+
+    result = get_connector(session_name).resume()
+    if result.unsupported:
+        console.print(f"[yellow]{result.message}[/yellow]")
+        return
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
 
 
 @job.command("status")
@@ -698,109 +725,78 @@ def job_resume(session_name):
 @session_option
 def job_status(daemon: bool, session_name):
     """Show current job and queue status."""
-    from .tracker import get_running_experiments, get_latest_metric
-    from .queue import read_queue, get_queue_state, get_daemon_status
+    from .session_connector import get_connector
 
-    running = get_running_experiments(session_name=session_name)
-    queue_state = get_queue_state()
-    queued = read_queue(session_name)
+    connector = get_connector(session_name)
+    active = connector.status()
+
+    if active:
+        console.print(f"[bold cyan]Active Jobs[/bold cyan] [dim]({len(active)})[/dim]")
+        table = Table()
+        table.add_column("Job ID", style="cyan")
+        table.add_column("Script")
+        table.add_column("Status")
+        table.add_column("Created")
+        for j in active:
+            color = "green" if j.state == "running" else "yellow"
+            created = j.created_at[:19] if j.created_at else ""
+            table.add_row(j.job_id, j.script or "", f"[{color}]{j.state}[/{color}]", created)
+        console.print(table)
+    else:
+        console.print("[dim]No active jobs[/dim]")
 
     # Currently running experiment (local view)
-    if running:
-        exp = running[0]
-        metric = get_latest_metric(exp.id)
-        console.print(f"[bold cyan]Currently Running[/bold cyan] [dim]#{exp.id}[/dim]")
-        console.print(f"  Name: {exp.name}")
-        console.print(f"  Script: {exp.script}")
-        console.print(f"  Window: [dim]{exp.tmux_window}[/dim]")
-        if metric:
-            progress = f"{metric.step}/{metric.total_steps}" if metric.total_steps else str(metric.step)
-            console.print(f"  Progress: {progress}")
-            if metric.val_loss:
-                console.print(f"  Val Loss: {metric.val_loss:.4f}")
-    else:
-        console.print("[dim]No experiment currently running (local)[/dim]")
-
-    console.print()
-
-    # Queue status and contents (local view)
-    state_color = "green" if queue_state == "active" else "yellow"
-    if queued:
-        console.print(f"[bold cyan]Queue[/bold cyan] [{state_color}]{queue_state}[/{state_color}] [dim]({len(queued)} pending)[/dim]")
-        for i, exp in enumerate(queued[:5], 1):
-            env_str = ", ".join(f"{k}={v}" for k, v in exp.env_vars.items()) if exp.env_vars else ""
-            console.print(f"  {i}. {exp.script} {env_str}")
-        if len(queued) > 5:
-            console.print(f"  [dim]... and {len(queued) - 5} more[/dim]")
-    else:
-        console.print(f"[bold cyan]Queue[/bold cyan] [{state_color}]{queue_state}[/{state_color}] [dim](empty)[/dim]")
-
-    # Daemon status (optional, requires connection)
-    if daemon:
-        console.print()
-        daemon_status = get_daemon_status(session_name=session_name)
-        if daemon_status:
-            d_status = daemon_status.get("status", "unknown")
-            d_color = {"idle": "dim", "running": "green", "paused": "yellow"}.get(d_status, "white")
-            console.print(f"[bold cyan]Daemon[/bold cyan] [{d_color}]{d_status}[/{d_color}]")
-            if daemon_status.get("current_experiment_id"):
-                console.print(f"  Experiment: #{daemon_status.get('current_experiment_id')}")
-                console.print(f"  Window: [dim]{daemon_status.get('current_window')}[/dim]")
-                if daemon_status.get("current_run_id"):
-                    console.print(f"  Run ID: [dim]{daemon_status.get('current_run_id')}[/dim]")
-            console.print(f"  Remote queue: {daemon_status.get('queue_length', 0)} pending")
-
-            # GPU processes
-            gpu_procs = daemon_status.get("gpu_processes", [])
-            if gpu_procs:
-                total_mem = sum(p.get("memory_mb", 0) for p in gpu_procs)
-                console.print(f"  GPU: [yellow]{len(gpu_procs)} process(es), {total_mem}MB[/yellow]")
-            else:
-                console.print(f"  GPU: [green]idle[/green]")
-        else:
-            console.print("[bold cyan]Daemon[/bold cyan] [dim]not connected[/dim]")
 
 
 @job.command("logs")
 @click.option("--tail", "-f", is_flag=True, help="Continuously watch logs")
-@click.option("--window", "-w", default=None, help="Specific tmux window to watch")
+@click.option("--window", "-w", default=None, help="Specific tmux window to watch (SSH only)")
 @click.option("--lines", "-n", default=50, help="Number of lines to show")
+@click.argument("job_id", required=False)
 @session_option
-def job_logs(tail: bool, window: str, lines: int, session_name):
-    """View raw experiment output from tmux.
+def job_logs(tail: bool, window: str, lines: int, job_id: str, session_name):
+    """View raw experiment output.
 
-    Useful for debugging errors, warnings, or watching training progress.
+    For SSH sessions: shows tmux output. For iris: streams from controller.
     """
-    import time
-    from .tracker import get_running_experiments
+    from .session_connector import get_connector
 
-    remote = require_session(session_name)
+    connector = get_connector(session_name)
+    result = connector.logs(job_id=job_id or window, tail=tail, lines=lines)
 
-    # Default to running experiment's window
-    if window is None:
-        running = get_running_experiments(session_name=session_name)
-        if running and running[0].tmux_window:
-            window = running[0].tmux_window
+    if result.unsupported:
+        # SSH connector returns unsupported to signal "use tmux directly"
+        import time
+        remote = require_session(session_name)
+        from .tracker import get_running_experiments
+
+        target_window = window
+        if target_window is None:
+            running = get_running_experiments(session_name=session_name)
+            if running and running[0].tmux_window:
+                target_window = running[0].tmux_window
+            else:
+                console.print("[yellow]No running experiment found[/yellow]")
+                console.print("[dim]Use --window to specify a tmux window[/dim]")
+                return
+
+        if tail:
+            console.print("[dim]Press Ctrl+C to stop watching[/dim]")
+            try:
+                while True:
+                    output = remote.get_tmux_output(target_window, lines=lines)
+                    print("\033[2J\033[H", end="")
+                    print(output)
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
         else:
-            console.print("[yellow]No running experiment found[/yellow]")
-            console.print("[dim]Use --window to specify a tmux window[/dim]")
-            return
+            output = remote.get_tmux_output(target_window, lines=lines)
+            print(output)
+        return
 
-    if tail:
-        console.print("[dim]Press Ctrl+C to stop watching[/dim]")
-        try:
-            while True:
-                output = remote.get_tmux_output(window, lines=lines)
-                # Use raw print to preserve ANSI colors from training script
-                print("\033[2J\033[H", end="")  # Clear screen
-                print(output)
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-    else:
-        output = remote.get_tmux_output(window, lines=lines)
-        # Use raw print to preserve ANSI colors from training script
-        print(output)
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
 
 
 @job.command("ps")
@@ -852,7 +848,7 @@ def job_ps(session_name):
 
 @job.group("queue", invoke_without_command=True)
 @click.option("--flat", is_flag=True, help="Plain text output (no table, no truncation)")
-@click.option("--session", "session_name", default=None, help="Session name (omit to show all sessions)")
+@session_option
 @click.pass_context
 def job_queue(ctx, flat, session_name):
     """Show or manage the experiment queue."""
@@ -861,54 +857,42 @@ def job_queue(ctx, flat, session_name):
     if ctx.invoked_subcommand is not None:
         return
 
-    # Default behavior: show queue
-    from .queue import read_queue, get_queue_state
+    from .session_connector import get_connector
 
-    queued = read_queue(session_name)
-    state = get_queue_state()
+    connector = get_connector(session_name)
+    items = connector.queue()
 
-    console.print(f"[bold]Queue Status:[/bold] {state}")
-    console.print()
-
-    if not queued:
+    if not items:
         console.print("[dim]Queue is empty[/dim]")
-        console.print("Add experiments with: nanorun job add <script>")
         return
 
     if flat:
-        show_session = session_name is None and len(set(e.session_name for e in queued)) > 1
-        for i, exp in enumerate(queued, 1):
-            env_str = " ".join(f"{k}={v}" for k, v in exp.env_vars.items()) if exp.env_vars else ""
-            parts = [f"{i}.", exp.script]
+        for i, item in enumerate(items, 1):
+            env_str = " ".join(f"{k}={v}" for k, v in item.env_vars.items()) if item.env_vars else ""
+            parts = [f"{i}.", item.job_id or item.script]
+            if item.state:
+                parts.append(f"[{item.state}]")
             if env_str:
                 parts.append(env_str)
-            if show_session and exp.session_name:
-                parts.append(f"({exp.session_name})")
             print(" ".join(parts))
         return
 
-    show_session = session_name is None and len(set(e.session_name for e in queued)) > 1
-    table = Table(title=f"Queued Experiments ({len(queued)})")
+    table = Table(title=f"Queue ({len(items)})")
     table.add_column("#", style="dim", justify="right")
-    table.add_column("Script", style="cyan")
-    table.add_column("Env")
-    table.add_column("Track")
-    table.add_column("GPUs", justify="right")
-    if show_session:
-        table.add_column("Session", style="magenta")
+    table.add_column("Job", style="cyan")
+    table.add_column("Status")
+    table.add_column("Script")
+    table.add_column("Created")
 
-    for i, exp in enumerate(queued, 1):
-        env_str = ", ".join(f"{k}={v}" for k, v in exp.env_vars.items()) if exp.env_vars else "[dim]-[/dim]"
-        row = [
+    for i, item in enumerate(items, 1):
+        color = {"running": "green", "queued": "yellow", "completed": "dim", "failed": "red", "cancelled": "dim"}.get(item.state, "white")
+        table.add_row(
             str(i),
-            exp.script,
-            env_str[:30] + "..." if len(env_str) > 30 else env_str,
-            exp.track or "[dim]-[/dim]",
-            f"{exp.gpus}x {exp.gpu_type}",
-        ]
-        if show_session:
-            row.append(exp.session_name or "-")
-        table.add_row(*row)
+            item.job_id,
+            f"[{color}]{item.state}[/{color}]",
+            item.script or "",
+            item.created_at[:19] if item.created_at else "",
+        )
 
     console.print(table)
 
@@ -918,58 +902,35 @@ def job_queue(ctx, flat, session_name):
 @session_option
 def job_clear(yes: bool, session_name):
     """Clear all queued experiments."""
-    from .queue import clear_queue_via_daemon, read_queue
+    from .session_connector import get_connector
 
-    queued = read_queue(session_name)
-    if len(queued) == 0:
-        console.print("[dim]Queue is already empty[/dim]")
+    connector = get_connector(session_name)
+    result = connector.clear()
+    if result.unsupported:
+        console.print(f"[yellow]{result.message}[/yellow]")
         return
-
-    if not yes:
-        if not click.confirm(f"Clear {len(queued)} queued experiment(s)?"):
-            return
-
-    cleared = clear_queue_via_daemon(session_name=session_name)
-    if cleared is not None:
-        console.print(f"[green]Cleared {cleared} experiment(s) from queue[/green]")
-    else:
-        console.print("[red]Failed to clear queue - daemon not reachable[/red]")
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
+        return
+    console.print(f"[green]{result.message}[/green]")
 
 
 @job.command("remove")
 @click.argument("index", type=int)
-@click.option("--session", "session_name", default=None, help="Session name (omit to use combined queue index)")
+@session_option
 def job_remove(index: int, session_name):
     """Remove experiment at INDEX from queue (1-indexed)."""
-    from .queue import remove_from_queue_via_daemon, read_queue, _read_session_queue
+    from .session_connector import get_connector
 
-    queued = read_queue(session_name)
-    if index < 1 or index > len(queued):
-        console.print(f"[red]Invalid index: {index} (queue has {len(queued)} items)[/red]")
+    connector = get_connector(session_name)
+    result = connector.remove(index)
+    if result.unsupported:
+        console.print(f"[yellow]{result.message}[/yellow]")
         return
-
-    exp = queued[index - 1]
-    target_session = exp.session_name or session_name
-    if not target_session:
-        console.print("[red]Cannot determine session for this item[/red]")
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
         return
-
-    # Find the item's index within its own session's queue
-    session_queue = _read_session_queue(target_session)
-    session_index = None
-    for i, sq_exp in enumerate(session_queue):
-        if sq_exp.script == exp.script and sq_exp.env_vars == exp.env_vars:
-            session_index = i
-            break
-
-    if session_index is None:
-        console.print("[red]Could not find item in session queue[/red]")
-        return
-
-    if remove_from_queue_via_daemon(session_index, session_name=target_session):
-        console.print(f"[green]Removed: {exp.script}[/green]")
-    else:
-        console.print("[red]Failed to remove from queue - daemon not reachable[/red]")
+    console.print(f"[green]{result.message}[/green]")
 
 
 # ============================================================================
@@ -1027,16 +988,12 @@ def mark_crashes_seen(session_name: str = None):
     default=False,
     help="Run in background or foreground (default)",
 )
-@click.option("--no-dashboard", is_flag=True, help="Don't start the dashboard server")
-@click.option("--dashboard-port", "-p", default=8080, help="Dashboard port (default: 8080)")
-def local_daemon_start(background: bool, no_dashboard: bool, dashboard_port: int):
+def daemon_start(background: bool):
     """Start the local daemon.
 
     The daemon polls the remote for experiment status and syncs metrics
     to the local database. It automatically detects when experiments
     start (including from queue) and finish.
-
-    Also starts the web dashboard (localhost:8080) unless --no-dashboard is passed.
 
     Polling intervals: status/queue=1s, metrics=3s, logs=10s
     """
@@ -1050,13 +1007,8 @@ def local_daemon_start(background: bool, no_dashboard: bool, dashboard_port: int
 
     if background:
         # Run as background process
-        cmd = [sys.executable, "-m", "nanorun.local_daemon"]
-        if no_dashboard:
-            cmd.append("--no-dashboard")
-        if dashboard_port != 8080:
-            cmd.extend(["--dashboard-port", str(dashboard_port)])
         proc = subprocess.Popen(
-            cmd,
+            [sys.executable, "-m", "nanorun.local_daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -1075,9 +1027,7 @@ def local_daemon_start(background: bool, no_dashboard: bool, dashboard_port: int
         # Run in foreground (blocking)
         console.print("[cyan]Starting local daemon in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        daemon_instance = LocalMetricsDaemon(
-            dashboard_port=dashboard_port, no_dashboard=no_dashboard
-        )
+        daemon_instance = LocalMetricsDaemon()
         daemon_instance.run()
 
 
@@ -1198,11 +1148,31 @@ def local_daemon_logs(tail: bool, num_lines: int, session_name: str):
 
 
 @local_daemon.command("restart")
-@click.pass_context
-def local_daemon_restart(ctx):
-    """Restart the local daemon (stop + start with same options)."""
-    ctx.invoke(local_daemon_stop)
-    ctx.invoke(local_daemon_start)
+@click.option(
+    "--background/--foreground",
+    "background",
+    default=False,
+    help="Run in background or foreground (default)",
+)
+def local_daemon_restart(background: bool):
+    """Restart the local daemon."""
+    from .local_daemon import is_daemon_running, stop_daemon, restart_daemon, LocalMetricsDaemon
+
+    if is_daemon_running():
+        console.print("[dim]Stopping existing daemon...[/dim]")
+        stop_daemon()
+
+    if background:
+        pid = restart_daemon(skip_stop=True)
+        if pid:
+            console.print(f"[green]Local daemon restarted (PID: {pid})[/green]")
+        else:
+            console.print("[red]Failed to restart local daemon[/red]")
+    else:
+        console.print("[cyan]Starting local daemon in foreground...[/cyan]")
+        console.print("[dim]Press Ctrl+C to stop[/dim]")
+        daemon_instance = LocalMetricsDaemon()
+        daemon_instance.run()
 
 
 @local_daemon.command("crashes")
@@ -1450,7 +1420,7 @@ def hub_logs(experiment_id: int):
         console.print(f"[red]Experiment {experiment_id} has no session_name[/red]")
         return
 
-    local_path = Config.get_config_dir() / "logs" / exp.session_name / f"{exp.remote_run_id}.txt"
+    local_path = Config.get_config_dir() / "logs" / f"{exp.remote_run_id}.txt"
     try:
         hub_mod.download_log(exp.remote_run_id, local_path, exp.session_name)
         print(local_path.read_text())
@@ -1499,59 +1469,6 @@ def hub_weights(experiment_id: int, download: bool, output: str):
         console.print(f"  Downloading {f}...")
         hub_mod.download_weight(experiment_id, f, out_dir / f, exp.session_name)
     console.print(f"[green]Downloaded {len(filenames)} files to {out_dir}[/green]")
-
-
-# ============================================================================
-# Exec command
-# ============================================================================
-
-@cli.command("exec")
-@click.argument("command", nargs=-1)
-@click.option("-t", "--timeout", default=30, type=int, help="Timeout in seconds (0 = no timeout)")
-@session_option
-def exec_cmd(command: tuple, timeout: int, session_name):
-    """Run a command on the remote machine.
-
-    Reads from stdin if no command given (pipe mode):
-
-        echo "nvidia-smi" | nanorun exec
-
-        cat script.sh | nanorun exec
-
-    Or pass the command directly:
-
-        nanorun exec nvidia-smi
-
-        nanorun exec -- ls -la ~/nanorun/logs/
-    """
-    import sys
-
-    if command:
-        cmd_str = " ".join(command)
-    elif not sys.stdin.isatty():
-        cmd_str = sys.stdin.read().strip()
-        if not cmd_str:
-            console.print("[red]No command provided via stdin.[/red]")
-            raise SystemExit(1)
-    else:
-        console.print("[red]No command provided. Pass a command or pipe via stdin.[/red]")
-        console.print("[dim]Usage: nanorun exec <command>  or  echo 'cmd' | nanorun exec[/dim]")
-        raise SystemExit(1)
-
-    remote = require_session(session_name)
-    t = timeout if timeout > 0 else None
-    result = remote.run(cmd_str, timeout=t)
-
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-        if not result.stdout.endswith("\n"):
-            sys.stdout.write("\n")
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-        if not result.stderr.endswith("\n"):
-            sys.stderr.write("\n")
-
-    raise SystemExit(result.returncode)
 
 
 # ============================================================================

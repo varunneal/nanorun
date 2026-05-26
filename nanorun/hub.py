@@ -10,12 +10,14 @@ Storage layout (same across all backends):
 """
 
 import os
+import warnings
 from pathlib import Path
 from typing import List, Optional
 
 from .project_config import load_project_config
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+warnings.filterwarnings("ignore", message="Cannot enable progress bars", module="huggingface_hub")
 
 
 def _get_hub_config() -> dict:
@@ -385,6 +387,171 @@ class _LocalBackend:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         src = self._dir("weights", session, str(experiment_id), filename)
         self._shutil.copy2(src, local_path)
+
+    def get_local_token(self) -> Optional[str]:
+        return None
+
+
+# =========================================================================
+# Backend: Iris (TPU jobs via iris CLI)
+# =========================================================================
+
+
+def _iris_job_id_to_filename(job_id: str) -> str:
+    """Strip the leading /{user}/ prefix from an iris job_id for use as filename.
+
+    Any remaining slashes are replaced with __ to prevent directory creation.
+    """
+    parts = job_id.strip("/").split("/", 1)
+    name = parts[1] if len(parts) > 1 else parts[0]
+    return name.replace("/", "__")
+
+
+_IRIS_STATE_MAP = {
+    "JOB_STATE_PENDING": "queued",
+    "JOB_STATE_BUILDING": "queued",
+    "JOB_STATE_RUNNING": "running",
+    "JOB_STATE_SUCCEEDED": "completed",
+    "JOB_STATE_FAILED": "failed",
+    "JOB_STATE_KILLED": "cancelled",
+    "JOB_STATE_WORKER_FAILED": "failed",
+    "JOB_STATE_UNSCHEDULABLE": "failed",
+}
+
+
+class _IrisBackend:
+    """Hub backend for Iris sessions. Fetches logs via iris CLI."""
+
+    def __init__(self, session_config):
+        self.iris_config = session_config.iris_config
+        self.iris_binary = session_config.iris_binary or "iris"
+        self.iris_user = session_config.iris_user or ""
+        self.wandb_project = getattr(session_config, "wandb_project", None)
+        self.wandb_entity = getattr(session_config, "wandb_entity", None)
+        self._finalized_jobs: set = set()
+
+    def _iris_cmd(self, *args: str) -> List[str]:
+        cmd = [self.iris_binary]
+        if self.iris_config:
+            cmd.extend(["--config", self.iris_config])
+        cmd.extend(args)
+        return cmd
+
+    def _run_iris(self, *args: str, timeout: int = 60) -> "subprocess.CompletedProcess":
+        import subprocess
+        cmd = self._iris_cmd(*args)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    def ping(self) -> bool:
+        try:
+            result = self._run_iris("job", "list", "--prefix", f"/{self.iris_user}/", "--json", timeout=30)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def check_auth(self) -> Optional[str]:
+        if self.ping():
+            return self.iris_user or "iris"
+        return None
+
+    def list_jobs(self) -> List[dict]:
+        """Call iris job list and return parsed JSON array."""
+        import json as _json
+        result = self._run_iris("job", "list", "--prefix", f"/{self.iris_user}/", "--json", timeout=30)
+        if result.returncode != 0:
+            return []
+        try:
+            return _json.loads(result.stdout)
+        except (ValueError, _json.JSONDecodeError):
+            return []
+
+    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
+        """Poll iris job list, fetch logs for active/recently-finished jobs."""
+        local_logs_dir.mkdir(parents=True, exist_ok=True)
+        jobs = self.list_jobs()
+
+        for job in jobs:
+            job_id = job.get("name", "")
+            state = job.get("state", "")
+            nanorun_status = _IRIS_STATE_MAP.get(state, "")
+
+            # Only process parent jobs (has_children=True)
+            if not job.get("has_children"):
+                continue
+
+            if not job_id:
+                continue
+
+            filename = _iris_job_id_to_filename(job_id)
+            local_path = local_logs_dir / f"{filename}.txt"
+
+            # Skip finalized jobs we've already captured
+            if job_id in self._finalized_jobs:
+                continue
+
+            # Fetch logs for running/queued jobs, or finished jobs without a local file
+            if nanorun_status in ("running", "queued"):
+                self._fetch_and_write_log(job_id, local_path)
+            elif nanorun_status in ("completed", "failed", "cancelled"):
+                if not local_path.exists():
+                    self._fetch_and_write_log(job_id, local_path)
+                    self._finalized_jobs.add(job_id)
+                else:
+                    # Fetch once more in case the final bytes weren't captured
+                    old_size = local_path.stat().st_size
+                    self._fetch_and_write_log(job_id, local_path)
+                    new_size = local_path.stat().st_size if local_path.exists() else 0
+                    if new_size == old_size:
+                        self._finalized_jobs.add(job_id)
+
+    def _fetch_and_write_log(self, job_id: str, local_path: Path) -> None:
+        """Fetch full log for a job and overwrite the log section of the local file."""
+        result = self._run_iris(
+            "job", "logs", "--max-lines", "999999", "--no-tail", job_id,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            return
+
+        log_content = result.stdout
+
+        # Preserve the header (CODE + METADATA sections) if present
+        if local_path.exists():
+            existing = local_path.read_text()
+            marker = "--- METADATA END ---\n"
+            idx = existing.find(marker)
+            if idx >= 0:
+                header = existing[: idx + len(marker)] + "\n"
+                local_path.write_text(header + log_content)
+                return
+
+        # No existing header — write raw log content
+        local_path.write_text(log_content)
+
+    def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
+        pass
+
+    def list_logs(self, session: str) -> List[str]:
+        jobs = self.list_jobs()
+        return [_iris_job_id_to_filename(j["name"]) for j in jobs if j.get("name")]
+
+    def upload_log(self, local_path: Path, run_id: str, session: str) -> None:
+        pass
+
+    def download_log(self, run_id: str, local_path: Path, session: str) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        # run_id here is the filename key; reconstruct full job_id
+        full_job_id = f"/{self.iris_user}/{run_id}"
+        self._fetch_and_write_log(full_job_id, local_path)
+
+    def list_weights(self, experiment_id: int, session: str) -> List[str]:
+        return []
+
+    def upload_weight(self, local_path: Path, experiment_id: int, filename: str, session: str) -> None:
+        pass
+
+    def download_weight(self, experiment_id: int, filename: str, local_path: Path, session: str) -> None:
+        pass
 
     def get_local_token(self) -> Optional[str]:
         return None

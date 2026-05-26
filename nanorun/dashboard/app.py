@@ -511,27 +511,35 @@ async def list_tracks():
     return {"tracks": track_list}
 
 
-@app.get("/api/logs/{run_id}")
+@app.get("/api/logs/{run_id:path}")
 async def get_log_file(run_id: str):
     """Get the log file content for a remote run."""
+    from ..hub import _iris_job_id_to_filename
+
     logs_dir = Config.get_config_dir() / "logs"
     # Logs are stored per-session: logs/{session}/{run_id}.txt
     # Also check flat dir for pre-migration logs
+    # For iris job IDs (contain slashes), convert to filename encoding
+    candidates = [run_id, _iris_job_id_to_filename(run_id)]
+
     log_file = None
-    flat = logs_dir / f"{run_id}.txt"
-    if flat.exists():
-        log_file = flat
-    else:
+    for rid in candidates:
+        flat = logs_dir / f"{rid}.txt"
+        if flat.exists():
+            log_file = flat
+            break
         for session_dir in logs_dir.iterdir():
             if not session_dir.is_dir():
                 continue
-            candidate = session_dir / f"{run_id}.txt"
+            candidate = session_dir / f"{rid}.txt"
             if candidate.exists():
                 log_file = candidate
                 break
+        if log_file:
+            break
 
     if not log_file:
-        return JSONResponse({"error": f"Log file not found: {run_id}.txt"}, status_code=404)
+        return JSONResponse({"error": f"Log file not found: {run_id}"}, status_code=404)
 
     try:
         content = log_file.read_text()

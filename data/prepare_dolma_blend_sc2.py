@@ -1,14 +1,15 @@
 """
 Download, tokenize, and shard a blended dataset from Dolma subsets.
+Uses StarCoder2 tokenizer (49,152 vocab, better code/math compression).
 
 Produces .bin files in the same format as fineweb10B:
   - 256 int32 header: magic=20240520, version=1, num_tokens=N, rest zeros
-  - N uint16 token values (GPT-2 tokenizer)
+  - N uint16 token values (StarCoder2 tokenizer, vocab_size=49152)
 
 Domains: code (starcoder), math (algebraic-stack), literature (books/gutenberg), news (cc_news)
 
 Usage:
-  uv run python data/prepare_dolma_blend.py [--tokens-per-domain 2_500_000_000] [--upload]
+  uv run --with transformers python data/prepare_dolma_blend_sc2.py [--tokens-per-domain 2_500_000_000] [--upload]
 """
 
 import argparse
@@ -19,8 +20,8 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-import tiktoken
 import requests
+from transformers import AutoTokenizer
 
 DOMAINS = {
     "code": {
@@ -41,8 +42,7 @@ DOMAINS = {
     },
 }
 
-SHARD_SIZE = 100_000_000  # 100M tokens per shard (same as fineweb)
-BOS_TOKEN = 50256
+SHARD_SIZE = 100_000_000  # 100M tokens per shard
 MAGIC = 20240520
 VERSION = 1
 
@@ -71,8 +71,8 @@ def download_gz(url: str, dest: Path) -> bool:
     return True
 
 
-def tokenize_jsonl_gz(path: Path, max_tokens: int, enc, existing_count: int = 0):
-    """Tokenize a gzipped JSONL file, prepending BOS to each document. Yields chunks to avoid OOM."""
+def tokenize_jsonl_gz(path: Path, max_tokens: int, tokenizer, bos_token: int, existing_count: int = 0):
+    """Tokenize a gzipped JSONL file, prepending BOS to each document."""
     tokens = []
     total = existing_count
     docs = 0
@@ -84,8 +84,8 @@ def tokenize_jsonl_gz(path: Path, max_tokens: int, enc, existing_count: int = 0)
             text = obj.get("text", "")
             if not text:
                 continue
-            doc_tokens = enc.encode_ordinary(text)
-            tokens.append(BOS_TOKEN)
+            doc_tokens = tokenizer.encode(text, add_special_tokens=False)
+            tokens.append(bos_token)
             tokens.extend(doc_tokens)
             total += len(doc_tokens) + 1
             docs += 1
@@ -122,9 +122,9 @@ def shard_tokens(tokens: np.ndarray, domain: str, split: str, out_dir: Path):
     return paths
 
 
-def compute_stats(tokens: np.ndarray, domain: str, enc):
+def compute_stats(tokens: np.ndarray, domain: str, bos_token: int):
     """Compute sequence length statistics."""
-    bos_positions = np.where(tokens == BOS_TOKEN)[0]
+    bos_positions = np.where(tokens == bos_token)[0]
     if len(bos_positions) < 2:
         return
     lengths = np.diff(bos_positions)
@@ -149,9 +149,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens-per-domain", type=int, default=2_500_000_000)
     parser.add_argument("--val-tokens-per-domain", type=int, default=10_000_000)
-    parser.add_argument("--out-dir", type=str, default="data/dolma_blend")
+    parser.add_argument("--out-dir", type=str, default="data/dolma_blend_sc2")
     parser.add_argument("--upload", action="store_true", help="Upload to HuggingFace")
-    parser.add_argument("--repo-id", type=str, default="varunneal/dolma-blend-gpt2")
+    parser.add_argument("--repo-id", type=str, default="varunneal/dolma-blend-starcoder2")
     parser.add_argument("--stats-only", action="store_true", help="Just print stats, don't shard")
     parser.add_argument("--domains", type=str, default=None, help="Comma-separated list of domains to process (default: all)")
     args = parser.parse_args()
@@ -160,7 +160,11 @@ def main():
     cache_dir = Path(tempfile.gettempdir()) / "dolma_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    enc = tiktoken.get_encoding("gpt2")
+    print("Loading StarCoder2 tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoder2-15b")
+    bos_token = 0  # <|endoftext|> — used as document separator
+    print(f"  Vocab size: {tokenizer.vocab_size}, BOS token: {bos_token}")
+
     total_needed = args.tokens_per_domain + args.val_tokens_per_domain
 
     all_stats = []
@@ -184,13 +188,11 @@ def main():
             url = domain_cfg["base_url"].format(shard=shard_idx)
             gz_path = cache_dir / f"{domain}_{shard_idx:04d}.json.gz"
 
-            # Download (stops if 404)
             if not download_gz(url, gz_path):
                 break
 
-            # Tokenize
             print(f"  Tokenizing shard {shard_idx} (have {collected / 1e9:.2f}B / {total_needed / 1e9:.2f}B)...")
-            chunk = tokenize_jsonl_gz(gz_path, total_needed, enc, existing_count=collected)
+            chunk = tokenize_jsonl_gz(gz_path, total_needed, tokenizer, bos_token, existing_count=collected)
             if len(chunk) == 0:
                 print(f"  Shard {shard_idx} yielded 0 tokens, stopping")
                 break
@@ -204,29 +206,25 @@ def main():
         tokens = np.concatenate(token_chunks)
         del token_chunks
 
-        # Stats
-        stats = compute_stats(tokens, domain, enc)
+        stats = compute_stats(tokens, domain, bos_token)
         if stats:
             all_stats.append(stats)
 
         if args.stats_only:
             continue
 
-        # Split into val + train
         val_tokens = tokens[: args.val_tokens_per_domain]
         train_tokens = tokens[args.val_tokens_per_domain : args.val_tokens_per_domain + args.tokens_per_domain]
         del tokens
 
         print(f"  Val: {len(val_tokens) / 1e6:.1f}M tokens, Train: {len(train_tokens) / 1e6:.1f}M tokens")
 
-        # Shard
         val_paths = shard_tokens(val_tokens, domain, "val", out_dir)
         del val_tokens
         train_paths = shard_tokens(train_tokens, domain, "train", out_dir)
         del train_tokens
         all_paths.extend(val_paths + train_paths)
 
-    # Print summary
     if all_stats:
         print(f"\n{'='*60}")
         print("SUMMARY")
@@ -239,7 +237,6 @@ def main():
             total_tokens += s["total_tokens"]
         print(f"  {'TOTAL':12s}: {total_tokens / 1e9:.2f}B tokens")
 
-    # Upload
     if args.upload and all_paths:
         from huggingface_hub import HfApi
         api = HfApi()

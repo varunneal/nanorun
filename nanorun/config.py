@@ -17,8 +17,8 @@ TRACK_FILE = ".track.json"
 class SessionConfig:
     """Configuration for a remote session."""
     name: str  # Session name (e.g. "session-1", "my-h100")
-    host: str
-    user: str
+    host: str = ""
+    user: str = ""
     port: int = 22
     cuda_version: Optional[str] = None
     gpu_type: str = "H100"  # H100, H200, GH200, DGX_SPARK
@@ -29,6 +29,13 @@ class SessionConfig:
     key_file: Optional[str] = None  # Path to SSH private key (-i flag)
     ssh_options: Optional[List[str]] = None  # Extra SSH -o options (e.g. ["IdentitiesOnly=yes"])
     use_pty: bool = False  # Request PTY for exec (needed for RunPod SSH proxy)
+    session_type: str = "ssh"  # "ssh" or "iris"
+    iris_config: Optional[str] = None  # Path to iris cluster yaml
+    iris_binary: Optional[str] = None  # Path to iris CLI binary (default: "iris" on PATH)
+    iris_user: Optional[str] = None  # Iris job prefix user
+    iris_workspace: Optional[str] = None  # Working directory for iris CLI (marin repo root)
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
 
 
 @dataclass
@@ -219,6 +226,30 @@ class Config:
             if active_file.exists():
                 active_file.unlink()
         return True
+
+    @classmethod
+    def rename_session(cls, old_name: str, new_name: str) -> None:
+        """Rename a session (file + state dir + active pointer)."""
+        old_file = cls._get_session_file(old_name)
+        if not old_file.exists():
+            raise ValueError(f"Session '{old_name}' does not exist")
+        new_file = cls._get_session_file(new_name)
+        if new_file.exists():
+            raise ValueError(f"Session '{new_name}' already exists")
+        # Check active pointer before renaming
+        was_active = cls.get_active_session_file().exists() and cls.get_active_session_file().read_text().strip() == old_name
+        # Update the session config's name field
+        data = json.loads(old_file.read_text())
+        data["name"] = new_name
+        new_file.write_text(json.dumps(data, indent=2))
+        old_file.unlink()
+        # Rename state dir if it exists
+        old_state = cls.get_sessions_dir() / old_name
+        if old_state.exists():
+            old_state.rename(cls.get_sessions_dir() / new_name)
+        # Update active pointer if it was pointing to old name
+        if was_active:
+            cls.get_active_session_file().write_text(new_name)
 
     @classmethod
     def get_session_state_dir(cls, name: str) -> Path:

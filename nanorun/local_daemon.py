@@ -123,11 +123,13 @@ def _append_queue_history(session_name: str, ts: str, queue_items: list):
 
 def _sync_all_logs(session_name: str):
     from . import hub
-    # Sync into a session-specific subdir to prevent mapping file collisions
-    # (log .txt files use UUIDs so don't collide, but mappings/*.jsonl have
-    # generic names that would overwrite across sessions in a shared dir)
+    session_config = Config.load_session(session_name)
     session_logs_dir = PATHS.logs_dir / session_name
-    hub.sync_logs_down(session_logs_dir, session_name)
+    if session_config and session_config.session_type == "iris":
+        backend = hub._IrisBackend(session_config)
+        backend.sync_logs_down(session_logs_dir, session_name)
+    else:
+        hub.sync_logs_down(session_logs_dir, session_name)
 
 
 class HubSyncer:
@@ -222,10 +224,11 @@ class HubSyncer:
     SYNC_TIMEOUT = 20.0  # kill sync call if it hangs longer than this
 
     def _do_sync(self):
-        sessions = list(self.daemon.trackers.keys())
+        sessions = [s.name for s in Config.list_sessions()]
         for session_name in sessions:
             try:
                 self._sync_with_timeout(session_name)
+                self._parse_metrics_for_session(session_name)
             except TimeoutError:
                 self._consecutive_failures += 1
                 if self._consecutive_failures == 1:
@@ -251,6 +254,95 @@ class HubSyncer:
         self._consecutive_failures = 0
         self._last_successful_sync = time.monotonic()
         self.last_sync_at = datetime.now().strftime("%H:%M:%S")
+
+    def _parse_metrics_for_session(self, session_name: str):
+        """Parse metrics from local log files. Dispatches to correct parser by session type."""
+        session_config = Config.load_session(session_name)
+        if session_config and session_config.session_type == "iris":
+            self._parse_iris_metrics(session_name)
+        else:
+            pass  # SSH sessions parse metrics in SessionTracker._sync_logs_and_metrics
+
+    def _parse_iris_metrics(self, session_name: str):
+        """Full reparse of iris log files + status reconciliation from iris job list."""
+        from .tracker import IrisMetricParser, record_metric, get_experiment, update_experiment_status
+        from .hub import _IrisBackend, _iris_job_id_to_filename, _IRIS_STATE_MAP
+
+        session_logs = PATHS.logs_dir / session_name
+        if not session_logs.exists():
+            return
+
+        session_config = Config.load_session(session_name)
+        if not session_config:
+            return
+
+        # Reconcile experiment status from iris job list
+        backend = _IrisBackend(session_config)
+        jobs = backend.list_jobs()
+        job_states = {}
+        for j in jobs:
+            if j.get("has_children") and j.get("name"):
+                job_states[j["name"]] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, remote_run_id, status FROM experiments WHERE remote_run_id IS NOT NULL AND session_name = ?",
+            (session_name,),
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            exp_id, remote_run_id, local_status = row["id"], row["remote_run_id"], row["status"]
+            iris_status = job_states.get(remote_run_id)
+            if iris_status and iris_status != local_status:
+                if local_status == "completed" and iris_status == "failed":
+                    continue
+                update_experiment_status(exp_id, iris_status)
+                if iris_status != "running":
+                    self.event(f"[{session_name}] Experiment {exp_id} → {iris_status}")
+
+        import re
+        _WANDB_URL_RE = re.compile(r"https://wandb\.ai/\S+")
+
+        for row in rows:
+            exp_id, remote_run_id = row["id"], row["remote_run_id"]
+            filename = _iris_job_id_to_filename(remote_run_id)
+            log_path = session_logs / f"{filename}.txt"
+            if not log_path.exists():
+                continue
+
+            content = log_path.read_text()
+
+            # Inject W&B URL into metadata header if found in log body
+            wandb_match = _WANDB_URL_RE.search(content)
+            if wandb_match and "wandb_url:" not in content[:content.find("--- METADATA END ---") + 1 if "--- METADATA END ---" in content else 0]:
+                marker = "--- METADATA END ---"
+                idx = content.find(marker)
+                if idx >= 0:
+                    wandb_line = f"wandb_url: {wandb_match.group()}\n"
+                    content = content[:idx] + wandb_line + content[idx:]
+                    log_path.write_text(content)
+
+            parser = IrisMetricParser()
+            metrics = parser.parse_content(content)
+
+            new_count = 0
+            for m in metrics:
+                is_final = m["total_steps"] is not None and m["step"] >= m["total_steps"]
+                inserted = record_metric(
+                    experiment_id=exp_id, step=m["step"],
+                    total_steps=m["total_steps"], val_loss=m["val_loss"],
+                    train_time_ms=m["train_time_ms"],
+                    step_avg_ms=m.get("step_avg_ms"), is_final_step=is_final,
+                )
+                if inserted:
+                    new_count += 1
+                if is_final:
+                    update_experiment_status(exp_id, "completed")
+                    self.event(f"[{session_name}] Experiment {exp_id} completed")
+
+            if new_count:
+                self.event(f"[{session_name}] Synced {new_count} metric steps for experiment {exp_id}")
 
     def _sync_with_timeout(self, session_name: str):
         """Run sync in a worker thread with a timeout to prevent hanging."""
@@ -789,6 +881,9 @@ class LocalMetricsDaemon:
     # --- session trackers (SSH/RPC) ---
 
     def _start_tracker(self, config: SessionConfig):
+        if config.session_type == "iris":
+            log.info(f"Skipping tracker for iris session '{config.name}' (served by HubSyncer)")
+            return
         tracker = SessionTracker(config, self)
         self.trackers[config.name] = tracker
         tracker.start()

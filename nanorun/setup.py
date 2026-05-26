@@ -216,9 +216,9 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     # Step 3: Install uv
     console.print("\n[bold]Step 3: Install uv[/bold]")
 
-    # Check if uv already installed (search common locations since ~ may be broken)
-    result = remote.run("which uv || /root/.local/bin/uv --version 2>/dev/null || find /usr/local/bin /root/.local/bin -name uv 2>/dev/null | head -1")
-    if result.success:
+    # Check if uv already installed (search common locations, including $HOME/.local/bin)
+    result = remote.run("which uv || $HOME/.local/bin/uv --version 2>/dev/null || find /usr/local/bin $HOME/.local/bin /root/.local/bin -name uv 2>/dev/null | head -1")
+    if result.success and result.stdout.strip():
         console.print("  [green]uv already installed[/green]")
     else:
         if confirm("  Install uv?", default=True):
@@ -328,7 +328,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
 
     # Step 8: Install other deps
     console.print("\n[bold]Step 8: Install dependencies[/bold]")
-    deps = "huggingface-hub websockets tqdm numpy kernels setuptools datasets tiktoken nvidia-cuda-nvcc"
+    deps = "huggingface-hub websockets tqdm numpy kernels==0.13.0 setuptools datasets tiktoken nvidia-cuda-nvcc"
     console.print(f"  [dim]Will install: {deps}[/dim]")
 
     if confirm("  Install dependencies?", default=True):

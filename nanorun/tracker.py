@@ -609,6 +609,86 @@ def parse_log_content(content: str) -> List[Dict]:
 
 
 # =============================================================================
+# Iris metric parsing (stateful — eval and progress lines arrive separately)
+# =============================================================================
+
+_IRIS_PALOMA = re.compile(r"paloma macro loss:\s*(\d+(?:\.\d+)?)")
+_IRIS_PROGRESS = re.compile(
+    r"Progress on:train\s+(\d+(?:\.\d+)?)(k?)it/(\d+(?:\.\d+)?)(k?)it"
+)
+_IRIS_ELAPSED = re.compile(r"elapsed:(\d+):(\d+):(\d+)")
+_IRIS_RATE_IT_S = re.compile(r"rate:(\d+(?:\.\d+)?)it/s")
+_IRIS_RATE_S_IT = re.compile(r"rate:(\d+(?:\.\d+)?)s/it")
+
+
+class IrisMetricParser:
+    """Stateful parser for iris log files.
+
+    Instantiate fresh per parse pass (file is overwritten each tick).
+    Emits a metric dict each time a paloma eval line is seen, pairing it
+    with the inferred step = eval_count * steps_per_eval.
+    """
+
+    def __init__(self, steps_per_eval: int = 1000):
+        self.steps_per_eval = steps_per_eval
+        self.eval_count = 0
+        self.total_steps: Optional[int] = None
+        self.last_elapsed_ms: Optional[int] = None
+        self.last_step_avg_ms: Optional[float] = None
+
+    def parse_line(self, line: str) -> Optional[Dict]:
+        """Parse a single line. Returns metric dict on eval lines, else None."""
+        # tqdm progress line — update running state
+        prog = _IRIS_PROGRESS.search(line)
+        if prog:
+            step_val = float(prog.group(1))
+            if prog.group(2) == "k":
+                step_val *= 1000
+            total_val = float(prog.group(3))
+            if prog.group(4) == "k":
+                total_val *= 1000
+            self.total_steps = int(total_val)
+
+            elapsed = _IRIS_ELAPSED.search(line)
+            if elapsed:
+                h, m, s = int(elapsed.group(1)), int(elapsed.group(2)), int(elapsed.group(3))
+                self.last_elapsed_ms = (h * 3600 + m * 60 + s) * 1000
+
+            rate_it = _IRIS_RATE_IT_S.search(line)
+            rate_s = _IRIS_RATE_S_IT.search(line)
+            if rate_it:
+                self.last_step_avg_ms = 1000.0 / float(rate_it.group(1))
+            elif rate_s:
+                self.last_step_avg_ms = float(rate_s.group(1)) * 1000.0
+
+            return None
+
+        # Paloma eval line — emit a metric record
+        paloma = _IRIS_PALOMA.search(line)
+        if paloma:
+            self.eval_count += 1
+            step = self.eval_count * self.steps_per_eval
+            return {
+                "step": step,
+                "total_steps": self.total_steps,
+                "val_loss": float(paloma.group(1)),
+                "train_time_ms": self.last_elapsed_ms,
+                "step_avg_ms": self.last_step_avg_ms,
+            }
+
+        return None
+
+    def parse_content(self, content: str) -> List[Dict]:
+        """Parse full log content, returning all metric records."""
+        metrics = []
+        for line in content.split("\n"):
+            m = self.parse_line(line)
+            if m:
+                metrics.append(m)
+        return metrics
+
+
+# =============================================================================
 # Display functions
 # =============================================================================
 

@@ -11,6 +11,7 @@ use DaemonClient (backed by RpcClient) to talk to it over an SSH tunnel.
 
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -189,9 +190,13 @@ class RemoteSession:
             if self.config.use_pty:
                 return self._run_via_shell(client, command, timeout)
 
+            # Ensure ~/.local/bin is on PATH (uv, etc. install there)
+            home = "/root" if self.config.user == "root" else f"/home/{self.config.user}"
+            wrapped = f"export PATH=\"{home}/.local/bin:$PATH\" && {command}"
+
             # Execute command
             stdin, stdout, stderr = client.exec_command(
-                command,
+                wrapped,
                 timeout=timeout,
             )
 

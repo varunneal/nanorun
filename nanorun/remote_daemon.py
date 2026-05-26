@@ -684,16 +684,16 @@ class NanorunDaemon:
     def _rpc_run(self, params, rid):
         result = self.start_experiment(
             experiment_id=params["experiment_id"], script=params["script"],
-            env_vars=params.get("env_vars", {}), gpus=params.get("gpus", 1),
-            gpu_type=params.get("gpu_type", "H100"), name=params.get("name"), track=params.get("track"),
+            env_vars=params.get("env_vars", {}), gpus=params.get("gpus") or 1,
+            gpu_type=params.get("gpu_type") or "H100", name=params.get("name"), track=params.get("track"),
         )
         return Response.ok(rid, **result) if result["success"] else Response.err(rid, ErrorCode.CONFLICT, result["error"])
 
     def _rpc_queue_add(self, params, rid):
         item = QueuedItem(
             experiment_id=params["experiment_id"], script=params["script"],
-            env_vars=params.get("env_vars", {}), gpus=params.get("gpus", 1),
-            gpu_type=params.get("gpu_type", "H100"), name=params.get("name"),
+            env_vars=params.get("env_vars", {}), gpus=params.get("gpus") or 1,
+            gpu_type=params.get("gpu_type") or "H100", name=params.get("name"),
             track=params.get("track"), cmd_prefix=params.get("cmd_prefix"),
         )
         new_len = self.add_to_queue(item, first=params.get("first", False))
@@ -751,8 +751,8 @@ class NanorunDaemon:
     def _rpc_queue_set(self, params, rid):
         items = [
             QueuedItem(experiment_id=d.get("experiment_id", 0), script=d["script"],
-                       env_vars=d.get("env_vars", {}), gpus=d.get("gpus", 1),
-                       gpu_type=d.get("gpu_type", "H100"), name=d.get("name"),
+                       env_vars=d.get("env_vars", {}), gpus=d.get("gpus") or 1,
+                       gpu_type=d.get("gpu_type") or "H100", name=d.get("name"),
                        track=d.get("track"), cmd_prefix=d.get("cmd_prefix"))
             for d in params.get("items", [])
         ]
