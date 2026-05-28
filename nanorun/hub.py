@@ -426,6 +426,7 @@ class _IrisBackend:
         self.iris_config = session_config.iris_config
         self.iris_binary = session_config.iris_binary or "iris"
         self.iris_user = session_config.iris_user or ""
+        self.iris_workspace = getattr(session_config, "iris_workspace", None)
         self.wandb_project = getattr(session_config, "wandb_project", None)
         self.wandb_entity = getattr(session_config, "wandb_entity", None)
         self._finalized_jobs: set = set()
@@ -440,7 +441,7 @@ class _IrisBackend:
     def _run_iris(self, *args: str, timeout: int = 60) -> "subprocess.CompletedProcess":
         import subprocess
         cmd = self._iris_cmd(*args)
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=self.iris_workspace)
 
     def ping(self) -> bool:
         try:
@@ -466,67 +467,139 @@ class _IrisBackend:
             return []
 
     def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
-        """Poll iris job list, fetch logs for active/recently-finished jobs."""
+        """Fetch metrics from W&B and write to local log files in nanorun-parseable format.
+
+        remote_run_id is now the wandb_run_id (12-char UUID). The iris job ID
+        is stored in env_vars._iris_job_id for status reconciliation.
+        """
         local_logs_dir.mkdir(parents=True, exist_ok=True)
-        jobs = self.list_jobs()
 
-        for job in jobs:
-            job_id = job.get("name", "")
-            state = job.get("state", "")
-            nanorun_status = _IRIS_STATE_MAP.get(state, "")
+        import json as _json2
+        from .tracker import get_db
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, remote_run_id, status, env_vars FROM experiments "
+            "WHERE remote_run_id IS NOT NULL AND session_name = ?",
+            (session,),
+        ).fetchall()
+        conn.close()
 
-            # Only process parent jobs (has_children=True)
-            if not job.get("has_children"):
-                continue
-
-            if not job_id:
-                continue
-
-            filename = _iris_job_id_to_filename(job_id)
-            local_path = local_logs_dir / f"{filename}.txt"
-
-            # Skip finalized jobs we've already captured
-            if job_id in self._finalized_jobs:
-                continue
-
-            # Fetch logs for running/queued jobs, or finished jobs without a local file
-            if nanorun_status in ("running", "queued"):
-                self._fetch_and_write_log(job_id, local_path)
-            elif nanorun_status in ("completed", "failed", "cancelled"):
-                if not local_path.exists():
-                    self._fetch_and_write_log(job_id, local_path)
-                    self._finalized_jobs.add(job_id)
-                else:
-                    # Fetch once more in case the final bytes weren't captured
-                    old_size = local_path.stat().st_size
-                    self._fetch_and_write_log(job_id, local_path)
-                    new_size = local_path.stat().st_size if local_path.exists() else 0
-                    if new_size == old_size:
-                        self._finalized_jobs.add(job_id)
-
-    def _fetch_and_write_log(self, job_id: str, local_path: Path) -> None:
-        """Fetch full log for a job and overwrite the log section of the local file."""
-        result = self._run_iris(
-            "job", "logs", "--max-lines", "999999", "--no-tail", job_id,
-            timeout=120,
-        )
-        if result.returncode != 0:
+        if not rows:
             return
 
-        log_content = result.stdout
+        # Build job state mapping from iris job list (keyed by iris job ID)
+        jobs = self.list_jobs()
+        job_states = {}
+        for j in jobs:
+            if j.get("has_children"):
+                job_states[j.get("name", "")] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
 
-        # Preserve the header (CODE + METADATA sections) if present
-        if local_path.exists():
-            existing = local_path.read_text()
-            marker = "--- METADATA END ---\n"
-            idx = existing.find(marker)
-            if idx >= 0:
-                header = existing[: idx + len(marker)] + "\n"
-                local_path.write_text(header + log_content)
-                return
+        # Fetch W&B metrics for each tracked experiment
+        try:
+            import wandb
+            api = wandb.Api()
+        except Exception:
+            return
 
-        # No existing header — write raw log content
-        local_path.write_text(log_content)
+        projects = [p.strip() for p in (self.wandb_project or "").split(",") if p.strip()]
+
+        for row in rows:
+            wandb_run_id = row["remote_run_id"]
+            local_status = row["status"]
+            env = _json2.loads(row["env_vars"]) if row["env_vars"] else {}
+            iris_job_id = env.get("_iris_job_id")
+
+            # Reconcile status from iris job list
+            if iris_job_id:
+                iris_status = job_states.get(iris_job_id, "")
+                if iris_status and iris_status != local_status:
+                    if not (local_status == "completed" and iris_status == "failed"):
+                        from .tracker import update_experiment_status
+                        update_experiment_status(row["id"], iris_status)
+
+            if wandb_run_id in self._finalized_jobs:
+                continue
+
+            local_path = local_logs_dir / f"{wandb_run_id}.txt"
+
+            # For legacy experiments without _wandb_run_id in env, fall back
+            lookup_id = env.get("_wandb_run_id") or wandb_run_id
+            if not lookup_id:
+                continue
+
+            wb_run = None
+            for project in projects:
+                try:
+                    found = api.runs(f"{self.wandb_entity}/{project}", filters={"display_name": lookup_id}, per_page=1)
+                    if found:
+                        wb_run = found[0]
+                        break
+                except Exception:
+                    continue
+            if not wb_run:
+                continue
+
+            hist = wb_run.history(
+                keys=["eval/paloma/macro_loss", "_step", "_timestamp"],
+                pandas=False,
+            )
+
+            # Also fetch train loss (sampled — W&B returns ~500 points)
+            train_hist = wb_run.history(
+                keys=["train/loss", "_step"],
+                pandas=False,
+            )
+
+            if not hist and not train_hist:
+                continue
+
+            # Get configured total steps from run config (not summary._step which is just current progress)
+            trainer_cfg = wb_run.config.get("trainer", {})
+            if isinstance(trainer_cfg, dict):
+                total_steps = trainer_cfg.get("trainer", {}).get("num_train_steps") or trainer_cfg.get("num_train_steps")
+            else:
+                total_steps = None
+            if not total_steps:
+                total_steps = wb_run.summary.get("_step") or (hist[-1].get("_step", 0) if hist else 0)
+            first_ts = hist[0].get("_timestamp", 0) if hist else 0
+
+            lines = []
+            for h in (hist or []):
+                step = h.get("_step", 0)
+                loss = h.get("eval/paloma/macro_loss")
+                ts = h.get("_timestamp", 0)
+                if loss is not None:
+                    elapsed_ms = int((ts - first_ts) * 1000) if ts and first_ts else 0
+                    lines.append(f"step:{step}/{total_steps} val_loss:{loss:.6f} train_time:{elapsed_ms}ms")
+
+            for h in (train_hist or []):
+                step = h.get("_step", 0)
+                loss = h.get("train/loss")
+                if loss is not None:
+                    lines.append(f"step:{step}/{total_steps} train_loss:{loss:.6f}")
+
+            # Preserve header, inject wandb URL if missing, overwrite metrics
+            header = ""
+            if local_path.exists():
+                content = local_path.read_text()
+                marker = "--- METADATA END ---\n"
+                idx = content.find(marker)
+                if idx >= 0:
+                    header_section = content[: idx + len(marker)]
+                    if "wandb_url:" not in header_section:
+                        wandb_url = f"https://wandb.ai/{self.wandb_entity}/{project}/runs/{wb_run.id}"
+                        header_section = content[:idx] + f"wandb_url: {wandb_url}\n" + content[idx:idx + len(marker)]
+                    header = header_section + "\n"
+
+            local_path.write_text(header + "\n".join(lines) + "\n")
+
+            # Only finalize once W&B is done AND we've seen eval data near the end
+            # (W&B history API has eventual consistency — state can be "finished"
+            # before all history rows are queryable)
+            if wb_run.state in ("finished", "crashed", "failed"):
+                last_eval_step = max((h.get("_step", 0) for h in hist if h.get("eval/paloma/macro_loss") is not None), default=0)
+                if total_steps and last_eval_step >= total_steps - 10:
+                    self._finalized_jobs.add(wandb_run_id)
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         pass
@@ -540,9 +613,10 @@ class _IrisBackend:
 
     def download_log(self, run_id: str, local_path: Path, session: str) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        # run_id here is the filename key; reconstruct full job_id
         full_job_id = f"/{self.iris_user}/{run_id}"
-        self._fetch_and_write_log(full_job_id, local_path)
+        result = self._run_iris("job", "logs", "--max-lines", "999999", "--no-tail", full_job_id, timeout=120)
+        if result.returncode == 0:
+            local_path.write_text(result.stdout)
 
     def list_weights(self, experiment_id: int, session: str) -> List[str]:
         return []

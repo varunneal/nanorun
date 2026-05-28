@@ -166,10 +166,14 @@ header h1:hover { opacity: 0.8; }
 .session-chip.connected .chip-dot { background: var(--success); }
 .session-chip.disconnected .chip-dot { background: var(--error); }
 .session-chip.connecting .chip-dot { background: var(--warning); }
+.session-chip.iris .chip-dot { background: var(--info); }
 
 .session-chip.disconnected {
     color: var(--error);
     background: rgba(224, 117, 112, 0.08);
+}
+.session-chip.iris {
+    color: var(--info);
 }
 
 .session-chip .chip-icon {

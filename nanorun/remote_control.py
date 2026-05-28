@@ -57,7 +57,7 @@ class RemoteSession:
         self.config = config
         self._client: Optional[paramiko.SSHClient] = None
         self._lock = threading.Lock()
-        self._connect_timeout = 10
+        self._connect_timeout = 30
 
     def _get_client(self) -> paramiko.SSHClient:
         """Get or create the SSH client connection."""
@@ -90,6 +90,7 @@ class RemoteSession:
             if self.config.key_file:
                 connect_kwargs["key_filename"] = os.path.expanduser(self.config.key_file)
                 connect_kwargs["look_for_keys"] = False
+                connect_kwargs["allow_agent"] = False
 
             try:
                 client.connect(**connect_kwargs)
@@ -109,10 +110,17 @@ class RemoteSession:
         channel.get_pty(term='dumb', width=200, height=50)
         channel.invoke_shell()
 
-        # Drain login banner
-        time.sleep(1)
-        while channel.recv_ready():
-            channel.recv(65536)
+        # Wait for shell prompt ($ or #) — RunPod proxies have slow banners
+        banner_deadline = time.time() + 10
+        buf = b""
+        while time.time() < banner_deadline:
+            if channel.recv_ready():
+                buf += channel.recv(65536)
+                decoded = buf.decode('utf-8', errors='replace')
+                if decoded.rstrip().endswith(('#', '$')):
+                    break
+            else:
+                time.sleep(0.2)
 
         # Disable echo and bracket-paste mode for clean output parsing
         channel.sendall(b"stty -echo; bind 'set enable-bracketed-paste off' 2>/dev/null\n")
@@ -294,11 +302,24 @@ class RemoteSession:
         return cmd
 
     def test_connection(self) -> Tuple[bool, str]:
-        """Test if we can connect to the remote machine."""
+        """Test if we can connect to the remote machine.
+
+        If exec_command fails (e.g. RunPod SSH proxy rejects non-PTY),
+        automatically retries with PTY mode and enables it on the config.
+        """
         try:
             result = self.run("echo 'nanorun connection test'", timeout=15)
             if result.success and "nanorun connection test" in result.stdout:
                 return True, "Connection successful"
+
+            # exec_command failed — try PTY mode (some proxies require it)
+            if not self.config.use_pty:
+                self.config.use_pty = True
+                result = self.run("echo 'nanorun connection test'", timeout=15)
+                if result.success and "nanorun connection test" in result.stdout:
+                    return True, "Connection successful (PTY mode)"
+                self.config.use_pty = False
+
             return False, result.stderr or "Connection failed"
         except ConnectionError as e:
             return False, str(e)

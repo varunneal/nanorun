@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import Config, SessionConfig, get_repo_root, infer_track_from_path
-from .hub import _iris_job_id_to_filename, _IRIS_STATE_MAP
+from .hub import _IRIS_STATE_MAP
 from .tracker import (
     create_experiment, update_experiment_metadata, update_experiment_status,
     get_db,
@@ -64,6 +64,8 @@ class ConnectorResult:
 class SessionConnector(ABC):
     """Uniform interface for job operations across session types."""
 
+    needs_session_tracker: bool = True
+
     @abstractmethod
     def submit(self, script: str, env_vars: Dict[str, str], name: str,
                track: Optional[str], gpus: int = 1, gpu_type: str = "H100",
@@ -107,6 +109,10 @@ class SessionConnector(ABC):
 
     def resolve_script(self, script: str) -> Optional[Path]:
         """Resolve script path against the appropriate root. Returns None if not found."""
+        return None
+
+    def infer_track(self, script: str) -> Optional[str]:
+        """Derive track name from script path when no .track.json exists."""
         return None
 
     def check_unsynced(self, script: str) -> bool:
@@ -255,6 +261,8 @@ _IRIS_AUTO_FORWARD_ENV = ["WANDB_API_KEY"]
 class IrisConnector(SessionConnector):
     """Job operations via iris CLI."""
 
+    needs_session_tracker = False
+
     def __init__(self, session_config: SessionConfig):
         self.sc = session_config
         self.session_name = session_config.name
@@ -284,11 +292,26 @@ class IrisConnector(SessionConnector):
             return p if p.exists() else None
         return None
 
+    def infer_track(self, script: str) -> Optional[str]:
+        """Derive track from script path: experiments/grug/moe/launch.py → moe."""
+        parts = Path(script).parts
+        # Strip leading "experiments/grug/" and use the next component as track
+        try:
+            idx = list(parts).index("grug")
+            if idx + 1 < len(parts) - 1:  # must have something after grug and before filename
+                return parts[idx + 1]
+        except ValueError:
+            pass
+        # Fallback: parent directory name
+        parent = Path(script).parent.name
+        return parent if parent and parent != "." else None
+
     def submit(self, script: str, env_vars: Dict[str, str], name: str,
                track: Optional[str], gpus: int = 1, gpu_type: str = "TPU",
                prefix: Optional[str] = None, first: bool = False,
                **kwargs) -> SubmitResult:
         import os as _os
+        import uuid
 
         reserve = kwargs.get("reserve")
         module = kwargs.get("module")
@@ -300,18 +323,23 @@ class IrisConnector(SessionConnector):
         if abs_script.exists():
             code_hash = hashlib.sha256(abs_script.read_bytes()).hexdigest()[:12]
 
+        # Generate unique run ID for W&B tracking
+        wandb_run_id = str(uuid.uuid4())
+
         # Auto-forward env vars (secrets — not persisted to DB)
         auto_env = {}
         for key in _IRIS_AUTO_FORWARD_ENV:
             val = _os.environ.get(key)
             if val:
                 auto_env[key] = val
+        auto_env["GRUG_RUN_ID"] = wandb_run_id
         cli_env = {**auto_env, **env_vars}
 
-        # Create experiment in SQLite (only user-provided env, no secrets)
+        # Create experiment in SQLite (user env + run ID, no secrets)
+        stored_env = {**env_vars, "_wandb_run_id": wandb_run_id}
         exp_id = create_experiment(
             name=name, script=script, track=track, code_hash=code_hash,
-            gpu_type="TPU", session_name=self.session_name, env_vars=env_vars,
+            gpu_type="TPU", session_name=self.session_name, env_vars=stored_env,
         )
         update_experiment_status(exp_id, "queued")
 
@@ -339,12 +367,21 @@ class IrisConnector(SessionConnector):
         lines = result.stdout.strip().splitlines()
         if not lines:
             return SubmitResult(experiment_id=exp_id, error="No output from iris job run")
-        job_id = lines[-1].strip()
+        iris_job_id = lines[-1].strip()
 
-        update_experiment_metadata(exp_id, remote_run_id=job_id)
-        self._write_log_header(job_id, script, abs_script)
+        # Use wandb_run_id as canonical remote_run_id (simple, no slashes)
+        # Store iris job ID separately for cancel/logs operations
+        update_experiment_metadata(exp_id, remote_run_id=wandb_run_id)
+        conn = get_db()
+        conn.execute(
+            "UPDATE experiments SET env_vars = json_set(COALESCE(env_vars, '{}'), '$._iris_job_id', ?) WHERE id = ?",
+            (iris_job_id, exp_id),
+        )
+        conn.commit()
+        conn.close()
+        self._write_log_header(wandb_run_id, script, abs_script, wandb_run_id, iris_job_id)
 
-        return SubmitResult(experiment_id=exp_id, job_id=job_id)
+        return SubmitResult(experiment_id=exp_id, job_id=iris_job_id)
 
     def queue(self) -> List[QueueItem]:
         jobs = self._list_jobs_raw()
@@ -372,7 +409,7 @@ class IrisConnector(SessionConnector):
 
     def cancel(self, job_id: Optional[str] = None) -> ConnectorResult:
         if not job_id:
-            # Find most recent running job
+            # Find most recent running job from iris
             items = self.queue()
             running = [i for i in items if i.state == "running"]
             if not running:
@@ -384,10 +421,11 @@ class IrisConnector(SessionConnector):
             err = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown"
             return ConnectorResult(success=False, message=f"iris job stop failed: {err}")
 
-        # Update local SQLite
+        # Update local SQLite — find by _iris_job_id in env_vars
         conn = get_db()
         row = conn.execute(
-            "SELECT id FROM experiments WHERE remote_run_id = ?", (job_id,)
+            "SELECT id FROM experiments WHERE session_name = ? AND json_extract(env_vars, '$._iris_job_id') = ?",
+            (self.session_name, job_id),
         ).fetchone()
         conn.close()
         if row:
@@ -442,13 +480,13 @@ class IrisConnector(SessionConnector):
         except (ValueError, json.JSONDecodeError):
             return []
 
-    def _write_log_header(self, job_id: str, script: str, abs_script: Path):
+    def _write_log_header(self, run_id: str, script: str, abs_script: Path,
+                          wandb_run_id: str, iris_job_id: str):
         config_dir = Config.get_config_dir()
         logs_dir = config_dir / "logs" / self.session_name
         logs_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = _iris_job_id_to_filename(job_id)
-        log_path = logs_dir / f"{filename}.txt"
+        log_path = logs_dir / f"{run_id}.txt"
 
         code_content = abs_script.read_text() if abs_script.exists() else "(script not found)"
         now = datetime.now(timezone.utc).isoformat()
@@ -458,7 +496,8 @@ class IrisConnector(SessionConnector):
             f"{code_content}\n"
             f"--- CODE END ---\n\n"
             f"--- METADATA ---\n"
-            f"iris_job_id: {job_id}\n"
+            f"iris_job_id: {iris_job_id}\n"
+            f"wandb_run_id: {wandb_run_id}\n"
             f"submitted_at: {now}\n"
             f"--- METADATA END ---\n\n"
         )

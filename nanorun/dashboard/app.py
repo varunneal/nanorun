@@ -296,12 +296,18 @@ async def get_sessions():
     result = []
     for sc in sessions:
         state = SessionState.load(sc.name)
+        if sc.session_type == "iris":
+            host = "iris controller"
+            status = "iris"
+        else:
+            host = f"{sc.user}@{sc.host}:{sc.port}"
+            status = state.status
         result.append({
             "name": sc.name,
-            "host": f"{sc.user}@{sc.host}:{sc.port}",
+            "host": host,
             "gpu_type": sc.gpu_type,
             "gpu_count": sc.gpu_count,
-            "status": state.status,
+            "status": status,
             "last_error": state.last_error,
             "metrics_synced": state.metrics_synced,
             "tracking_experiment_id": state.tracking_experiment_id,
@@ -387,6 +393,34 @@ async def get_session_daemon_status(name: str):
     if not status:
         return JSONResponse({"error": "Could not reach daemon"}, status_code=503)
     return status
+
+
+@app.get("/api/metrics/version")
+async def get_metrics_version(experiment_ids: Optional[str] = None):
+    """Lightweight endpoint returning metric counts for change detection.
+
+    If experiment_ids is provided (comma-separated), returns per-experiment counts.
+    Otherwise returns global total.
+    """
+    conn = get_db()
+    if experiment_ids:
+        ids = [int(x) for x in experiment_ids.split(",") if x.strip()]
+        if not ids:
+            conn.close()
+            return {"version": 0, "counts": {}}
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT experiment_id, COUNT(*) as cnt FROM metrics WHERE experiment_id IN ({placeholders}) GROUP BY experiment_id",
+            ids,
+        ).fetchall()
+        conn.close()
+        counts = {str(row["experiment_id"]): row["cnt"] for row in rows}
+        version = sum(counts.values())
+        return {"version": version, "counts": counts}
+    else:
+        row = conn.execute("SELECT COUNT(*) as cnt FROM metrics").fetchone()
+        conn.close()
+        return {"version": row["cnt"]}
 
 
 @app.get("/api/experiment/{exp_id}")
@@ -519,7 +553,7 @@ async def get_log_file(run_id: str):
     logs_dir = Config.get_config_dir() / "logs"
     # Logs are stored per-session: logs/{session}/{run_id}.txt
     # Also check flat dir for pre-migration logs
-    # For iris job IDs (contain slashes), convert to filename encoding
+    # Try direct name, then legacy iris job ID encoding for old experiments
     candidates = [run_id, _iris_job_id_to_filename(run_id)]
 
     log_file = None

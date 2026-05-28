@@ -182,16 +182,15 @@ class HubSyncer:
         log.info("[hub] Starting hub syncer")
         self.event("Hub syncer starting")
         from . import hub
+        # Try global hub ping (HF/S3) but don't gate on it — iris sessions
+        # use their own backend and don't need the global hub to be reachable
         try:
             hub.ping()
-        except Exception as e:
-            self.status = "error"
-            self.last_error = str(e)
-            self.event(f"Hub connection failed: {self.last_error}")
-            return
+            self.event("Hub connected")
+        except Exception:
+            self.event("Global hub unreachable (iris sessions will still sync)")
         self.status = "connected"
         self._was_connected = True
-        self.event("Hub connected")
         self._last_successful_sync = time.monotonic()
         while self.running:
             now = time.monotonic()
@@ -225,35 +224,38 @@ class HubSyncer:
 
     def _do_sync(self):
         sessions = [s.name for s in Config.list_sessions()]
+        any_success = False
         for session_name in sessions:
             try:
                 self._sync_with_timeout(session_name)
                 self._parse_metrics_for_session(session_name)
+                any_success = True
             except TimeoutError:
-                self._consecutive_failures += 1
-                if self._consecutive_failures == 1:
+                if not hasattr(self, '_session_failures'):
+                    self._session_failures = {}
+                self._session_failures[session_name] = self._session_failures.get(session_name, 0) + 1
+                if self._session_failures[session_name] == 1:
                     log.warning(f"[hub] Sync timed out for {session_name}")
-                return
+                continue
             except Exception as e:
                 err_str = str(e)
-                self._consecutive_failures += 1
                 if "rate limit" in err_str.lower() or "429" in err_str:
-                    backoff = min(60.0 * self._consecutive_failures, 300.0)
-                    log.warning(f"[hub] Rate limited, backing off {backoff:.0f}s")
-                    self.event(f"Rate limited — backing off {backoff:.0f}s")
+                    backoff = min(60.0, 300.0)
+                    log.warning(f"[hub] Rate limited on {session_name}, backing off {backoff:.0f}s")
                     self._last_sync = time.monotonic() + backoff - self.SYNC_INTERVAL
                     return
-                if self._consecutive_failures == 1:
+                if not hasattr(self, '_session_failures'):
+                    self._session_failures = {}
+                self._session_failures[session_name] = self._session_failures.get(session_name, 0) + 1
+                if self._session_failures[session_name] == 1:
                     log.warning(f"[hub] Sync failed for {session_name}: {e}")
-                if self._consecutive_failures >= 10:
-                    self.last_error = f"10 consecutive sync failures: {e}"
-                    self.status = "error"
-                    self.event(f"Hub sync failing repeatedly: {e}")
-                    self.running = False
-                return
-        self._consecutive_failures = 0
-        self._last_successful_sync = time.monotonic()
-        self.last_sync_at = datetime.now().strftime("%H:%M:%S")
+                continue
+        if any_success:
+            self._consecutive_failures = 0
+            self._last_successful_sync = time.monotonic()
+            self.last_sync_at = datetime.now().strftime("%H:%M:%S")
+        else:
+            self._consecutive_failures += 1
 
     def _parse_metrics_for_session(self, session_name: str):
         """Parse metrics from local log files. Dispatches to correct parser by session type."""
@@ -261,12 +263,49 @@ class HubSyncer:
         if session_config and session_config.session_type == "iris":
             self._parse_iris_metrics(session_name)
         else:
-            pass  # SSH sessions parse metrics in SessionTracker._sync_logs_and_metrics
+            # For SSH sessions: parse metrics here if the session tracker is dead
+            tracker = self.daemon.trackers.get(session_name)
+            tracker_alive = (
+                isinstance(tracker, SessionTracker)
+                and tracker._thread is not None
+                and tracker._thread.is_alive()
+            )
+            if not tracker_alive:
+                self._parse_ssh_metrics(session_name)
+
+    def _parse_ssh_metrics(self, session_name: str):
+        """Parse metrics from local log files for SSH sessions whose tracker is dead."""
+        session_logs = PATHS.logs_dir / session_name
+        if not session_logs.exists():
+            return
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, remote_run_id FROM experiments "
+            "WHERE remote_run_id IS NOT NULL AND session_name = ?",
+            (session_name,),
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            exp_id, run_id = row["id"], row["remote_run_id"]
+            local_log = session_logs / f"{run_id}.txt"
+            if not local_log.exists():
+                flat = PATHS.logs_dir / f"{run_id}.txt"
+                if flat.exists():
+                    local_log = flat
+                else:
+                    continue
+            if local_log.stat().st_size <= _log_offsets.get(run_id, 0):
+                continue
+            recorded, _ = _parse_local_metrics(exp_id, run_id, local_log)
+            if recorded:
+                self.event(f"[{session_name}] Synced {recorded} metric steps for experiment {exp_id}")
 
     def _parse_iris_metrics(self, session_name: str):
-        """Full reparse of iris log files + status reconciliation from iris job list."""
-        from .tracker import IrisMetricParser, record_metric, get_experiment, update_experiment_status
-        from .hub import _IrisBackend, _iris_job_id_to_filename, _IRIS_STATE_MAP
+        """Parse iris log files (keyed by wandb_run_id) + status reconciliation."""
+        from .tracker import parse_metric_line, record_metric, update_experiment_status
+        from .hub import _IrisBackend, _IRIS_STATE_MAP
 
         session_logs = PATHS.logs_dir / session_name
         if not session_logs.exists():
@@ -276,7 +315,7 @@ class HubSyncer:
         if not session_config:
             return
 
-        # Reconcile experiment status from iris job list
+        # Reconcile experiment status from iris job list (keyed by iris job ID)
         backend = _IrisBackend(session_config)
         jobs = backend.list_jobs()
         job_states = {}
@@ -284,16 +323,22 @@ class HubSyncer:
             if j.get("has_children") and j.get("name"):
                 job_states[j["name"]] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
 
+        import json as _json
         conn = get_db()
         rows = conn.execute(
-            "SELECT id, remote_run_id, status FROM experiments WHERE remote_run_id IS NOT NULL AND session_name = ?",
+            "SELECT id, remote_run_id, status, env_vars FROM experiments "
+            "WHERE remote_run_id IS NOT NULL AND session_name = ?",
             (session_name,),
         ).fetchall()
         conn.close()
 
         for row in rows:
-            exp_id, remote_run_id, local_status = row["id"], row["remote_run_id"], row["status"]
-            iris_status = job_states.get(remote_run_id)
+            exp_id, local_status = row["id"], row["status"]
+            env = _json.loads(row["env_vars"]) if row["env_vars"] else {}
+            iris_job_id = env.get("_iris_job_id")
+            if not iris_job_id:
+                continue
+            iris_status = job_states.get(iris_job_id)
             if iris_status and iris_status != local_status:
                 if local_status == "completed" and iris_status == "failed":
                     continue
@@ -301,37 +346,23 @@ class HubSyncer:
                 if iris_status != "running":
                     self.event(f"[{session_name}] Experiment {exp_id} → {iris_status}")
 
-        import re
-        _WANDB_URL_RE = re.compile(r"https://wandb\.ai/\S+")
-
         for row in rows:
-            exp_id, remote_run_id = row["id"], row["remote_run_id"]
-            filename = _iris_job_id_to_filename(remote_run_id)
-            log_path = session_logs / f"{filename}.txt"
+            exp_id, wandb_run_id = row["id"], row["remote_run_id"]
+            log_path = session_logs / f"{wandb_run_id}.txt"
             if not log_path.exists():
                 continue
 
             content = log_path.read_text()
-
-            # Inject W&B URL into metadata header if found in log body
-            wandb_match = _WANDB_URL_RE.search(content)
-            if wandb_match and "wandb_url:" not in content[:content.find("--- METADATA END ---") + 1 if "--- METADATA END ---" in content else 0]:
-                marker = "--- METADATA END ---"
-                idx = content.find(marker)
-                if idx >= 0:
-                    wandb_line = f"wandb_url: {wandb_match.group()}\n"
-                    content = content[:idx] + wandb_line + content[idx:]
-                    log_path.write_text(content)
-
-            parser = IrisMetricParser()
-            metrics = parser.parse_content(content)
-
             new_count = 0
-            for m in metrics:
+            for line in content.split("\n"):
+                m = parse_metric_line(line)
+                if not m:
+                    continue
                 is_final = m["total_steps"] is not None and m["step"] >= m["total_steps"]
                 inserted = record_metric(
                     experiment_id=exp_id, step=m["step"],
                     total_steps=m["total_steps"], val_loss=m["val_loss"],
+                    train_loss=m.get("train_loss"),
                     train_time_ms=m["train_time_ms"],
                     step_avg_ms=m.get("step_avg_ms"), is_final_step=is_final,
                 )
@@ -389,6 +420,7 @@ def _parse_local_metrics(experiment_id: int, run_id: str, log_path: Path) -> tup
             inserted = record_metric(
                 experiment_id=experiment_id, step=metric["step"],
                 total_steps=metric["total_steps"], val_loss=metric["val_loss"],
+                train_loss=metric.get("train_loss"),
                 train_time_ms=metric["train_time_ms"],
                 step_avg_ms=metric.get("step_avg_ms"), is_final_step=is_final,
             )
@@ -881,8 +913,10 @@ class LocalMetricsDaemon:
     # --- session trackers (SSH/RPC) ---
 
     def _start_tracker(self, config: SessionConfig):
-        if config.session_type == "iris":
-            log.info(f"Skipping tracker for iris session '{config.name}' (served by HubSyncer)")
+        from .session_connector import get_connector
+        connector = get_connector(config.name)
+        if not connector.needs_session_tracker:
+            self.trackers[config.name] = None  # sentinel: served by HubSyncer
             return
         tracker = SessionTracker(config, self)
         self.trackers[config.name] = tracker
@@ -891,7 +925,7 @@ class LocalMetricsDaemon:
 
     def _stop_tracker(self, name: str):
         tracker = self.trackers.pop(name, None)
-        if tracker:
+        if tracker is not None and isinstance(tracker, SessionTracker):
             tracker.stop()
             log.info(f"Stopped tracker for '{name}'")
 
@@ -941,7 +975,7 @@ class LocalMetricsDaemon:
     def _reconnectable_trackers(self) -> list[str]:
         """Dead trackers that were previously connected (not failed on first connect)."""
         return [name for name, t in self.trackers.items()
-                if t._thread and not t._thread.is_alive() and t._was_connected]
+                if isinstance(t, SessionTracker) and t._thread and not t._thread.is_alive() and t._was_connected]
 
     def _hub_reconnectable(self) -> bool:
         return self.hub_syncer is not None and self.hub_syncer.reconnectable

@@ -83,15 +83,24 @@ def detect_gpu_type(remote: RemoteSession) -> str:
     result = remote.run("nvidia-smi --query-gpu=name --format=csv,noheader | head -1")
     if result.success:
         name = result.stdout.strip().upper()
-        # DGX Spark uses GB10 Grace Blackwell Superchip
-        if "GB10" in name or "BLACKWELL" in name or "DGX SPARK" in name:
+        if "GB10" in name or "DGX SPARK" in name:
             return "DGX_SPARK"
+        elif "B200" in name:
+            return "B200"
+        elif "RTX PRO 6000" in name and "BLACKWELL" in name:
+            return "RTX_PRO_6000"
+        elif "BLACKWELL" in name or "B100" in name:
+            return "BLACKWELL"
         elif "GH200" in name:
             return "GH200"
         elif "H200" in name:
             return "H200"
         elif "H100" in name:
             return "H100"
+        elif "A100" in name:
+            return "A100"
+        elif "L4" in name:
+            return "L4"
     return "H100"  # Default fallback
 
 

@@ -213,24 +213,33 @@ def record_metric(
     step: int,
     total_steps: Optional[int] = None,
     val_loss: Optional[float] = None,
+    train_loss: Optional[float] = None,
     train_time_ms: Optional[int] = None,
     step_avg_ms: Optional[float] = None,
     is_final_step: bool = False,
 ) -> bool:
-    """Record a metric checkpoint. Returns True if a new row was inserted."""
+    """Record a metric checkpoint. Returns True if a new row was inserted or updated."""
     conn = get_db()
     cursor = conn.execute(
         """
-        INSERT OR IGNORE INTO metrics
-            (experiment_id, step, total_steps, val_loss, train_time_ms, step_avg_ms, is_final_step)
+        INSERT INTO metrics
+            (experiment_id, step, total_steps, val_loss, train_loss, train_time_ms, step_avg_ms, is_final_step)
         VALUES
-            (:experiment_id, :step, :total_steps, :val_loss, :train_time_ms, :step_avg_ms, :is_final_step)
+            (:experiment_id, :step, :total_steps, :val_loss, :train_loss, :train_time_ms, :step_avg_ms, :is_final_step)
+        ON CONFLICT(experiment_id, step) DO UPDATE SET
+            total_steps = COALESCE(:total_steps, total_steps),
+            val_loss = COALESCE(:val_loss, val_loss),
+            train_loss = COALESCE(:train_loss, train_loss),
+            train_time_ms = COALESCE(:train_time_ms, train_time_ms),
+            step_avg_ms = COALESCE(:step_avg_ms, step_avg_ms),
+            is_final_step = MAX(is_final_step, :is_final_step)
         """,
         {
             "experiment_id": experiment_id,
             "step": step,
             "total_steps": total_steps,
             "val_loss": val_loss,
+            "train_loss": train_loss,
             "train_time_ms": train_time_ms,
             "step_avg_ms": step_avg_ms,
             "is_final_step": is_final_step,
@@ -568,6 +577,7 @@ def get_final_metrics(experiment_id: int) -> Optional[Tuple[float, int, int]]:
 _NUM = r"\d+(?:\.\d+)?"
 _STEP_FIELD = re.compile(rf"step:(\d+)/(\d+)")
 _VAL_LOSS_FIELD = re.compile(rf"val_loss:({_NUM})")
+_TRAIN_LOSS_FIELD = re.compile(rf"train_loss:({_NUM})")
 _TRAIN_TIME_FIELD = re.compile(rf"train_time:({_NUM})(ms|s)")
 _STEP_AVG_FIELD = re.compile(rf"step_avg:({_NUM})ms")
 
@@ -575,27 +585,40 @@ _STEP_AVG_FIELD = re.compile(rf"step_avg:({_NUM})ms")
 def parse_metric_line(line: str) -> Optional[Dict]:
     """Parse a single log line for metrics. Returns dict or None.
 
-    Requires step/val_loss/train_time fields; step_avg is optional. Additional
-    fields in the log line (e.g. epoch:3.5) are ignored. train_time accepts
-    integer ms ('542512ms') or float seconds ('542.512s').
+    Handles two formats:
+      - Eval lines: step:N/M val_loss:X train_time:Yms [step_avg:Zms]
+      - Train loss lines: step:N/M train_loss:X
     """
     step_match = _STEP_FIELD.search(line)
-    val_loss_match = _VAL_LOSS_FIELD.search(line)
-    train_time_match = _TRAIN_TIME_FIELD.search(line)
-    if not (step_match and val_loss_match and train_time_match):
+    if not step_match:
         return None
 
-    train_time_val = float(train_time_match.group(1))
-    train_time_ms = int(train_time_val * 1000) if train_time_match.group(2) == "s" else int(train_time_val)
-
-    step_avg_match = _STEP_AVG_FIELD.search(line)
-    return {
+    result = {
         "step": int(step_match.group(1)),
         "total_steps": int(step_match.group(2)),
-        "val_loss": float(val_loss_match.group(1)),
-        "train_time_ms": train_time_ms,
-        "step_avg_ms": float(step_avg_match.group(1)) if step_avg_match else None,
+        "val_loss": None,
+        "train_loss": None,
+        "train_time_ms": None,
+        "step_avg_ms": None,
     }
+
+    val_loss_match = _VAL_LOSS_FIELD.search(line)
+    train_loss_match = _TRAIN_LOSS_FIELD.search(line)
+    train_time_match = _TRAIN_TIME_FIELD.search(line)
+
+    if val_loss_match and train_time_match:
+        train_time_val = float(train_time_match.group(1))
+        result["val_loss"] = float(val_loss_match.group(1))
+        result["train_time_ms"] = int(train_time_val * 1000) if train_time_match.group(2) == "s" else int(train_time_val)
+        step_avg_match = _STEP_AVG_FIELD.search(line)
+        result["step_avg_ms"] = float(step_avg_match.group(1)) if step_avg_match else None
+        return result
+
+    if train_loss_match:
+        result["train_loss"] = float(train_loss_match.group(1))
+        return result
+
+    return None
 
 
 def parse_log_content(content: str) -> List[Dict]:
@@ -616,7 +639,7 @@ _IRIS_PALOMA = re.compile(r"paloma macro loss:\s*(\d+(?:\.\d+)?)")
 _IRIS_PROGRESS = re.compile(
     r"Progress on:train\s+(\d+(?:\.\d+)?)(k?)it/(\d+(?:\.\d+)?)(k?)it"
 )
-_IRIS_ELAPSED = re.compile(r"elapsed:(\d+):(\d+):(\d+)")
+_IRIS_ELAPSED = re.compile(r"elapsed:(?:(\d+):)?(\d+):(\d+)")
 _IRIS_RATE_IT_S = re.compile(r"rate:(\d+(?:\.\d+)?)it/s")
 _IRIS_RATE_S_IT = re.compile(r"rate:(\d+(?:\.\d+)?)s/it")
 
@@ -651,7 +674,8 @@ class IrisMetricParser:
 
             elapsed = _IRIS_ELAPSED.search(line)
             if elapsed:
-                h, m, s = int(elapsed.group(1)), int(elapsed.group(2)), int(elapsed.group(3))
+                h = int(elapsed.group(1)) if elapsed.group(1) else 0
+                m, s = int(elapsed.group(2)), int(elapsed.group(3))
                 self.last_elapsed_ms = (h * 3600 + m * 60 + s) * 1000
 
             rate_it = _IRIS_RATE_IT_S.search(line)

@@ -203,28 +203,10 @@ async function loadTracks() {
 
 // --- Experiments list ---
 
-async function refreshExperiments() {
-    const searchFilter = document.getElementById('search-filter').value.trim();
-    const statusFilter = document.getElementById('status-filter').value;
-    const trackFilter = document.getElementById('track-filter').value;
+let _lastExperimentsJson = null;
 
-    const params = new URLSearchParams();
-    if (trackFilter) params.set('track', trackFilter);
-    if (statusFilter) params.set('status', statusFilter);
-    if (searchFilter) params.set('search', searchFilter);
-
-    const url = params.toString() ? `/api/experiments?${params}` : '/api/experiments';
-    const response = await fetch(url);
-    let data = await response.json();
-
-    const listEl = document.getElementById('experiments-list');
-
-    if (data.experiments.length === 0) {
-        listEl.innerHTML = '<p class="placeholder">No experiments found. Run "nanorun run &lt;script&gt;" to start an experiment.</p>';
-        return [];
-    }
-
-    listEl.innerHTML = data.experiments.map(exp => {
+function _buildExperimentListHtml(experiments) {
+    return experiments.map(exp => {
         const scriptPath = (exp.script || '').replace(/'/g, "\\'");
         return `
         <div class="experiment-card ${exp.status}" onclick="selectExperiment('${exp.code_hash || exp.id}', ${JSON.stringify(exp.experiment_ids || [exp.id])})" data-id="${exp.code_hash || exp.id}">
@@ -249,16 +231,47 @@ async function refreshExperiments() {
             </div>
         </div>
     `}).join('');
+}
 
-    // Re-highlight selected
-    const sel = State.get('selectedExp');
-    if (sel) {
-        document.querySelectorAll('.experiment-card').forEach(el => {
-            el.classList.toggle('selected', el.dataset.id == sel);
-        });
+async function refreshExperiments() {
+    const searchFilter = document.getElementById('search-filter').value.trim();
+    const statusFilter = document.getElementById('status-filter').value;
+    const trackFilter = document.getElementById('track-filter').value;
+
+    const params = new URLSearchParams();
+    if (trackFilter) params.set('track', trackFilter);
+    if (statusFilter) params.set('status', statusFilter);
+    if (searchFilter) params.set('search', searchFilter);
+
+    const url = params.toString() ? `/api/experiments?${params}` : '/api/experiments';
+    const response = await fetch(url);
+    let data = await response.json();
+
+    const listEl = document.getElementById('experiments-list');
+
+    if (data.experiments.length === 0) {
+        listEl.innerHTML = '<p class="placeholder">No experiments found. Run "nanorun run &lt;script&gt;" to start an experiment.</p>';
+        _lastExperimentsJson = null;
+        return [];
     }
 
-    renderBucketCard();
+    // Only rebuild sidebar DOM if the data actually changed
+    const fingerprint = JSON.stringify(data.experiments.map(e => [e.code_hash || e.id, e.status, e.val_loss, e.current_step]));
+    if (fingerprint !== _lastExperimentsJson) {
+        _lastExperimentsJson = fingerprint;
+        listEl.innerHTML = _buildExperimentListHtml(data.experiments);
+
+        // Re-highlight selected
+        const sel = State.get('selectedExp');
+        if (sel) {
+            document.querySelectorAll('.experiment-card').forEach(el => {
+                el.classList.toggle('selected', el.dataset.id == sel);
+            });
+        }
+
+        renderBucketCard();
+    }
+
     return data.experiments;
 }
 
@@ -268,6 +281,9 @@ async function selectExperiment(codeHashOrId, experimentIds) {
     State.set('selectedQueuedScript', null);
     const prevExp = State.get('selectedExp');
     const isSameExperiment = prevExp === codeHashOrId;
+
+    // Reset metrics version tracking when switching experiments
+    if (!isSameExperiment) _lastMetricsVersion = null;
 
     State.update({
         selectedExp: codeHashOrId,
@@ -613,7 +629,7 @@ async function goToExperiment(expId) {
 
 // --- Session chips ---
 
-const MAX_SESSION_CHIPS = 3;
+const MAX_SESSION_CHIPS = 5;
 let _sessionData = [];
 let _sessionPopoverOpen = null;
 let _hubData = {};
@@ -625,7 +641,7 @@ async function refreshSessionChips() {
         _sessionData = data.sessions || data;
         _hubData = data.hub || {};
         _sessionData.sort((a, b) => {
-            const order = { disconnected: 0, connecting: 1, connected: 2 };
+            const order = { disconnected: 0, connecting: 1, iris: 2, connected: 3 };
             return (order[a.status] ?? 1) - (order[b.status] ?? 1);
         });
         if (_sessionPopoverOpen) return;
@@ -698,7 +714,9 @@ function openSessionPopover(name) {
     popover.id = 'session-popover';
     const gpuLabel = s.gpu_count > 1 ? `${s.gpu_count}× ${s.gpu_type}` : s.gpu_type;
     let body = `<div class="sp-header"><span class="sp-name">${s.name}</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info"><span style="color:var(--text-primary)">${s.host}</span> <span style="color:#888">${gpuLabel}</span></div>`;
-    if (s.status === 'connected') {
+    if (s.status === 'iris') {
+        body += `<div class="sp-actions"><button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
+    } else if (s.status === 'connected') {
         body += `<div class="sp-status-detail" id="sp-detail-${name}">Loading...</div>`;
         body += `<div class="sp-actions"><button class="sp-btn sp-btn-secondary" onclick="doDaemonRestart('${name}')">Daemon Restart</button></div>`;
     } else {
@@ -802,6 +820,32 @@ async function revealInFinder(expId) {
 // --- Auto-refresh / init ---
 
 let refreshInterval = null;
+let _lastMetricsVersion = null;
+
+async function _checkMetricsChanged() {
+    /**
+     * Lightweight poll: only returns true when metric rows have actually changed
+     * for the currently selected experiments.
+     */
+    const selIds = State.get('selectedExpIds');
+    if (!selIds || selIds.length === 0) return false;
+    try {
+        const resp = await fetch(`/api/metrics/version?experiment_ids=${selIds.join(',')}`);
+        const data = await resp.json();
+        const version = data.version;
+        if (_lastMetricsVersion === null) {
+            _lastMetricsVersion = version;
+            return false;
+        }
+        if (version !== _lastMetricsVersion) {
+            _lastMetricsVersion = version;
+            return true;
+        }
+        return false;
+    } catch {
+        return false;
+    }
+}
 
 async function startAutoRefresh() {
     // Restore view
@@ -847,20 +891,23 @@ async function startAutoRefresh() {
         selectExperiment(first.code_hash || first.id, first.experiment_ids || [first.id]);
     }
 
-    refreshInterval = setInterval(() => {
+    refreshInterval = setInterval(async () => {
         if (State.get('deleteInProgress')) return;
         if (State.get('view') === 'queue') {
             refreshQueue();
         } else {
             refreshExperiments();
             refreshQueueCount();
-            // Only re-fetch detail data if there's a running experiment (metrics changing)
+            // Only re-fetch detail panel when metrics actually changed
             const sel = State.get('selectedExp');
             const selIds = State.get('selectedExpIds');
             const expData = State.get('experimentData');
             const hasRunning = expData && expData.some(d => d.status === 'running');
             if (sel && selIds && selIds.length > 0 && hasRunning) {
-                selectExperiment(sel, selIds);
+                const changed = await _checkMetricsChanged();
+                if (changed) {
+                    selectExperiment(sel, selIds);
+                }
             }
         }
     }, 5000);

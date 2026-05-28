@@ -158,6 +158,8 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
         raise SystemExit(1)
 
     console.print("[green]Connection successful![/green]")
+    if session_config.use_pty:
+        console.print("[dim]PTY mode enabled (SSH proxy requires it)[/dim]")
 
     # Detect or use provided GPU type
     if gpu_type:
@@ -536,6 +538,56 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
 
 
 # ============================================================================
+# Exec command
+# ============================================================================
+
+@cli.command("exec")
+@click.argument("command", nargs=-1)
+@click.option("-t", "--timeout", "timeout", default=30, type=int, help="Timeout in seconds (0 for none)")
+@session_option
+def remote_exec(command: tuple, timeout: int, session_name):
+    """Run a command on the remote machine.
+
+    Examples:
+        nanorun exec nvidia-smi
+        nanorun exec -- ls -la ~/nanorun/logs/
+        nanorun exec -t 0 'tail -f ~/nanorun/logs/run.txt'
+        echo "hostname" | nanorun exec
+    """
+    import sys as _sys
+
+    if not _require_ssh_session(session_name):
+        raise SystemExit(1)
+
+    # Read command from stdin if no arguments given
+    if not command:
+        if _sys.stdin.isatty():
+            console.print("[red]No command given. Provide as argument or pipe via stdin.[/red]")
+            raise SystemExit(1)
+        cmd_str = _sys.stdin.read().strip()
+    else:
+        cmd_str = " ".join(command)
+
+    if not cmd_str:
+        console.print("[red]Empty command.[/red]")
+        raise SystemExit(1)
+
+    remote = require_session(session_name)
+    result = remote.run(cmd_str, timeout=timeout if timeout > 0 else None)
+
+    if result.stdout:
+        _sys.stdout.write(result.stdout)
+        if not result.stdout.endswith("\n"):
+            _sys.stdout.write("\n")
+    if result.stderr:
+        _sys.stderr.write(result.stderr)
+        if not result.stderr.endswith("\n"):
+            _sys.stderr.write("\n")
+
+    raise SystemExit(result.exit_code)
+
+
+# ============================================================================
 # Job commands
 # ============================================================================
 
@@ -590,6 +642,9 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
     env_dict = dict(e.split("=", 1) for e in env) if env else {}
     exp_name = name or Path(script).stem
     track = infer_track_from_path(script_rel)
+    if not track:
+        # For iris sessions, derive track from script path (e.g. experiments/grug/moe/launch.py → moe)
+        track = connector.infer_track(script_rel)
     if track:
         console.print(f"[dim]Track: {track}[/dim]")
 

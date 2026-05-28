@@ -21,7 +21,7 @@ class SessionConfig:
     user: str = ""
     port: int = 22
     cuda_version: Optional[str] = None
-    gpu_type: str = "H100"  # H100, H200, GH200, DGX_SPARK
+    gpu_type: str = "H100"  # H100, H200, GH200, A100, L4, B200, RTX_PRO_6000, BLACKWELL, DGX_SPARK
     gpu_count: int = 1  # Number of GPUs on the machine
     has_sudo: bool = True
     repo_path: str = "~/nanorun"
