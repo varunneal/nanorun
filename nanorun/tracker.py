@@ -83,6 +83,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "gpu_type": "TEXT DEFAULT 'H100'",
         "kernels_path": "TEXT",
         "session_name": "TEXT",
+        "queue_command": "TEXT",
     }
     for col, col_type in migrations.items():
         if col not in columns:
@@ -166,6 +167,16 @@ class Metric:
 # Database operations
 # =============================================================================
 
+def _build_queue_command(script: str, env_vars: Optional[Dict[str, str]]) -> str:
+    """Build a reproducible nanorun command from script + env_vars."""
+    parts = ["nanorun job add", script]
+    if env_vars:
+        for k, v in env_vars.items():
+            if not k.startswith("_"):
+                parts.append(f"--env {k}={v}")
+    return " ".join(parts)
+
+
 def create_experiment(
     name: str,
     script: str,
@@ -184,8 +195,8 @@ def create_experiment(
     conn = get_db()
     cursor = conn.execute(
         """
-        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, session_name)
-        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :session_name)
+        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, session_name, queue_command)
+        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :session_name, :queue_command)
         """,
         {
             "name": name,
@@ -200,6 +211,7 @@ def create_experiment(
             "run_number": run_number,
             "tmux_window": tmux_window,
             "session_name": session_name,
+            "queue_command": _build_queue_command(script, env_vars),
         }
     )
     conn.commit()
@@ -421,8 +433,8 @@ def create_experiment_from_mapping(
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, crash_log, started_at, finished_at, kernels_path, session_name)
-        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :crash_log, :started_at, :finished_at, :kernels_path, :session_name)
+        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, crash_log, started_at, finished_at, kernels_path, session_name, queue_command)
+        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :crash_log, :started_at, :finished_at, :kernels_path, :session_name, :queue_command)
         """,
         {
             "id": experiment_id,
@@ -443,6 +455,7 @@ def create_experiment_from_mapping(
             "finished_at": finished_at,
             "kernels_path": kernels_path,
             "session_name": session_name,
+            "queue_command": _build_queue_command(script, env_vars),
         }
     )
     conn.commit()

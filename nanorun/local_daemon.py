@@ -121,6 +121,89 @@ def _append_queue_history(session_name: str, ts: str, queue_items: list):
         f.write(entry + "\n")
 
 
+# Track file offsets for hub-syncer mappings ingestion (keyed by session_name -> {filename: offset})
+_hub_mappings_offsets: Dict[str, Dict[str, int]] = {}
+
+
+def _ingest_mappings_for_session(session_name: str):
+    """Read mappings from hub-synced log directory and create/update experiment DB entries.
+
+    Called by HubSyncer for sessions whose SessionTracker is not alive.
+    """
+    session_logs = PATHS.logs_dir / session_name
+    if not session_logs.exists():
+        return
+
+    offsets = _hub_mappings_offsets.setdefault(session_name, {})
+
+    # Legacy flat file
+    legacy = session_logs / "mappings.jsonl"
+    if legacy.exists():
+        size = legacy.stat().st_size
+        if size > offsets.get("legacy", 0):
+            with open(legacy) as f:
+                f.seek(offsets.get("legacy", 0))
+                new_content = f.read()
+                offsets["legacy"] = f.tell()
+            _ingest_mapping_lines_for_session(session_name, new_content)
+
+    # Segmented files
+    segments_dir = session_logs / "mappings"
+    if segments_dir.exists():
+        for path in sorted(segments_dir.glob("mappings-*.jsonl")):
+            size = path.stat().st_size
+            offset = offsets.get(path.name, 0)
+            if size <= offset:
+                continue
+            with open(path) as f:
+                f.seek(offset)
+                new_content = f.read()
+                offsets[path.name] = f.tell()
+            _ingest_mapping_lines_for_session(session_name, new_content)
+
+
+def _ingest_mapping_lines_for_session(session_name: str, content: str):
+    """Parse mapping lines and create/update experiments in DB."""
+    for line in content.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            mapping = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        exp_id = mapping.get("experiment_id")
+        if not exp_id:
+            continue
+        existing = get_experiment(exp_id)
+        if not existing:
+            script = mapping.get("script", "unknown")
+            name = mapping.get("name") or Path(script).stem
+            track = mapping.get("track") or infer_track_from_path(script)
+            try:
+                create_experiment_from_mapping(
+                    experiment_id=exp_id, name=name, script=script,
+                    status=mapping.get("status", "running"), track=track,
+                    code_hash=mapping.get("code_hash"), remote_run_id=mapping.get("run_id"),
+                    tmux_window=mapping.get("tmux_window"), started_at=mapping.get("started_at"),
+                    finished_at=mapping.get("finished_at"), env_vars=mapping.get("env_vars"),
+                    gpus=mapping.get("gpus", 1), gpu_type=mapping.get("gpu_type", "H100"),
+                    git_commit=mapping.get("git_commit"), parent_hash=mapping.get("parent_hash"),
+                    kernels_path=mapping.get("kernels_path"), session_name=session_name,
+                )
+                log.info(f"[hub] Created experiment {exp_id} ({Path(script).name}) for {session_name}")
+            except Exception as e:
+                log.error(f"[hub] Failed to create experiment {exp_id}: {e}")
+        else:
+            remote_status = mapping.get("status")
+            if remote_status and remote_status != existing.status:
+                if existing.status == "completed" and remote_status == "failed":
+                    pass
+                elif remote_status in ("completed", "failed") or existing.status in ("running", "queued"):
+                    update_experiment_status(exp_id, remote_status)
+            if mapping.get("run_id") and not existing.remote_run_id:
+                update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
+
+
 def _sync_all_logs(session_name: str):
     from . import hub
     session_config = Config.load_session(session_name)
@@ -141,7 +224,7 @@ class HubSyncer:
 
     SYNC_INTERVAL = 10.0
 
-    STALE_THRESHOLD = 30.0  # seconds without successful sync = stale
+    STALE_THRESHOLD = 120.0  # seconds without successful sync = stale
 
     def __init__(self, daemon: "LocalMetricsDaemon"):
         self.daemon = daemon
@@ -220,7 +303,7 @@ class HubSyncer:
             self.last_error = f"Hub connection lost: {e}"
             return False
 
-    SYNC_TIMEOUT = 20.0  # kill sync call if it hangs longer than this
+    SYNC_TIMEOUT = 60.0  # generous for first pass when _finalized_jobs is cold
 
     def _do_sync(self):
         sessions = [s.name for s in Config.list_sessions()]
@@ -278,6 +361,9 @@ class HubSyncer:
         session_logs = PATHS.logs_dir / session_name
         if not session_logs.exists():
             return
+
+        # Ingest mappings first so new experiments get created before we parse their logs
+        _ingest_mappings_for_session(session_name)
 
         conn = get_db()
         rows = conn.execute(

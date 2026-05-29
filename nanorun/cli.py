@@ -584,7 +584,7 @@ def remote_exec(command: tuple, timeout: int, session_name):
         if not result.stderr.endswith("\n"):
             _sys.stderr.write("\n")
 
-    raise SystemExit(result.exit_code)
+    raise SystemExit(result.returncode)
 
 
 # ============================================================================
@@ -986,6 +986,81 @@ def job_remove(index: int, session_name):
         console.print(f"[red]{result.message}[/red]")
         return
     console.print(f"[green]{result.message}[/green]")
+
+
+@job.command("history")
+@click.option("-n", "--limit", "num", type=int, default=20, help="Number of most recent snapshots to show")
+@click.option("-v", "--verbose", is_flag=True, help="Show full job details per snapshot")
+@click.option("--session", "session_name", default=None, help="Filter to a specific session")
+def job_history(num: int, verbose: bool, session_name):
+    """Show queue history (snapshots of queue state over time)."""
+    import json
+    from .config import Config
+
+    history_file = Config.get_config_dir() / "queue_history.jsonl"
+    if not history_file.exists():
+        console.print("[dim]No queue history found[/dim]")
+        return
+
+    entries = []
+    with open(history_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if session_name and entry.get("session") != session_name:
+                continue
+            entries.append(entry)
+
+    if not entries:
+        msg = f"No queue history for session '{session_name}'" if session_name else "No queue history found"
+        console.print(f"[dim]{msg}[/dim]")
+        return
+
+    # Deduplicate consecutive identical queue states per session
+    deduped = []
+    prev_key = None
+    for entry in entries:
+        queue_ids = tuple(item.get("experiment_id", "") for item in entry.get("queue", []))
+        key = (entry.get("session"), queue_ids)
+        if key != prev_key:
+            deduped.append(entry)
+            prev_key = key
+
+    # Take most recent N
+    snapshots = deduped[-num:]
+
+    if session_name:
+        for snap in reversed(snapshots):
+            ts = snap["ts"][:19].replace("T", " ")
+            queue = snap.get("queue", [])
+            print(f"{ts}  [{len(queue)} jobs]")
+            for i, item in enumerate(queue, 1):
+                name = item.get("name") or item.get("script", "?").split("/")[-1].replace(".py", "")
+                env = item.get("env_vars", {})
+                env_str = " ".join(f"{k}={v}" for k, v in env.items()) if env else ""
+                if verbose:
+                    script = item.get("script", "?")
+                    line = f"  {i}. {script}"
+                    if env_str:
+                        line += f"  {env_str}"
+                else:
+                    line = f"  {i}. {name}"
+                    if env_str:
+                        line += f" | {env_str}"
+                print(line)
+            print()
+    else:
+        # Summary view across all sessions
+        for snap in reversed(snapshots):
+            ts = snap["ts"][:19].replace("T", " ")
+            session = snap.get("session", "?")
+            queue = snap.get("queue", [])
+            print(f"{ts}  {session:<20s}  {len(queue)} jobs")
 
 
 # ============================================================================

@@ -520,7 +520,13 @@ class _IrisBackend:
             if wandb_run_id in self._finalized_jobs:
                 continue
 
+            # Skip completed experiments that already have metrics written locally
             local_path = local_logs_dir / f"{wandb_run_id}.txt"
+            if local_status in ("completed", "failed", "cancelled") and local_path.exists():
+                content = local_path.read_text()
+                if "val_loss:" in content or "train_loss:" in content:
+                    self._finalized_jobs.add(wandb_run_id)
+                    continue
 
             # For legacy experiments without _wandb_run_id in env, fall back
             lookup_id = env.get("_wandb_run_id") or wandb_run_id
@@ -569,6 +575,10 @@ class _IrisBackend:
                 loss = h.get("eval/paloma/macro_loss")
                 ts = h.get("_timestamp", 0)
                 if loss is not None:
+                    try:
+                        loss = float(loss)
+                    except (TypeError, ValueError):
+                        continue
                     elapsed_ms = int((ts - first_ts) * 1000) if ts and first_ts else 0
                     lines.append(f"step:{step}/{total_steps} val_loss:{loss:.6f} train_time:{elapsed_ms}ms")
 
@@ -576,6 +586,10 @@ class _IrisBackend:
                 step = h.get("_step", 0)
                 loss = h.get("train/loss")
                 if loss is not None:
+                    try:
+                        loss = float(loss)
+                    except (TypeError, ValueError):
+                        continue
                     lines.append(f"step:{step}/{total_steps} train_loss:{loss:.6f}")
 
             # Preserve header, inject wandb URL if missing, overwrite metrics
