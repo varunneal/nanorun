@@ -25,18 +25,24 @@ from transformers import AutoTokenizer
 
 DOMAINS = {
     "code": {
-        "base_url": "https://olmo-data.org/dolma-v1_7/starcoder/starcoder-{shard:04d}.json.gz",
-        "max_shards": 100,
+        "sources": [
+            {"base_url": "https://olmo-data.org/dolma-v1_7/starcoder/starcoder-{shard:04d}.json.gz", "max_shards": 100},
+        ],
     },
     "math": {
-        "base_url": "https://olmo-data.org/dolma-v1_7/proof_pile_2-algebraic_stack/algebraic-stack-train-{shard:04d}.json.gz",
-        "max_shards": 100,
+        "sources": [
+            {"base_url": "https://olmo-data.org/dolma-v1_7/proof_pile_2-algebraic_stack/algebraic-stack-train-{shard:04d}.json.gz", "max_shards": 100},
+        ],
     },
     "literature": {
-        "base_url": "https://olmo-data.org/dolma-v1_7/books/books-{shard:04d}.json.gz",
-        "max_shards": 3,
+        "sources": [
+            {"base_url": "https://olmo-data.org/dolma-v1_7/books/books-{shard:04d}.json.gz", "max_shards": 3},
+            {"base_url": "https://olmo-data.org/dolma-v1_7/wiki/wiki-{shard:04d}.json.gz", "max_shards": 10},
+        ],
     },
 }
+
+MAX_DOC_TOKENS = 4096
 
 SHARD_SIZE = 100_000_000  # 100M tokens per shard
 MAGIC = 20240520
@@ -67,8 +73,9 @@ def download_gz(url: str, dest: Path) -> bool:
     return True
 
 
-def tokenize_jsonl_gz(path: Path, max_tokens: int, tokenizer, bos_token: int, existing_count: int = 0):
-    """Tokenize a gzipped JSONL file, prepending BOS to each document."""
+def tokenize_jsonl_gz(path: Path, max_tokens: int, tokenizer, bos_token: int, existing_count: int = 0, max_doc_tokens: int = 0):
+    """Tokenize a gzipped JSONL file, prepending BOS to each document.
+    If max_doc_tokens > 0, clip each document to that length."""
     tokens = []
     total = existing_count
     docs = 0
@@ -81,6 +88,8 @@ def tokenize_jsonl_gz(path: Path, max_tokens: int, tokenizer, bos_token: int, ex
             if not text:
                 continue
             doc_tokens = tokenizer.encode(text, add_special_tokens=False)
+            if max_doc_tokens > 0:
+                doc_tokens = doc_tokens[:max_doc_tokens]
             tokens.append(bos_token)
             tokens.extend(doc_tokens)
             total += len(doc_tokens) + 1
@@ -177,30 +186,50 @@ def main():
         token_chunks = []
         collected = 0
 
-        for shard_idx in range(domain_cfg["max_shards"]):
+        for source in domain_cfg["sources"]:
             if collected >= total_needed:
                 break
+            source_name = source["base_url"].split("/")[-1].split("-")[0]
+            print(f"\n  Source: {source_name}")
 
-            url = domain_cfg["base_url"].format(shard=shard_idx)
-            gz_path = cache_dir / f"{domain}_{shard_idx:04d}.json.gz"
+            for shard_idx in range(source["max_shards"]):
+                if collected >= total_needed:
+                    break
 
-            if not download_gz(url, gz_path):
-                break
+                url = source["base_url"].format(shard=shard_idx)
+                gz_path = cache_dir / f"{domain}_{source_name}_{shard_idx:04d}.json.gz"
 
-            print(f"  Tokenizing shard {shard_idx} (have {collected / 1e9:.2f}B / {total_needed / 1e9:.2f}B)...")
-            chunk = tokenize_jsonl_gz(gz_path, total_needed, tokenizer, bos_token, existing_count=collected)
-            if len(chunk) == 0:
-                print(f"  Shard {shard_idx} yielded 0 tokens, stopping")
-                break
-            token_chunks.append(chunk)
-            collected += len(chunk)
-            print(f"  Cumulative: {collected / 1e9:.3f}B tokens")
+                if not download_gz(url, gz_path):
+                    break
+
+                print(f"  Tokenizing shard {shard_idx} (have {collected / 1e9:.2f}B / {total_needed / 1e9:.2f}B)...")
+                chunk = tokenize_jsonl_gz(gz_path, total_needed, tokenizer, bos_token, existing_count=collected, max_doc_tokens=MAX_DOC_TOKENS)
+                if len(chunk) == 0:
+                    print(f"  Shard {shard_idx} yielded 0 tokens, stopping")
+                    break
+                token_chunks.append(chunk)
+                collected += len(chunk)
+                print(f"  Cumulative: {collected / 1e9:.3f}B tokens")
 
         if collected < total_needed:
             print(f"  WARNING: only got {collected / 1e9:.2f}B tokens (wanted {total_needed / 1e9:.2f}B)")
 
         tokens = np.concatenate(token_chunks)
         del token_chunks
+
+        # Shuffle documents before splitting val/train
+        print(f"  Shuffling documents...")
+        bos_positions = np.where(tokens == bos_token)[0]
+        docs = []
+        for i in range(len(bos_positions)):
+            start = bos_positions[i]
+            end = bos_positions[i + 1] if i + 1 < len(bos_positions) else len(tokens)
+            docs.append(tokens[start:end])
+        rng = np.random.default_rng(seed=42)
+        rng.shuffle(docs)
+        tokens = np.concatenate(docs)
+        del docs
+        print(f"  Shuffled {len(bos_positions):,} documents")
 
         stats = compute_stats(tokens, domain, bos_token)
         if stats:

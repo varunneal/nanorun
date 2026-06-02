@@ -227,7 +227,7 @@ class SshConnector(SessionConnector):
 
     def remove(self, index: int) -> ConnectorResult:
         from .queue import remove_from_queue_via_daemon, read_queue
-        queued = read_queue()
+        queued = read_queue(session_name=self.session_name)
         if index < 1 or index > len(queued):
             return ConnectorResult(success=False, message=f"Invalid index: {index} (queue has {len(queued)} items)")
         exp = queued[index - 1]
@@ -241,7 +241,7 @@ class SshConnector(SessionConnector):
 
     def check_unsynced(self, script: str) -> bool:
         from .sync import has_unsynced_changes
-        return has_unsynced_changes(files=[script])
+        return has_unsynced_changes(files=[script], session_name=self.session_name)
 
     def sync_file(self, script: str) -> None:
         from .remote_control import require_session
@@ -389,8 +389,10 @@ class IrisConnector(SessionConnector):
         for j in jobs:
             if not j.get("name"):
                 continue
-            # Only show parent jobs (skip child tasks like :reservation:, subtasks)
             if not j.get("has_children"):
+                continue
+            state = _IRIS_STATE_MAP.get(j.get("state", ""), "")
+            if state not in ("queued", "running"):
                 continue
             submitted = j.get("submitted_at", {})
             epoch_ms = submitted.get("epoch_ms")
@@ -401,7 +403,7 @@ class IrisConnector(SessionConnector):
             items.append(QueueItem(
                 job_id=j.get("name", ""),
                 script="",
-                state=_IRIS_STATE_MAP.get(j.get("state", ""), ""),
+                state=state,
                 created_at=created_at,
                 session_name=self.session_name,
             ))
@@ -491,6 +493,11 @@ class IrisConnector(SessionConnector):
         code_content = abs_script.read_text() if abs_script.exists() else "(script not found)"
         now = datetime.now(timezone.utc).isoformat()
 
+        # Construct wandb URL from session config (first project in comma-separated list)
+        wandb_entity = getattr(self.sc, "wandb_entity", "") or ""
+        wandb_project = (getattr(self.sc, "wandb_project", "") or "").split(",")[0].strip()
+        wandb_url = f"https://wandb.ai/{wandb_entity}/{wandb_project}/runs/{wandb_run_id}" if wandb_entity and wandb_project else ""
+
         header = (
             f"--- CODE START ---\n"
             f"{code_content}\n"
@@ -498,6 +505,7 @@ class IrisConnector(SessionConnector):
             f"--- METADATA ---\n"
             f"iris_job_id: {iris_job_id}\n"
             f"wandb_run_id: {wandb_run_id}\n"
+            f"wandb_url: {wandb_url}\n"
             f"submitted_at: {now}\n"
             f"--- METADATA END ---\n\n"
         )

@@ -9,6 +9,9 @@ Storage layout (same across all backends):
   weights/{session}/{experiment_id}/       - Model checkpoints
 """
 
+import json
+import logging
+import math
 import os
 import warnings
 from pathlib import Path
@@ -18,6 +21,8 @@ from .project_config import load_project_config
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 warnings.filterwarnings("ignore", message="Cannot enable progress bars", module="huggingface_hub")
+
+log = logging.getLogger("local_daemon")
 
 
 def _get_hub_config() -> dict:
@@ -455,16 +460,30 @@ class _IrisBackend:
             return self.iris_user or "iris"
         return None
 
-    def list_jobs(self) -> List[dict]:
+    def list_jobs(self, *, strict: bool = False) -> List[dict]:
         """Call iris job list and return parsed JSON array."""
-        import json as _json
         result = self._run_iris("job", "list", "--prefix", f"/{self.iris_user}/", "--json", timeout=30)
         if result.returncode != 0:
+            msg = f"iris job list failed with exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+            if strict:
+                raise RuntimeError(msg)
+            log.warning("[hub] %s", msg)
             return []
         try:
-            return _json.loads(result.stdout)
-        except (ValueError, _json.JSONDecodeError):
+            jobs = json.loads(result.stdout)
+        except (ValueError, json.JSONDecodeError) as e:
+            msg = f"iris job list returned invalid JSON: {e}"
+            if strict:
+                raise RuntimeError(msg) from e
+            log.warning("[hub] %s", msg)
             return []
+        if not isinstance(jobs, list):
+            msg = f"iris job list returned {type(jobs).__name__}, expected list"
+            if strict:
+                raise RuntimeError(msg)
+            log.warning("[hub] %s", msg)
+            return []
+        return jobs
 
     def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
         """Fetch metrics from W&B and write to local log files in nanorun-parseable format.
@@ -474,146 +493,238 @@ class _IrisBackend:
         """
         local_logs_dir.mkdir(parents=True, exist_ok=True)
 
-        import json as _json2
         from .tracker import get_db
         conn = get_db()
         rows = conn.execute(
-            "SELECT id, remote_run_id, status, env_vars FROM experiments "
-            "WHERE remote_run_id IS NOT NULL AND session_name = ?",
+            """
+            SELECT
+                e.id, e.remote_run_id, e.status, e.env_vars, e.crash_log,
+                EXISTS (
+                    SELECT 1 FROM metrics m
+                    WHERE m.experiment_id = e.id AND m.is_final_step = 1
+                ) AS has_final_metric
+            FROM experiments e
+            WHERE e.remote_run_id IS NOT NULL AND e.session_name = ?
+            """,
             (session,),
         ).fetchall()
         conn.close()
+        rows = [dict(row) for row in rows]
 
         if not rows:
             return
 
         # Build job state mapping from iris job list (keyed by iris job ID)
-        jobs = self.list_jobs()
+        jobs = self.list_jobs(strict=False)
         job_states = {}
         for j in jobs:
             if j.get("has_children"):
                 job_states[j.get("name", "")] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
 
         # Fetch W&B metrics for each tracked experiment
+        projects = [p.strip() for p in (self.wandb_project or "").split(",") if p.strip()]
+        if not self.wandb_entity or not projects:
+            raise RuntimeError("iris W&B sync requires wandb_entity and wandb_project in the session config")
+
+        def _as_int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return default
+
         try:
             import wandb
             api = wandb.Api()
-        except Exception:
+        except Exception as e:
+            log.warning(f"[hub] W&B unavailable for iris sync: {e}")
             return
 
-        projects = [p.strip() for p in (self.wandb_project or "").split(",") if p.strip()]
+        row_errors = 0
 
         for row in rows:
-            wandb_run_id = row["remote_run_id"]
-            local_status = row["status"]
-            env = _json2.loads(row["env_vars"]) if row["env_vars"] else {}
-            iris_job_id = env.get("_iris_job_id")
-
-            # Reconcile status from iris job list
-            if iris_job_id:
-                iris_status = job_states.get(iris_job_id, "")
-                if iris_status and iris_status != local_status:
-                    if not (local_status == "completed" and iris_status == "failed"):
-                        from .tracker import update_experiment_status
-                        update_experiment_status(row["id"], iris_status)
-
-            if wandb_run_id in self._finalized_jobs:
-                continue
-
-            # Skip completed experiments that already have metrics written locally
-            local_path = local_logs_dir / f"{wandb_run_id}.txt"
-            if local_status in ("completed", "failed", "cancelled") and local_path.exists():
-                content = local_path.read_text()
-                if "val_loss:" in content or "train_loss:" in content:
-                    self._finalized_jobs.add(wandb_run_id)
-                    continue
-
-            # For legacy experiments without _wandb_run_id in env, fall back
-            lookup_id = env.get("_wandb_run_id") or wandb_run_id
-            if not lookup_id:
-                continue
-
-            wb_run = None
-            for project in projects:
+            try:
+                wandb_run_id = row["remote_run_id"]
+                local_status = row["status"]
                 try:
-                    found = api.runs(f"{self.wandb_entity}/{project}", filters={"display_name": lookup_id}, per_page=1)
-                    if found:
-                        wb_run = found[0]
-                        break
-                except Exception:
+                    env = json.loads(row["env_vars"]) if row["env_vars"] else {}
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"experiment {row['id']} has invalid env_vars JSON: {e}") from e
+                iris_job_id = env.get("_iris_job_id")
+
+                # Reconcile status from iris job list
+                if iris_job_id:
+                    iris_status = job_states.get(iris_job_id, "")
+                    if iris_status and iris_status != local_status:
+                        if not (local_status == "completed" and iris_status == "failed"):
+                            from .tracker import update_experiment_status
+                            update_experiment_status(row["id"], iris_status)
+
+                    # Fetch crash log for failed jobs that don't have one yet.
+                    effective_status = iris_status or local_status
+                    if effective_status == "failed" and not row["crash_log"]:
+                        from .tracker import update_experiment_metadata
+                        result = self._run_iris("job", "logs", "--no-tail", iris_job_id, timeout=30)
+                        if result.returncode == 0 and result.stdout.strip():
+                            update_experiment_metadata(row["id"], crash_log=result.stdout[-4000:])
+                        elif result.returncode != 0:
+                            log.warning(
+                                "[hub] Failed to fetch iris crash log for experiment %s (%s): %s",
+                                row["id"],
+                                iris_job_id,
+                                result.stderr.strip() or result.stdout.strip(),
+                            )
+
+                if wandb_run_id in self._finalized_jobs:
                     continue
-            if not wb_run:
-                continue
 
-            hist = wb_run.history(
-                keys=["eval/paloma/macro_loss", "_step", "_timestamp"],
-                pandas=False,
-            )
-
-            # Also fetch train loss (sampled — W&B returns ~500 points)
-            train_hist = wb_run.history(
-                keys=["train/loss", "_step"],
-                pandas=False,
-            )
-
-            if not hist and not train_hist:
-                continue
-
-            # Get configured total steps from run config (not summary._step which is just current progress)
-            trainer_cfg = wb_run.config.get("trainer", {})
-            if isinstance(trainer_cfg, dict):
-                total_steps = trainer_cfg.get("trainer", {}).get("num_train_steps") or trainer_cfg.get("num_train_steps")
-            else:
-                total_steps = None
-            if not total_steps:
-                total_steps = wb_run.summary.get("_step") or (hist[-1].get("_step", 0) if hist else 0)
-            first_ts = hist[0].get("_timestamp", 0) if hist else 0
-
-            lines = []
-            for h in (hist or []):
-                step = h.get("_step", 0)
-                loss = h.get("eval/paloma/macro_loss")
-                ts = h.get("_timestamp", 0)
-                if loss is not None:
-                    try:
-                        loss = float(loss)
-                    except (TypeError, ValueError):
-                        continue
-                    elapsed_ms = int((ts - first_ts) * 1000) if ts and first_ts else 0
-                    lines.append(f"step:{step}/{total_steps} val_loss:{loss:.6f} train_time:{elapsed_ms}ms")
-
-            for h in (train_hist or []):
-                step = h.get("_step", 0)
-                loss = h.get("train/loss")
-                if loss is not None:
-                    try:
-                        loss = float(loss)
-                    except (TypeError, ValueError):
-                        continue
-                    lines.append(f"step:{step}/{total_steps} train_loss:{loss:.6f}")
-
-            # Preserve header, inject wandb URL if missing, overwrite metrics
-            header = ""
-            if local_path.exists():
-                content = local_path.read_text()
-                marker = "--- METADATA END ---\n"
-                idx = content.find(marker)
-                if idx >= 0:
-                    header_section = content[: idx + len(marker)]
-                    if "wandb_url:" not in header_section:
-                        wandb_url = f"https://wandb.ai/{self.wandb_entity}/{project}/runs/{wb_run.id}"
-                        header_section = content[:idx] + f"wandb_url: {wandb_url}\n" + content[idx:idx + len(marker)]
-                    header = header_section + "\n"
-
-            local_path.write_text(header + "\n".join(lines) + "\n")
-
-            # Only finalize once W&B is done AND we've seen eval data near the end
-            # (W&B history API has eventual consistency — state can be "finished"
-            # before all history rows are queryable)
-            if wb_run.state in ("finished", "crashed", "failed"):
-                last_eval_step = max((h.get("_step", 0) for h in hist if h.get("eval/paloma/macro_loss") is not None), default=0)
-                if total_steps and last_eval_step >= total_steps - 10:
+                if local_status in ("completed", "failed", "cancelled") and row["has_final_metric"]:
                     self._finalized_jobs.add(wandb_run_id)
+                    continue
+
+                local_path = local_logs_dir / f"{wandb_run_id}.txt"
+
+                # For legacy experiments without _wandb_run_id in env, fall back
+                lookup_id = env.get("_wandb_run_id") or wandb_run_id
+                if not lookup_id:
+                    continue
+
+                wb_run = None
+                project_for_run = None
+                lookup_errors = []
+                for project in projects:
+                    try:
+                        found = api.runs(f"{self.wandb_entity}/{project}", filters={"display_name": lookup_id}, per_page=1)
+                        if found:
+                            wb_run = found[0]
+                            project_for_run = project
+                            break
+                    except Exception as e:
+                        lookup_errors.append(f"{project}: {e}")
+                if not wb_run:
+                    if lookup_errors:
+                        raise RuntimeError(f"W&B lookup failed for {lookup_id}: {'; '.join(lookup_errors)}")
+                    continue
+
+                hist = wb_run.history(
+                    keys=["eval/paloma/macro_loss", "_step", "_runtime"],
+                    pandas=False,
+                )
+
+                # Also fetch train loss + step time (sampled — W&B returns ~500 points)
+                train_hist = wb_run.history(
+                    keys=["train/loss", "throughput/duration", "_step"],
+                    pandas=False,
+                )
+
+                hist = list(hist or [])
+                train_hist = list(train_hist or [])
+                if not hist and not train_hist:
+                    continue
+
+                # Get configured total steps from run config (not summary._step which is just current progress)
+                trainer_cfg = wb_run.config.get("trainer", {}) if wb_run.config else {}
+                if isinstance(trainer_cfg, dict):
+                    nested_trainer_cfg = trainer_cfg.get("trainer", {})
+                    total_steps = (
+                        nested_trainer_cfg.get("num_train_steps") if isinstance(nested_trainer_cfg, dict) else None
+                    ) or trainer_cfg.get("num_train_steps")
+                else:
+                    total_steps = None
+                if not total_steps:
+                    all_steps = [_as_int(h.get("_step", 0)) for h in hist + train_hist if h.get("_step") is not None]
+                    total_steps = wb_run.summary.get("_step") or max(all_steps, default=0)
+                total_steps = _as_int(total_steps)
+                if total_steps <= 0:
+                    continue
+
+                lines = []
+                for h in hist:
+                    step = h.get("_step", 0)
+                    loss = h.get("eval/paloma/macro_loss")
+                    runtime = h.get("_runtime", 0)
+                    if loss is not None:
+                        try:
+                            step = _as_int(step)
+                            loss = float(loss)
+                            runtime = float(runtime or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(loss):
+                            continue
+                        elapsed_ms = int(runtime * 1000)
+                        lines.append(f"step:{step}/{total_steps} val_loss:{loss:.6f} train_time:{elapsed_ms}ms")
+
+                for h in train_hist:
+                    step = h.get("_step", 0)
+                    loss = h.get("train/loss")
+                    duration = h.get("throughput/duration")
+                    if loss is not None:
+                        try:
+                            step = _as_int(step)
+                            loss = float(loss)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(loss):
+                            continue
+                        suffix = ""
+                        if duration is not None:
+                            try:
+                                suffix = f" step_avg:{float(duration) * 1000:.0f}ms"
+                            except (TypeError, ValueError):
+                                pass
+                        lines.append(f"step:{step}/{total_steps} train_loss:{loss:.6f}{suffix}")
+
+                if not lines:
+                    continue
+
+                # Sort by step so val_loss and train_loss are interleaved chronologically
+                lines.sort(key=lambda l: int(l.split("/")[0].split(":")[1]))
+
+                # Preserve header, update wandb URL with correct project/run ID
+                correct_wandb_url = f"https://wandb.ai/{self.wandb_entity}/{project_for_run}/runs/{wb_run.id}"
+                header = ""
+                if local_path.exists():
+                    content = local_path.read_text()
+                    marker = "--- METADATA END ---\n"
+                    idx = content.find(marker)
+                    if idx >= 0:
+                        header_section = content[: idx + len(marker)]
+                        import re as _re
+                        if "wandb_url:" in header_section:
+                            header_section = _re.sub(r"wandb_url: .*\n", f"wandb_url: {correct_wandb_url}\n", header_section)
+                        else:
+                            header_section = content[:idx] + f"wandb_url: {correct_wandb_url}\n" + content[idx:idx + len(marker)]
+                        header = header_section + "\n"
+
+                local_path.write_text(header + "\n".join(lines) + "\n")
+
+                # Only finalize once W&B is done AND we've seen eval data near the end
+                # (W&B history API has eventual consistency — state can be "finished"
+                # before all history rows are queryable)
+                if wb_run.state in ("finished", "crashed", "failed"):
+                    last_eval_step = max((
+                        _as_int(h.get("_step", 0))
+                        for h in hist
+                        if h.get("_step") is not None and h.get("eval/paloma/macro_loss") is not None
+                    ), default=0)
+                    if last_eval_step >= total_steps - 10:
+                        self._finalized_jobs.add(wandb_run_id)
+            except Exception as e:
+                row_errors += 1
+                log.warning(
+                    "[hub] Iris W&B sync failed for experiment %s (%s): %s",
+                    row["id"],
+                    row["remote_run_id"],
+                    e,
+                    exc_info=True,
+                )
+                continue
+
+        if row_errors and row_errors == len(rows):
+            raise RuntimeError(f"Iris W&B sync failed for all {row_errors} experiments in session {session}")
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         pass

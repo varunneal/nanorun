@@ -903,7 +903,7 @@ def job_ps(session_name):
 
 @job.group("queue", invoke_without_command=True)
 @click.option("--flat", is_flag=True, help="Plain text output (no table, no truncation)")
-@session_option
+@click.option("--session", "session_name", default=None, help="Session name (default: all sessions)")
 @click.pass_context
 def job_queue(ctx, flat, session_name):
     """Show or manage the experiment queue."""
@@ -914,42 +914,69 @@ def job_queue(ctx, flat, session_name):
 
     from .session_connector import get_connector
 
-    connector = get_connector(session_name)
-    items = connector.queue()
+    # Determine which sessions to show
+    if session_name:
+        sc = Config.load_session(session_name)
+        if not sc:
+            console.print(f"[red]Session '{session_name}' not found.[/red]")
+            raise SystemExit(1)
+        session_names = [session_name]
+    else:
+        session_names = [sc.name for sc in Config.list_sessions()]
 
-    if not items:
+    all_items = []
+    for sn in session_names:
+        connector = get_connector(sn)
+        items = connector.queue()
+        all_items.append((sn, items))
+
+    total = sum(len(items) for _, items in all_items)
+    if total == 0:
         console.print("[dim]Queue is empty[/dim]")
         return
 
+    multi_session = len(session_names) > 1
+
     if flat:
-        for i, item in enumerate(items, 1):
-            env_str = " ".join(f"{k}={v}" for k, v in item.env_vars.items()) if item.env_vars else ""
-            parts = [f"{i}.", item.job_id or item.script]
-            if item.state:
-                parts.append(f"[{item.state}]")
-            if env_str:
-                parts.append(env_str)
-            print(" ".join(parts))
+        for sn, items in all_items:
+            if not items:
+                continue
+            if multi_session:
+                print(f"[{sn}]")
+            for i, item in enumerate(items, 1):
+                env_str = " ".join(f"{k}={v}" for k, v in item.env_vars.items()) if item.env_vars else ""
+                parts = [f"{i}.", item.job_id or item.script]
+                if item.state:
+                    parts.append(f"[{item.state}]")
+                if env_str:
+                    parts.append(env_str)
+                print(" ".join(parts))
+            if multi_session:
+                print()
         return
 
-    table = Table(title=f"Queue ({len(items)})")
-    table.add_column("#", style="dim", justify="right")
-    table.add_column("Job", style="cyan")
-    table.add_column("Status")
-    table.add_column("Script")
-    table.add_column("Created")
+    for sn, items in all_items:
+        if not items:
+            continue
+        title = f"Queue: {sn} ({len(items)})" if multi_session else f"Queue ({len(items)})"
+        table = Table(title=title)
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Job", style="cyan")
+        table.add_column("Status")
+        table.add_column("Script")
+        table.add_column("Created")
 
-    for i, item in enumerate(items, 1):
-        color = {"running": "green", "queued": "yellow", "completed": "dim", "failed": "red", "cancelled": "dim"}.get(item.state, "white")
-        table.add_row(
-            str(i),
-            item.job_id,
-            f"[{color}]{item.state}[/{color}]",
-            item.script or "",
-            item.created_at[:19] if item.created_at else "",
-        )
+        for i, item in enumerate(items, 1):
+            color = {"running": "green", "queued": "yellow", "completed": "dim", "failed": "red", "cancelled": "dim"}.get(item.state, "white")
+            table.add_row(
+                str(i),
+                item.job_id,
+                f"[{color}]{item.state}[/{color}]",
+                item.script or "",
+                item.created_at[:19] if item.created_at else "",
+            )
 
-    console.print(table)
+        console.print(table)
 
 
 @job.command("clear")

@@ -58,6 +58,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             step INTEGER NOT NULL,
             total_steps INTEGER,
             val_loss REAL,
+            train_loss REAL,
             train_time_ms INTEGER,
             step_avg_ms REAL,
             is_final_step BOOLEAN DEFAULT 0,
@@ -85,9 +86,18 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "session_name": "TEXT",
         "queue_command": "TEXT",
     }
+    metric_migrations = {
+        "train_loss": "REAL",
+    }
     for col, col_type in migrations.items():
         if col not in columns:
             conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {col_type}")
+
+    cursor = conn.execute("PRAGMA table_info(metrics)")
+    metric_columns = [row[1] for row in cursor.fetchall()]
+    for col, col_type in metric_migrations.items():
+        if col not in metric_columns:
+            conn.execute(f"ALTER TABLE metrics ADD COLUMN {col} {col_type}")
     conn.commit()
 
     _schema_initialized = True
@@ -96,8 +106,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 def get_db() -> sqlite3.Connection:
     """Get database connection, initializing schema if needed."""
     db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     _init_schema(conn)
     return conn
 
@@ -230,9 +241,10 @@ def record_metric(
     step_avg_ms: Optional[float] = None,
     is_final_step: bool = False,
 ) -> bool:
-    """Record a metric checkpoint. Returns True if a new row was inserted or updated."""
+    """Record a metric checkpoint. Returns True only if new data was written."""
     conn = get_db()
-    cursor = conn.execute(
+    total_changes_before = conn.execute("SELECT total_changes()").fetchone()[0]
+    conn.execute(
         """
         INSERT INTO metrics
             (experiment_id, step, total_steps, val_loss, train_loss, train_time_ms, step_avg_ms, is_final_step)
@@ -245,6 +257,12 @@ def record_metric(
             train_time_ms = COALESCE(:train_time_ms, train_time_ms),
             step_avg_ms = COALESCE(:step_avg_ms, step_avg_ms),
             is_final_step = MAX(is_final_step, :is_final_step)
+        WHERE total_steps IS NOT COALESCE(:total_steps, total_steps)
+           OR val_loss IS NOT COALESCE(:val_loss, val_loss)
+           OR train_loss IS NOT COALESCE(:train_loss, train_loss)
+           OR train_time_ms IS NOT COALESCE(:train_time_ms, train_time_ms)
+           OR step_avg_ms IS NOT COALESCE(:step_avg_ms, step_avg_ms)
+           OR is_final_step < :is_final_step
         """,
         {
             "experiment_id": experiment_id,
@@ -257,10 +275,11 @@ def record_metric(
             "is_final_step": is_final_step,
         }
     )
-    inserted = cursor.rowcount > 0
+    total_changes_after = conn.execute("SELECT total_changes()").fetchone()[0]
+    changed = total_changes_after > total_changes_before
     conn.commit()
     conn.close()
-    return inserted
+    return changed
 
 
 def update_experiment_status(experiment_id: int, status: str) -> None:
@@ -629,6 +648,8 @@ def parse_metric_line(line: str) -> Optional[Dict]:
 
     if train_loss_match:
         result["train_loss"] = float(train_loss_match.group(1))
+        step_avg_match = _STEP_AVG_FIELD.search(line)
+        result["step_avg_ms"] = float(step_avg_match.group(1)) if step_avg_match else None
         return result
 
     return None

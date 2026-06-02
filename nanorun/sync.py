@@ -228,12 +228,43 @@ def check_python_syntax(files: list[str] | None = None) -> list[str]:
     return errors
 
 
-def has_unsynced_changes(files: list[str] | None = None) -> bool:
-    """Check if there are uncommitted or unpushed changes.
+def _get_session_sync_file(session_name: str) -> Path:
+    """Path to the file that stores the last-synced commit for a session."""
+    from .config import Config
+    return Config.get_sessions_dir() / session_name / "last_synced_commit"
+
+
+def get_last_synced_commit(session_name: str) -> str | None:
+    """Get the commit hash that was last synced to this session."""
+    f = _get_session_sync_file(session_name)
+    if f.exists():
+        return f.read_text().strip() or None
+    return None
+
+
+def record_synced_commit(session_name: str) -> None:
+    """Record the current HEAD as the last-synced commit for this session."""
+    local_repo = get_local_repo_path()
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=local_repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        f = _get_session_sync_file(session_name)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(result.stdout.strip())
+
+
+def has_unsynced_changes(files: list[str] | None = None, session_name: str | None = None) -> bool:
+    """Check if there are uncommitted or unpushed changes relative to a session.
 
     Args:
         files: If provided, only check these specific files (paths relative to repo root).
             If None, checks for any uncommitted/unpushed changes.
+        session_name: If provided, also checks whether the file has changed since
+            the last sync to this specific session.
 
     Returns:
         True if there are local changes not synced to remote
@@ -260,6 +291,19 @@ def has_unsynced_changes(files: list[str] | None = None) -> bool:
         )
         if result.stdout.strip():
             return True
+
+        # Check if files changed since last sync to this session
+        if session_name:
+            last_commit = get_last_synced_commit(session_name)
+            if last_commit:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"{last_commit}..HEAD", "--"] + files,
+                    cwd=local_repo,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.stdout.strip():
+                    return True
 
         return False
 
@@ -380,6 +424,7 @@ def push_code(remote: RemoteSession, message: str = None, skip_syntax_check: boo
             for line in remote_result.stdout.split("\n"):
                 if "|" in line or "create mode" in line or "delete mode" in line:
                     console.print(f"  [dim]{line.strip()}[/dim]")
+        record_synced_commit(remote.config.name)
     else:
         console.print(f"[red]Remote pull failed: {remote_result.stderr}[/red]")
 

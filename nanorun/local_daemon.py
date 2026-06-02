@@ -224,19 +224,15 @@ class HubSyncer:
 
     SYNC_INTERVAL = 10.0
 
-    STALE_THRESHOLD = 120.0  # seconds without successful sync = stale
-
     def __init__(self, daemon: "LocalMetricsDaemon"):
         self.daemon = daemon
         self.running = True
-        self.status: str = "disconnected"  # disconnected, connected, error, stale
+        self.status: str = "disconnected"  # disconnected, connected
         self.last_error: Optional[str] = None
         self.last_sync_at: Optional[str] = None
         self._thread: Optional[threading.Thread] = None
         self._was_connected: bool = False
-        self._consecutive_failures: int = 0
         self._last_sync: float = 0
-        self._last_successful_sync: float = 0
 
     def start(self):
         self._thread = threading.Thread(
@@ -264,81 +260,63 @@ class HubSyncer:
     def _loop(self):
         log.info("[hub] Starting hub syncer")
         self.event("Hub syncer starting")
-        from . import hub
-        # Try global hub ping (HF/S3) but don't gate on it — iris sessions
-        # use their own backend and don't need the global hub to be reachable
-        try:
-            hub.ping()
-            self.event("Hub connected")
-        except Exception:
-            self.event("Global hub unreachable (iris sessions will still sync)")
         self.status = "connected"
         self._was_connected = True
-        self._last_successful_sync = time.monotonic()
         while self.running:
             now = time.monotonic()
             if now - self._last_sync >= self.SYNC_INTERVAL:
                 self._do_sync()
                 self._last_sync = now
-            # If no successful sync in 30s, disconnect and wait for user reconnect
-            if now - self._last_successful_sync > self.STALE_THRESHOLD:
-                self.status = "error"
-                self.last_error = "Hub sync stale (no successful sync in 30s)"
-                self.event("Hub disconnected — sync stale")
-                return
             time.sleep(1)
         log.info("[hub] Syncer stopped")
 
-    def _check_connection(self) -> bool:
-        """Verify HTTPS connectivity to the hub."""
-        from . import hub
-        try:
-            if not hub.ping():
-                self.last_error = "Hub connection lost (will retry on reconnect)"
-                return False
-            self.last_error = None
-            self._consecutive_failures = 0
-            return True
-        except Exception as e:
-            self.last_error = f"Hub connection lost: {e}"
-            return False
+    SYNC_TIMEOUT = 60.0
 
-    SYNC_TIMEOUT = 60.0  # generous for first pass when _finalized_jobs is cold
+    def _log_session_error(self, session_name: str, message: str, *, exc_info: bool = False):
+        previous = self._session_errors_logged.get(session_name)
+        if previous != message:
+            log.warning(message, exc_info=exc_info)
+            self._session_errors_logged[session_name] = message
+        self.last_error = message
 
     def _do_sync(self):
+        if not hasattr(self, '_session_errors_logged'):
+            self._session_errors_logged = {}
         sessions = [s.name for s in Config.list_sessions()]
-        any_success = False
         for session_name in sessions:
+            had_error = False
             try:
                 self._sync_with_timeout(session_name)
-                self._parse_metrics_for_session(session_name)
-                any_success = True
             except TimeoutError:
-                if not hasattr(self, '_session_failures'):
-                    self._session_failures = {}
-                self._session_failures[session_name] = self._session_failures.get(session_name, 0) + 1
-                if self._session_failures[session_name] == 1:
-                    log.warning(f"[hub] Sync timed out for {session_name}")
+                self._log_session_error(
+                    session_name,
+                    f"[hub] Sync timed out for {session_name}",
+                    exc_info=True,
+                )
                 continue
             except Exception as e:
-                err_str = str(e)
-                if "rate limit" in err_str.lower() or "429" in err_str:
-                    backoff = min(60.0, 300.0)
-                    log.warning(f"[hub] Rate limited on {session_name}, backing off {backoff:.0f}s")
-                    self._last_sync = time.monotonic() + backoff - self.SYNC_INTERVAL
-                    return
-                if not hasattr(self, '_session_failures'):
-                    self._session_failures = {}
-                self._session_failures[session_name] = self._session_failures.get(session_name, 0) + 1
-                if self._session_failures[session_name] == 1:
-                    log.warning(f"[hub] Sync failed for {session_name}: {e}")
+                had_error = True
+                self._log_session_error(
+                    session_name,
+                    f"[hub] Sync failed for {session_name}: {e}",
+                    exc_info=True,
+                )
+
+            try:
+                self._parse_metrics_for_session(session_name)
+            except Exception as e:
+                had_error = True
+                self._log_session_error(
+                    session_name,
+                    f"[hub] Metric parse failed for {session_name}: {e}",
+                    exc_info=True,
+                )
                 continue
-        if any_success:
-            self._consecutive_failures = 0
-            self._last_successful_sync = time.monotonic()
-            self.last_sync_at = datetime.now().strftime("%H:%M:%S")
-        else:
-            self._consecutive_failures += 1
+
+            if not had_error:
+                self._session_errors_logged.pop(session_name, None)
+                self.last_error = None
+        self.last_sync_at = datetime.now().strftime("%H:%M:%S")
 
     def _parse_metrics_for_session(self, session_name: str):
         """Parse metrics from local log files. Dispatches to correct parser by session type."""
@@ -420,7 +398,14 @@ class HubSyncer:
 
         for row in rows:
             exp_id, local_status = row["id"], row["status"]
-            env = _json.loads(row["env_vars"]) if row["env_vars"] else {}
+            try:
+                env = _json.loads(row["env_vars"]) if row["env_vars"] else {}
+            except _json.JSONDecodeError as e:
+                log.warning(
+                    f"[hub] Invalid env_vars JSON for iris experiment {exp_id}: {e}",
+                    exc_info=True,
+                )
+                continue
             iris_job_id = env.get("_iris_job_id")
             if not iris_job_id:
                 continue
@@ -438,13 +423,17 @@ class HubSyncer:
             if not log_path.exists():
                 continue
 
-            content = log_path.read_text()
+            with open(log_path) as f:
+                new_content = f.read()
+
             new_count = 0
-            for line in content.split("\n"):
+            found_final = False
+            for line in new_content.split("\n"):
                 m = parse_metric_line(line)
                 if not m:
                     continue
                 is_final = m["total_steps"] is not None and m["step"] >= m["total_steps"]
+                found_final = found_final or is_final
                 inserted = record_metric(
                     experiment_id=exp_id, step=m["step"],
                     total_steps=m["total_steps"], val_loss=m["val_loss"],
@@ -454,9 +443,10 @@ class HubSyncer:
                 )
                 if inserted:
                     new_count += 1
-                if is_final:
-                    update_experiment_status(exp_id, "completed")
-                    self.event(f"[{session_name}] Experiment {exp_id} completed")
+
+            if found_final and row["status"] != "completed":
+                update_experiment_status(exp_id, "completed")
+                self.event(f"[{session_name}] Experiment {exp_id} completed")
 
             if new_count:
                 self.event(f"[{session_name}] Synced {new_count} metric steps for experiment {exp_id}")

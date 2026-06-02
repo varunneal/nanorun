@@ -83,23 +83,9 @@ def get_queue_state_path() -> Path:
     return config_dir / "queue_state.txt"
 
 
-def read_queue(session_name: Optional[str] = None) -> List[QueuedExperiment]:
-    """Read queued experiments from local cache (synced from remote daemon).
-
-    If session_name is given, reads only that session's queue.
-    If None, combines queues from all sessions.
-    """
-    from .local_daemon import safe_json_load, get_queue_cache_file
-
-    if session_name is not None:
-        return _read_session_queue(session_name)
-
-    # Combine all sessions
-    sessions = Config.list_sessions()
-    experiments = []
-    for sc in sessions:
-        experiments.extend(_read_session_queue(sc.name))
-    return experiments
+def read_queue(session_name: str) -> List[QueuedExperiment]:
+    """Read queued experiments from local cache (synced from remote daemon)."""
+    return _read_session_queue(session_name)
 
 
 def _read_session_queue(session_name: str) -> List[QueuedExperiment]:
