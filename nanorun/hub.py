@@ -515,11 +515,15 @@ class _IrisBackend:
             return
 
         # Build job state mapping from iris job list (keyed by iris job ID)
+        # Include both parent jobs (has_children) and direct-run jobs (no children)
+        # Exclude child tasks (name ends with :reservation:, :subtask, etc.)
         jobs = self.list_jobs(strict=False)
         job_states = {}
         for j in jobs:
-            if j.get("has_children"):
-                job_states[j.get("name", "")] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
+            name = j.get("name", "")
+            if not name or ":" in name.split("/")[-1]:
+                continue
+            job_states[name] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
 
         # Fetch W&B metrics for each tracked experiment
         projects = [p.strip() for p in (self.wandb_project or "").split(",") if p.strip()]

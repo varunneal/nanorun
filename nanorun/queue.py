@@ -88,6 +88,23 @@ def read_queue(session_name: str) -> List[QueuedExperiment]:
     return _read_session_queue(session_name)
 
 
+def read_queue_meta(session_name: str) -> Dict[str, object]:
+    """Freshness metadata for the cached queue.
+
+    Returns {"connected": bool, "synced_at": str|None}. `connected` reflects
+    whether the local daemon's session tracker had a live link at last write;
+    when False the queue is the last-known snapshot and may be stale. Defaults
+    to connected=True for legacy caches missing the field.
+    """
+    from .local_daemon import safe_json_load, get_queue_cache_file
+
+    data = safe_json_load(get_queue_cache_file(session_name), default={}) or {}
+    return {
+        "connected": data.get("connected", True),
+        "synced_at": data.get("synced_at"),
+    }
+
+
 def _read_session_queue(session_name: str) -> List[QueuedExperiment]:
     from .local_daemon import safe_json_load, get_queue_cache_file
 

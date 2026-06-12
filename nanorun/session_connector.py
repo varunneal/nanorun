@@ -56,6 +56,23 @@ class ConnectorResult:
     unsupported: bool = False
 
 
+@dataclass
+class QueueMeta:
+    """Freshness/connection metadata for a queue() result.
+
+    `live` is True when queue() returns data fetched on the spot (e.g. Iris),
+    so staleness can't apply. For cache-backed connectors, `connected` is False
+    when the snapshot is stale and `synced_at` is when it was last fresh.
+    """
+    connected: bool = True
+    synced_at: Optional[str] = None
+    live: bool = False
+
+    @property
+    def stale(self) -> bool:
+        return not self.live and not self.connected
+
+
 # =============================================================================
 # ABC
 # =============================================================================
@@ -74,6 +91,10 @@ class SessionConnector(ABC):
 
     @abstractmethod
     def queue(self) -> List[QueueItem]: ...
+
+    def queue_meta(self) -> QueueMeta:
+        """Freshness of the last queue() result. Default: live (always fresh)."""
+        return QueueMeta(live=True)
 
     @abstractmethod
     def cancel(self, job_id: Optional[str] = None) -> ConnectorResult: ...
@@ -184,6 +205,11 @@ class SshConnector(SessionConnector):
             )
             for e in queued
         ]
+
+    def queue_meta(self) -> QueueMeta:
+        from .queue import read_queue_meta
+        m = read_queue_meta(self.session_name)
+        return QueueMeta(connected=bool(m["connected"]), synced_at=m["synced_at"], live=False)
 
     def cancel(self, job_id: Optional[str] = None) -> ConnectorResult:
         from .runner import cancel_experiment
@@ -347,6 +373,10 @@ class IrisConnector(SessionConnector):
         cmd_args = ["job", "run", "--no-wait"]
         if reserve:
             cmd_args.extend(["--reserve", reserve])
+        region = kwargs.get("region")
+        if region:
+            for r in region:
+                cmd_args.extend(["--region", r])
         for k, v in cli_env.items():
             cmd_args.extend(["-e", k, v])
         cmd_args.append("--")
@@ -387,9 +417,8 @@ class IrisConnector(SessionConnector):
         jobs = self._list_jobs_raw()
         items = []
         for j in jobs:
-            if not j.get("name"):
-                continue
-            if not j.get("has_children"):
+            name = j.get("name", "")
+            if not name or ":" in name.split("/")[-1]:
                 continue
             state = _IRIS_STATE_MAP.get(j.get("state", ""), "")
             if state not in ("queued", "running"):

@@ -78,7 +78,8 @@ const State = createStateManager({
     // Global preferences (persist always)
     theme: { default: 'dark', persist: true },
     sidebarCollapsed: { default: false, persist: true },
-    bucket: { default: [], persist: true },
+    buckets: { default: [[], [], [], [], [], [], [], [], []], persist: true },
+    bucketNames: { default: ['', '', '', '', '', '', '', '', ''], persist: true },
 
     // Navigation state (persist so reloads restore position)
     view: { default: 'experiments', persist: true },
@@ -104,3 +105,17 @@ const State = createStateManager({
     selectedQueuedScript: { default: null },
     deleteInProgress: { default: false },
 });
+
+// Migrate old single-bucket format to multi-bucket
+(function migrateBucket() {
+    try {
+        const raw = JSON.parse(localStorage.getItem('nanorun_state') || '{}');
+        if (Array.isArray(raw.bucket) && raw.bucket.length > 0 && !raw.buckets) {
+            const buckets = [raw.bucket, [], [], [], [], [], [], [], []];
+            raw.buckets = buckets;
+            delete raw.bucket;
+            localStorage.setItem('nanorun_state', JSON.stringify(raw));
+            State.set('buckets', buckets);
+        }
+    } catch {}
+})();

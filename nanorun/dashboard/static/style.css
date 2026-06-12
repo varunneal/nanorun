@@ -494,8 +494,33 @@ main {
     border-style: solid;
 }
 
+.bucket-num {
+    font-size: var(--font-xs);
+    color: var(--text-secondary);
+    background: var(--bg-input);
+    border-radius: 3px;
+    padding: 0 5px;
+    margin-right: 6px;
+    min-width: 16px;
+    text-align: center;
+    line-height: 1.6;
+}
+
 .bucket-label {
     color: var(--warning);
+    cursor: default;
+}
+
+.bucket-rename-input {
+    background: var(--bg-card);
+    border: 1px solid var(--warning);
+    color: var(--warning);
+    font-size: var(--font-sm);
+    font-family: inherit;
+    padding: 1px 4px;
+    border-radius: 3px;
+    width: 100px;
+    outline: none;
 }
 
 .bucket-count {

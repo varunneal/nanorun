@@ -38,6 +38,7 @@ def _resolve_session(ctx, param, value):
         sc = Config.load_session(value)
         if not sc:
             console.print(f"[red]Session '{value}' not found.[/red]")
+            console.print("[dim]Run 'nanorun session list' to see available sessions.[/dim]")
             raise SystemExit(1)
         return value
     name = Config.get_active_session_name()
@@ -607,8 +608,9 @@ def job():
 @click.option("--first", "-f", is_flag=True, help="Add to front of queue instead of end")
 @click.option("--reserve", "-r", default=None, help="TPU reservation name (iris only)")
 @click.option("--module", "-m", "module", default=None, help="Python module to run (iris only, e.g. 'marin.train')")
+@click.option("--region", default=None, multiple=True, help="GCP region (iris only, can repeat)")
 @session_option
-def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, first: bool, reserve: str, module: str, session_name):
+def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, first: bool, reserve: str, module: str, region: tuple, session_name):
     """Add an experiment to the queue.
 
     Track is auto-inferred from script path (if directory has .track.json).
@@ -659,6 +661,7 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
     result = connector.submit(
         script_rel, env_dict, exp_name, track, gpus=gpus, gpu_type=gpu_type,
         prefix=prefix, first=first, reserve=reserve, module=module,
+        region=list(region) if region else None,
     )
     if result.error:
         console.print(f"[red]{result.error}[/red]")
@@ -683,8 +686,9 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
 @click.option("--prefix", "-p", default=None, help="Command prefix (e.g., 'nsys profile --trace=cuda,nvtx -o trace')")
 @click.option("--reserve", "-r", default=None, help="TPU reservation name (iris only)")
 @click.option("--module", "-m", "module", default=None, help="Python module to run (iris only)")
+@click.option("--region", default=None, multiple=True, help="GCP region (iris only, can repeat)")
 @session_option
-def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, reserve: str, module: str, session_name):
+def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, reserve: str, module: str, region: tuple, session_name):
     """Add a parameter sweep to the queue.
 
     Track is auto-inferred from script path (if directory has .track.json).
@@ -730,6 +734,7 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
     results = connector.sweep(
         script_rel, configs, exp_name, track, gpus=gpus, gpu_type=gpu_type,
         prefix=prefix, reserve=reserve, module=module,
+        region=list(region) if region else None,
     )
 
     added = sum(1 for r in results if not r.error)
@@ -777,16 +782,41 @@ def job_resume(session_name):
 
 @job.command("status")
 @click.option("--daemon", "-d", is_flag=True, help="Also show daemon status from remote")
-@session_option
+@click.option("--session", "session_name", default=None, help="Session name (default: all active sessions)")
 def job_status(daemon: bool, session_name):
     """Show current job and queue status."""
     from .session_connector import get_connector
+    from .local_daemon import SessionState
 
-    connector = get_connector(session_name)
-    active = connector.status()
+    if session_name:
+        sc = Config.load_session(session_name)
+        if not sc:
+            console.print(f"[red]Session '{session_name}' not found.[/red]")
+            raise SystemExit(1)
+        session_names = [session_name]
+    else:
+        session_names = []
+        for sc in Config.list_sessions():
+            if sc.session_type == "iris":
+                session_names.append(sc.name)
+            else:
+                state = SessionState.load(sc.name)
+                if state.status == "connected":
+                    session_names.append(sc.name)
 
-    if active:
-        console.print(f"[bold cyan]Active Jobs[/bold cyan] [dim]({len(active)})[/dim]")
+    if not session_names:
+        console.print("[dim]No active sessions[/dim]")
+        return
+
+    for sn in session_names:
+        connector = get_connector(sn)
+        active = connector.status()
+
+        if not active:
+            console.print(f"[bold cyan]{sn}[/bold cyan] [dim](idle)[/dim]")
+            continue
+
+        console.print(f"[bold cyan]{sn}[/bold cyan] [dim]({len(active)} running)[/dim]")
         table = Table()
         table.add_column("Job ID", style="cyan")
         table.add_column("Script")
@@ -797,8 +827,6 @@ def job_status(daemon: bool, session_name):
             created = j.created_at[:19] if j.created_at else ""
             table.add_row(j.job_id, j.script or "", f"[{color}]{j.state}[/{color}]", created)
         console.print(table)
-    else:
-        console.print("[dim]No active jobs[/dim]")
 
     # Currently running experiment (local view)
 
@@ -913,6 +941,7 @@ def job_queue(ctx, flat, session_name):
         return
 
     from .session_connector import get_connector
+    from .local_daemon import SessionState
 
     # Determine which sessions to show
     if session_name:
@@ -922,27 +951,58 @@ def job_queue(ctx, flat, session_name):
             raise SystemExit(1)
         session_names = [session_name]
     else:
-        session_names = [sc.name for sc in Config.list_sessions()]
+        # Show only active (connected or iris) sessions
+        session_names = []
+        for sc in Config.list_sessions():
+            if sc.session_type == "iris":
+                session_names.append(sc.name)
+            else:
+                state = SessionState.load(sc.name)
+                if state.status == "connected":
+                    session_names.append(sc.name)
+
+    if not session_names:
+        console.print("[dim]No active sessions[/dim]")
+        return
 
     all_items = []
     for sn in session_names:
         connector = get_connector(sn)
         items = connector.queue()
-        all_items.append((sn, items))
-
-    total = sum(len(items) for _, items in all_items)
-    if total == 0:
-        console.print("[dim]Queue is empty[/dim]")
-        return
+        meta = connector.queue_meta()
+        all_items.append((sn, items, meta))
 
     multi_session = len(session_names) > 1
 
+    def _stale_banner(meta):
+        if not getattr(meta, "stale", False):
+            return None
+        when = ""
+        if meta.synced_at:
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(meta.synced_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                when = f" as of {dt.astimezone().strftime('%H:%M')}"
+            except Exception:
+                when = f" as of {meta.synced_at}"
+        return f"disconnected — showing cached queue{when} (may be stale)"
+
     if flat:
-        for sn, items in all_items:
-            if not items:
-                continue
+        for sn, items, meta in all_items:
             if multi_session:
                 print(f"[{sn}]")
+            banner = _stale_banner(meta)
+            if banner:
+                print(f"  ⚠ {banner}" if multi_session else f"⚠ {banner}")
+            if not items:
+                if multi_session:
+                    print("  (empty)")
+                    print()
+                else:
+                    print("(empty)")
+                continue
             for i, item in enumerate(items, 1):
                 env_str = " ".join(f"{k}={v}" for k, v in item.env_vars.items()) if item.env_vars else ""
                 parts = [f"{i}.", item.job_id or item.script]
@@ -955,9 +1015,10 @@ def job_queue(ctx, flat, session_name):
                 print()
         return
 
-    for sn, items in all_items:
-        if not items:
-            continue
+    for sn, items, meta in all_items:
+        banner = _stale_banner(meta)
+        if banner:
+            console.print(f"[yellow]⚠ {banner}[/yellow]")
         title = f"Queue: {sn} ({len(items)})" if multi_session else f"Queue ({len(items)})"
         table = Table(title=title)
         table.add_column("#", style="dim", justify="right")
@@ -966,15 +1027,18 @@ def job_queue(ctx, flat, session_name):
         table.add_column("Script")
         table.add_column("Created")
 
-        for i, item in enumerate(items, 1):
-            color = {"running": "green", "queued": "yellow", "completed": "dim", "failed": "red", "cancelled": "dim"}.get(item.state, "white")
-            table.add_row(
-                str(i),
-                item.job_id,
-                f"[{color}]{item.state}[/{color}]",
-                item.script or "",
-                item.created_at[:19] if item.created_at else "",
-            )
+        if not items:
+            table.add_row("", "", "[dim]empty[/dim]", "", "")
+        else:
+            for i, item in enumerate(items, 1):
+                color = {"running": "green", "queued": "yellow", "completed": "dim", "failed": "red", "cancelled": "dim"}.get(item.state, "white")
+                table.add_row(
+                    str(i),
+                    item.job_id,
+                    f"[{color}]{item.state}[/{color}]",
+                    item.script or "",
+                    item.created_at[:19] if item.created_at else "",
+                )
 
         console.print(table)
 

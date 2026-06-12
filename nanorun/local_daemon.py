@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from .config import Config, SessionConfig, infer_track_from_path
-from .rpc_client import RpcClient, RpcError
+from .rpc_client import RpcClient, RpcError, kill_tunnel
 from .rpc_types import Event, EventMessage, Method
 from .tracker import (
     get_db, parse_metric_line, record_metric,
@@ -384,8 +384,10 @@ class HubSyncer:
         jobs = backend.list_jobs()
         job_states = {}
         for j in jobs:
-            if j.get("has_children") and j.get("name"):
-                job_states[j["name"]] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
+            name = j.get("name", "")
+            if not name or ":" in name.split("/")[-1]:
+                continue
+            job_states[name] = _IRIS_STATE_MAP.get(j.get("state", ""), "")
 
         import json as _json
         conn = get_db()
@@ -539,7 +541,18 @@ class SessionState:
 
 
 class SessionTracker:
-    """Manages connection and tracking for one remote session."""
+    """Manages connection and tracking for one remote session.
+
+    The connection is treated as disposable: a dropped SSH tunnel or WebSocket
+    is reconnected automatically with capped exponential backoff. The local
+    daemon passively mirrors remote state, so losing the connection should never
+    require manual intervention.
+    """
+
+    RECONNECT_BASE_DELAY = 2.0    # first retry after a drop
+    RECONNECT_MAX_DELAY = 30.0    # backoff ceiling
+    SLEEP_GAP_THRESHOLD = 15.0    # wall-clock jump that implies host sleep/suspend
+    DEAD_SESSION_GRACE = 120.0    # unreachable longer than this => machine is gone
 
     def __init__(self, config: SessionConfig, daemon: "LocalMetricsDaemon"):
         self.config = config
@@ -553,6 +566,8 @@ class SessionTracker:
         self._thread: Optional[threading.Thread] = None
         self._last_queue_key: Optional[str] = None
         self._was_connected: bool = False
+        self._outage_started_mono: Optional[float] = None  # monotonic anchor: counts awake retry time only
+        self._dead_finalized: bool = False                 # finalized in-flight work for this outage
         self._mappings_offset: int = 0  # legacy mappings.jsonl offset
         self._segment_offsets: dict[str, int] = {}  # per-segment byte offset
 
@@ -582,33 +597,86 @@ class SessionTracker:
     def _session_loop(self):
         log.info(f"[{self.session_name}] Tracker starting")
         self.event("Session tracker starting")
-        try:
-            self._connect()
-            if not self.rpc:
-                self.state.status = "disconnected"
-                self.state.last_error = "Connection failed"
+        backoff = self.RECONNECT_BASE_DELAY
+        while self.running:
+            try:
+                self._connect()
+                if not self.rpc:
+                    raise ConnectionError("Connection failed")
+                self.state.status = "connected"
+                self._was_connected = True
+                self.state.last_error = None
                 self.state.save(self.session_name)
-                self.event("Connection failed — session marked disconnected")
-                return
-            self.state.status = "connected"
-            self._was_connected = True
-            self.state.save(self.session_name)
-            self.event("Connected to remote daemon")
-            self._initial_sync()
-            self._event_loop()
-        except Exception as e:
-            log.exception(f"[{self.session_name}] Session loop error: {e}")
-            self.state.last_error = str(e)
-        finally:
-            if self.rpc:
-                try: self.rpc.close()
-                except Exception: pass
-                self.rpc = None
-            self.state.status = "disconnected"
-            self.state.save(self.session_name)
-            if self.running:
-                self.event("Disconnected — run 'nanorun session start' to reconnect")
-            log.info(f"[{self.session_name}] Tracker stopped")
+                self.event("Connected to remote daemon")
+                self._set_cache_connected(True)
+                self._initial_sync()
+                # Healthy link: clear outage tracking and reset backoff.
+                self._outage_started_mono = None
+                self._dead_finalized = False
+                backoff = self.RECONNECT_BASE_DELAY
+                self._event_loop()  # returns on disconnect, sleep, or shutdown
+            except Exception as e:
+                log.warning(f"[{self.session_name}] Session loop error: {e}")
+                self.state.last_error = str(e)
+            finally:
+                if self.rpc:
+                    try: self.rpc.close()
+                    except Exception: pass
+                    self.rpc = None
+                self.state.status = "disconnected"
+                self.state.save(self.session_name)
+
+            if not self.running:
+                break
+
+            # Anchor the outage on a MONOTONIC clock. time.monotonic() doesn't tick
+            # while macOS is asleep, so grace counts only *awake* time spent actually
+            # retrying — the laptop sleeping never counts against the machine. (Using
+            # wall time here would declare a healthy machine dead after an overnight
+            # sleep, since wall_elapsed would blow past the grace window instantly.)
+            if self._outage_started_mono is None:
+                self._outage_started_mono = time.monotonic()
+
+            # Mark the cached queue stale (kept, not cleared) and force a fresh
+            # tunnel — a half-dead tunnel keeps a live local listener, so reusing
+            # it would loop forever. Then back off and reconnect.
+            self._on_disconnect()
+            kill_tunnel(self.session_name)
+
+            # Unreachable past the grace window (of awake retry time) => treat the
+            # machine as gone and finalize in-flight work. Self-healing: if the
+            # machine comes back, reconnect re-attaches via _reconcile_tracking and
+            # metrics sync restores the true status (failed -> running/completed).
+            outage = time.monotonic() - self._outage_started_mono
+            if outage > self.DEAD_SESSION_GRACE and not self._dead_finalized:
+                self._finalize_dead_session(outage)
+                self._dead_finalized = True
+
+            self.event(f"Disconnected — reconnecting in {backoff:.0f}s")
+            suspended = self._sleep_interruptible(backoff)
+            if suspended > self.SLEEP_GAP_THRESHOLD:
+                # The host suspended during backoff. Prior reachability evidence is
+                # now stale (the machine may have changed state over a long sleep),
+                # so restart the grace window — re-verify before declaring it dead.
+                self.event(f"Host suspended ~{suspended:.0f}s during backoff — restarting grace window")
+                self._outage_started_mono = time.monotonic()
+                self._dead_finalized = False
+                backoff = self.RECONNECT_BASE_DELAY
+            else:
+                backoff = min(backoff * 2, self.RECONNECT_MAX_DELAY)
+        log.info(f"[{self.session_name}] Tracker stopped")
+
+    def _sleep_interruptible(self, seconds: float) -> float:
+        """Sleep up to *seconds* (monotonic), waking early if the tracker is
+        stopping. Returns the wall time apparently spent suspended during the
+        sleep — i.e. wall_elapsed minus monotonic_elapsed, which on macOS is the
+        duration the host was asleep."""
+        start_mono = time.monotonic()
+        start_wall = time.time()
+        deadline = start_mono + seconds
+        while self.running and time.monotonic() < deadline:
+            time.sleep(min(0.2, deadline - time.monotonic()))
+        return max(0.0, (time.time() - start_wall) - (time.monotonic() - start_mono))
 
     def _connect(self):
         self.state.status = "connecting"
@@ -627,8 +695,24 @@ class SessionTracker:
 
     def _event_loop(self):
         SYNC_INTERVAL = 3.0
-        next_sync = time.monotonic() + SYNC_INTERVAL
+        last_mono = time.monotonic()
+        last_wall = time.time()
+        next_sync = last_mono + SYNC_INTERVAL
         while self.running and self.rpc:
+            # Detect host sleep/suspend cheaply (macOS): time.monotonic() does not
+            # advance while the machine is asleep, but the wall clock does. So when
+            # the loop unblocks, (wall_delta - mono_delta) ~= the time spent asleep.
+            # A busy-but-awake iteration advances both clocks together (divergence
+            # ~0), so this fires *only* on suspend — not on a merely slow loop. On
+            # wake the socket is almost certainly dead, so reconnect now instead of
+            # waiting ~45s for SSH keepalive (ServerAliveInterval=15 x 3) to notice.
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            slept = (now_wall - last_wall) - (now_mono - last_mono)
+            if slept > self.SLEEP_GAP_THRESHOLD:
+                self.event(f"Detected ~{slept:.0f}s host sleep/suspend — reconnecting")
+                return
+            last_mono, last_wall = now_mono, now_wall
             try:
                 ev = self.rpc.recv_event(timeout=1)
                 if ev:
@@ -639,12 +723,11 @@ class SessionTracker:
                     self._sync_logs_and_metrics()
             except ConnectionError:
                 log.warning(f"[{self.session_name}] WebSocket disconnected")
-                self._handle_disconnect()
-                break
+                return
             except Exception as e:
                 log.exception(f"[{self.session_name}] Event loop error: {e}")
                 if not self.running:
-                    break
+                    return
 
     # --- events ---
 
@@ -779,46 +862,72 @@ class SessionTracker:
             self.event(f"Initial sync failed: {e}")
             log.exception(f"[{self.session_name}] Initial sync error")
 
-    def _handle_disconnect(self):
-        self.event("Connection lost to remote daemon")
+    def _on_disconnect(self):
+        """Handle a dropped connection without destroying state.
 
-        # Mark running experiment as cancelled
+        Because we reconnect automatically, a drop is usually transient (host
+        sleep, network blip) while the remote daemon keeps running the queue.
+        Mutating local experiment/queue status here would be a lie that flickers
+        on every reconnect, so we don't: experiment statuses are left alone and
+        reconciled on reconnect via _initial_sync -> _reconcile_tracking. We only
+        flag the cached queue as stale so `nanorun job queue` can say so.
+        """
+        self.event("Connection lost to remote daemon — will auto-reconnect")
+        self._set_cache_connected(False)
+        # Force a clean re-sync of the queue cache on reconnect even if the
+        # remote queue is byte-identical to what we last saw.
+        self._last_queue_key = None
+
+    def _set_cache_connected(self, connected: bool):
+        """Flip the queue cache's connected flag in place, preserving the
+        last-known queue and its synced_at so the data stays stale-but-honest."""
+        path = PATHS.queue_cache_file(self.session_name)
+        data = safe_json_load(path, default=None) or {"synced_at": None, "queue": []}
+        data["connected"] = connected
+        try:
+            path.write_text(json.dumps(data, indent=2))
+        except OSError:
+            pass
+
+    def _finalize_dead_session(self, outage: float):
+        """The machine has been unreachable past the grace window — presume it's
+        gone and move in-flight work to a terminal state. The in-flight experiment
+        was training and got killed by infra (-> failed); queued experiments never
+        ran (-> cancelled). Tracking state is cleared so a later reconnect can
+        re-attach and self-heal if the machine actually returns.
+        """
+        note = (f"Machine disconnected — session '{self.session_name}' unreachable across "
+                f"{outage:.0f}s of reconnect attempts; experiment did not complete.")
         if self.current_experiment_id:
             exp = get_experiment(self.current_experiment_id)
             if exp and exp.status == "running":
-                update_experiment_status(self.current_experiment_id, "cancelled")
-                self.event(f"Marked experiment {self.current_experiment_id} as cancelled (disconnected)")
+                if not exp.crash_log:
+                    update_experiment_metadata(self.current_experiment_id, crash_log=note)
+                update_experiment_status(self.current_experiment_id, "failed")
+                self.event(f"Experiment {self.current_experiment_id} marked failed — machine gone "
+                           f"({outage:.0f}s of awake retries)")
 
-        # Mark all queued experiments for this session as cancelled
+        # Queued experiments that never started -> cancelled (best-effort; SSH
+        # sessions usually create DB rows only on start, so this often matches none).
         conn = get_db()
         now = datetime.now(timezone.utc).isoformat()
         cursor = conn.execute(
-            """UPDATE experiments SET status = 'cancelled', finished_at = COALESCE(finished_at, ?)
-               WHERE status = 'queued' AND session_name = ?""",
+            "UPDATE experiments SET status = 'cancelled', finished_at = COALESCE(finished_at, ?) "
+            "WHERE status = 'queued' AND session_name = ?",
             (now, self.session_name),
         )
         conn.commit()
-        cancelled_queued = cursor.rowcount or 0
+        cancelled = cursor.rowcount or 0
         conn.close()
-        if cancelled_queued:
-            self.event(f"Marked {cancelled_queued} queued experiments as cancelled")
+        if cancelled:
+            self.event(f"Marked {cancelled} queued experiments cancelled — machine gone")
 
-        # Preserve queue cache as backup, then clear the active cache
-        cache_file = PATHS.queue_cache_file(self.session_name)
-        backup_file = cache_file.with_suffix(".backup.json")
-        if cache_file.exists():
-            import shutil
-            shutil.copy2(cache_file, backup_file)
-            # Clear active cache (queue is gone with the session)
-            cache_file.write_text(json.dumps({
-                "synced_at": datetime.now(timezone.utc).isoformat(), "queue": [],
-            }, indent=2))
-
-        # Clear tracking state
+        # Clear tracking so reconnect re-attaches cleanly (and self-heals).
         self.current_experiment_id = None
         self.current_run_id = None
         self.state.tracking_experiment_id = None
         self.state.tracking_run_id = None
+        self.state.save(self.session_name)
 
     def _sync_logs_and_metrics(self):
         """Process local log files (downloaded by HubSyncer) and reparse metrics."""
@@ -938,7 +1047,7 @@ class SessionTracker:
         self._last_queue_key = queue_key
         now = datetime.now(timezone.utc).isoformat()
         PATHS.queue_cache_file(self.session_name).write_text(json.dumps({
-            "synced_at": now, "queue": queue_items,
+            "synced_at": now, "queue": queue_items, "connected": True,
         }, indent=2))
         _append_queue_history(self.session_name, now, queue_items)
 

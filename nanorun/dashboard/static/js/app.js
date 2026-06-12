@@ -361,9 +361,11 @@ async function selectExperiment(codeHashOrId, experimentIds) {
     const meanValLoss = valLosses.length ? valLosses.reduce((a, b) => a + b, 0) / valLosses.length : null;
     const meanTrainTime = trainTimes.length ? trainTimes.reduce((a, b) => a + b, 0) / trainTimes.length : null;
 
-    const isBucket = State.get('selectedExp') === 'bucket';
+    const isBucket = isBucketKey(State.get('selectedExp'));
 
-    document.getElementById('detail-title').textContent = isBucket ? '★ Bucket' : (primary.script ? primary.script.split('/').pop() : primary.name);
+    document.getElementById('detail-title').textContent = isBucket
+        ? getBucketLabel(parseBucketKey(State.get('selectedExp')))
+        : (primary.script ? primary.script.split('/').pop() : primary.name);
 
     const copyTitleInput = document.getElementById('chart-copy-title');
     if (copyTitleInput) copyTitleInput.value = primary.script ? primary.script.split('/').pop() : primary.name;
@@ -872,7 +874,12 @@ async function startAutoRefresh() {
 
     // Restore selected experiment
     const savedExp = State.get('selectedExp');
-    if (savedExp && experiments && experiments.length > 0) {
+    if (isBucketKey(savedExp)) {
+        const bucketIds = getBucket(parseBucketKey(savedExp));
+        if (bucketIds.length > 0) {
+            await selectExperiment(savedExp, bucketIds.slice());
+        }
+    } else if (savedExp && experiments && experiments.length > 0) {
         const match = experiments.find(e =>
             e.code_hash === savedExp || String(e.id) === savedExp
         );

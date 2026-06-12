@@ -2,86 +2,193 @@
 
 let currentMetricsData = null;
 let runsIsSweep = false;
+let _lastDigit = null;
+let _lastDigitTime = 0;
 
-function getBucket() {
-    return State.get('bucket');
+document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key >= '1' && e.key <= '9') {
+        _lastDigit = parseInt(e.key);
+        _lastDigitTime = Date.now();
+    }
+});
+document.addEventListener('keyup', (e) => {
+    if (e.key >= '1' && e.key <= '9' && parseInt(e.key) === _lastDigit) _lastDigit = null;
+});
+
+function getHeldDigit() {
+    if (_lastDigit && Date.now() - _lastDigitTime < 2000) return _lastDigit;
+    return null;
 }
 
-function saveBucket(ids) {
-    State.set('bucket', ids);
+// --- Bucket helpers ---
+
+function bucketKey(i) { return i === 0 ? 'bucket' : `bucket-${i + 1}`; }
+
+function parseBucketKey(key) {
+    if (key === 'bucket') return 0;
+    if (typeof key === 'string' && key.startsWith('bucket-')) return parseInt(key.split('-')[1]) - 1;
+    return -1;
 }
 
-function toggleBucketItem(expId) {
-    const bucket = getBucket();
+function isBucketKey(key) { return parseBucketKey(key) >= 0; }
+
+function getBucket(n = 0) { return State.get('buckets')[n] || []; }
+
+function saveBucket(n, ids) {
+    const buckets = State.get('buckets');
+    buckets[n] = ids;
+    State.set('buckets', buckets);
+}
+
+function getAllBucketExpIds() {
+    const all = new Set();
+    for (const b of State.get('buckets')) for (const id of b) all.add(id);
+    return all;
+}
+
+function getBucketLabel(i) {
+    const names = State.get('bucketNames');
+    if (names[i]) return `★ ${names[i]}`;
+    return i === 0 ? '★ Bucket' : `★ Bucket ${i + 1}`;
+}
+
+function clearBucketDetail() {
+    State.update({ selectedExp: null, selectedExpIds: null });
+    document.getElementById('experiment-details').innerHTML = '';
+    document.getElementById('meta-row-container').innerHTML = '';
+    document.getElementById('detail-title').textContent = '';
+}
+
+function toggleBucketItem(expId, bucketIndex = 0) {
+    const bucket = getBucket(bucketIndex);
     const idx = bucket.indexOf(expId);
     if (idx >= 0) {
         bucket.splice(idx, 1);
     } else {
+        // Remove from any other bucket first (run can only be in one)
+        const buckets = State.get('buckets');
+        for (let i = 0; i < buckets.length; i++) {
+            if (i === bucketIndex) continue;
+            const pos = buckets[i].indexOf(expId);
+            if (pos >= 0) { buckets[i].splice(pos, 1); break; }
+        }
+        State.set('buckets', buckets);
         bucket.push(expId);
     }
-    saveBucket(bucket);
-    renderBucketCard();
-    // Re-render runs table if viewing bucket to update icons
-    if (State.get('selectedExp') === 'bucket') {
-        selectExperiment('bucket', bucket.slice());
+    saveBucket(bucketIndex, bucket);
+    renderBucketCards();
+    const viewingIdx = parseBucketKey(State.get('selectedExp'));
+    if (viewingIdx >= 0) {
+        const viewingBucket = getBucket(viewingIdx);
+        if (viewingBucket.length === 0) clearBucketDetail();
+        else selectExperiment(bucketKey(viewingIdx), viewingBucket.slice());
     }
 }
 
 function removeFromBucket(expId) {
-    const bucket = getBucket().filter(id => id !== expId);
-    saveBucket(bucket);
-    renderBucketCard();
-    if (State.get('selectedExp') === 'bucket') {
-        if (bucket.length === 0) {
-            State.update({ selectedExp: null, selectedExpIds: null });
-            document.getElementById('experiment-details').innerHTML = '';
-            document.getElementById('meta-row-container').innerHTML = '';
-            document.getElementById('detail-title').textContent = '';
-        } else {
-            selectExperiment('bucket', bucket.slice());
-        }
-    }
+    const viewingIdx = parseBucketKey(State.get('selectedExp'));
+    const bucket = getBucket(viewingIdx).filter(id => id !== expId);
+    saveBucket(viewingIdx, bucket);
+    renderBucketCards();
+    if (bucket.length === 0) clearBucketDetail();
+    else selectExperiment(bucketKey(viewingIdx), bucket.slice());
 }
 
-function renderBucketCard() {
-    // Remove existing bucket card
-    const existing = document.getElementById('bucket-card');
-    if (existing) existing.remove();
+function renameBucket(i, el) {
+    event.stopPropagation();
+    const current = State.get('bucketNames')[i] || '';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = current;
+    input.className = 'bucket-rename-input';
+    input.placeholder = i === 0 ? 'Bucket' : `Bucket ${i + 1}`;
 
-    const bucket = getBucket();
-    if (bucket.length === 0) return;
+    const commit = () => {
+        const val = input.value.trim();
+        const names = State.get('bucketNames');
+        names[i] = val;
+        State.set('bucketNames', names);
+        renderBucketCards();
+        if (State.get('selectedExp') === bucketKey(i)) {
+            document.getElementById('detail-title').textContent = getBucketLabel(i);
+        }
+    };
 
+    input.addEventListener('keydown', e => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+        if (e.key === 'Escape') { e.preventDefault(); renderBucketCards(); }
+    });
+    input.addEventListener('blur', commit);
+    input.addEventListener('click', e => e.stopPropagation());
+
+    el.replaceWith(input);
+    input.focus();
+    input.select();
+}
+
+function renderBucketCards() {
+    document.querySelectorAll('.bucket-card-item').forEach(el => el.remove());
     const listEl = document.getElementById('experiments-list');
     if (!listEl) return;
 
-    const isSelected = State.get('selectedExp') === 'bucket';
-    const card = document.createElement('div');
-    card.id = 'bucket-card';
-    card.className = `experiment-card bucket${isSelected ? ' selected' : ''}`;
-    card.dataset.id = 'bucket';
-    card.onclick = () => selectExperiment('bucket', bucket.slice());
-    card.innerHTML = `
-        <div class="exp-header">
-            <div class="exp-name-group">
-                <span class="exp-name"><span class="exp-track bucket-label">★ Bucket</span></span>
+    const buckets = State.get('buckets');
+    const selectedExp = State.get('selectedExp');
+
+    for (let i = buckets.length - 1; i >= 0; i--) {
+        const bucket = buckets[i];
+        if (bucket.length === 0) continue;
+        const key = bucketKey(i);
+        const card = document.createElement('div');
+        card.className = `experiment-card bucket bucket-card-item${selectedExp === key ? ' selected' : ''}`;
+        card.dataset.id = key;
+        card.onclick = () => selectExperiment(key, bucket.slice());
+        card.innerHTML = `
+            <div class="exp-header">
+                <div class="exp-name-group">
+                    <span class="bucket-num">${i + 1}</span>
+                    <span class="exp-name"><span class="exp-track bucket-label" ondblclick="renameBucket(${i}, this)">${getBucketLabel(i)}</span></span>
+                </div>
+                <div class="exp-badges">
+                    <span class="bucket-count">${bucket.length} run${bucket.length !== 1 ? 's' : ''}</span>
+                </div>
             </div>
-            <div class="exp-badges">
-                <span class="bucket-count">${bucket.length} run${bucket.length !== 1 ? 's' : ''}</span>
-            </div>
-        </div>
-    `;
-    listEl.prepend(card);
+        `;
+        listEl.prepend(card);
+    }
 }
 
+function renderBucketCard() { renderBucketCards(); }
+
 function handleRunRowClick(event, expId) {
-    if (event.metaKey || event.ctrlKey) {
-        event.preventDefault();
-        toggleBucketItem(expId);
-        // Re-render to update in-bucket styling
-        if (State.get('selectedExp') !== 'bucket') renderRunsTable();
+    const digit = getHeldDigit();
+    if (!(event.metaKey || event.ctrlKey) && !digit) {
+        showMetricsForRun(expId);
         return;
     }
-    showMetricsForRun(expId);
+    event.preventDefault();
+    // Clear digit after use so it doesn't stick
+    _lastDigit = null;
+
+    const viewingIdx = parseBucketKey(State.get('selectedExp'));
+    const inBucketView = viewingIdx >= 0;
+
+    if (digit && inBucketView && digit - 1 !== viewingIdx) {
+        // Move run from current bucket to target bucket
+        const src = getBucket(viewingIdx).filter(id => id !== expId);
+        saveBucket(viewingIdx, src);
+        const dst = getBucket(digit - 1);
+        if (!dst.includes(expId)) dst.push(expId);
+        saveBucket(digit - 1, dst);
+        renderBucketCards();
+        if (src.length === 0) clearBucketDetail();
+        else selectExperiment(bucketKey(viewingIdx), src.slice());
+    } else {
+        const idx = digit ? digit - 1 : (inBucketView ? viewingIdx : 0);
+        toggleBucketItem(expId, idx);
+        if (!inBucketView) renderRunsTable();
+    }
 }
 
 function showMetricsForRun(expId) {
@@ -272,9 +379,9 @@ function renderRunsTable() {
     const runsSort = State.get('runsSort');
     const runsLimit = State.get('runsLimit');
     const selectedRunId = State.get('selectedRun');
-    const isBucketView = State.get('selectedExp') === 'bucket';
+    const isBucketView = isBucketKey(State.get('selectedExp'));
 
-    const bucketSet = new Set(getBucket());
+    const bucketSet = getAllBucketExpIds();
     const limited = getVisibleRuns();
     const filterKeys = Object.keys(runsEnvFilters);
     // Total before limit (need to recount for "Showing X of Y")
@@ -334,7 +441,7 @@ function renderRunsTable() {
                 }).join(' ') || 'default'}</td>` : '';
                 const sessionHtml = showSession ? `<td class="session-col">${d.session_name || '-'}</td>` : '';
                 return `
-                <tr class="run-row${selectedRunId === d.id ? ' selected' : ''}${bucketSet.has(d.id) ? ' in-bucket' : ''}" data-exp-id="${d.id}" onclick="handleRunRowClick(event, ${d.id})" title="Click to view metrics · ⌘+click to add to bucket">
+                <tr class="run-row${selectedRunId === d.id ? ' selected' : ''}${bucketSet.has(d.id) ? ' in-bucket' : ''}" data-exp-id="${d.id}" onclick="handleRunRowClick(event, ${d.id})" title="Click to view metrics · ⌘+click bucket 1 · hold N+click bucket N">
                     <td>${isBucketView ? `<span class="exp-track">${d.track || 'untracked'}</span>/${d.script ? d.script.split('/').pop().replace('.py', '') : d.name}` : `#${d.id}`}</td>
                     <td>
                         ${d.remote_run_id
@@ -433,7 +540,7 @@ function copyRunsAsMarkdown() {
     const runs = getVisibleRuns();
     if (runs.length === 0) return;
 
-    const isBucketView = State.get('selectedExp') === 'bucket';
+    const isBucketView = isBucketKey(State.get('selectedExp'));
     const hasEnvVars = runs.some(d => d.env_vars && Object.keys(d.env_vars).length > 0);
 
     const statusLabel = (s) => s === 'running' ? 'in progress' : s === 'completed' ? 'success' : s;

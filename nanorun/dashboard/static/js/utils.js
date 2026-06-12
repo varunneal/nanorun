@@ -109,14 +109,13 @@ function getDifferingKeys(runs) {
 function computeSmartLabels(runs) {
     if (runs.length <= 1) return runs.map(() => 'Validation Loss');
     const differingKeys = getDifferingKeys(runs);
+    const inBucket = isBucketKey(State.get('selectedExp'));
     return runs.map((run, i) => {
         const env = run.env_vars || {};
         const scriptLabel = run.script ? run.script.split('/').pop().replace('.py', '') : run.name;
-        if (differingKeys.length === 0) {
-            return State.get('selectedExp') === 'bucket' ? scriptLabel : `Run ${i + 1}`;
-        }
+        if (differingKeys.length === 0) return inBucket ? scriptLabel : `Run ${i + 1}`;
         const parts = differingKeys.map(k => env[k] ?? '').join(', ');
-        return State.get('selectedExp') === 'bucket' ? `${scriptLabel} (${parts})` : parts;
+        return inBucket ? `${scriptLabel} (${parts})` : parts;
     });
 }
 

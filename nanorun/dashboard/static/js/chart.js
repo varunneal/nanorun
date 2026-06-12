@@ -449,8 +449,7 @@ function getEligibleViews(validData) {
         d.status === 'running' || d.status === 'completed'
     );
 
-    // Heatmap: disabled in bucket view
-    if (State.get('selectedExp') !== 'bucket') {
+    if (!isBucketKey(State.get('selectedExp'))) {
         const { processed } = getHeatmapData(validData);
         if (computeHeatmapData(processed)) views.push('heatmap');
     }
@@ -742,7 +741,7 @@ function renderChartLegend(runs) {
         return;
     }
     const diffKeys = getDifferingKeys(runs);
-    const isBucketView = State.get('selectedExp') === 'bucket';
+    const isBucketView = isBucketKey(State.get('selectedExp'));
     const showScript = isBucketView || new Set(runs.map(r => r.script || r.name)).size > 1;
     let headerCols = showScript ? '<th>Script</th>' : '';
     headerCols += diffKeys.length > 0
