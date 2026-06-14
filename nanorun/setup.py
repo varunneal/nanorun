@@ -1,10 +1,11 @@
 """Machine setup and provisioning for remote GPU machines (H100, H200, GH200, DGX Spark)."""
 
 import re
-from typing import Optional, Tuple
+import time
+from pathlib import PurePosixPath
+from typing import Optional
 
 from rich.console import Console
-from rich.prompt import Confirm
 from rich.panel import Panel
 
 from .remote_control import RemoteSession, DaemonClient
@@ -12,29 +13,22 @@ from .config import Config
 
 console = Console()
 
+# ─── Detection helpers ────────────────────────────────────────────────────────
+
 
 def detect_cuda_version(remote: RemoteSession) -> Optional[str]:
-    """Detect CUDA version from nvcc (preferred) or nvidia-smi (fallback).
-
-    nvcc --version shows the actual installed CUDA toolkit version.
-    nvidia-smi shows the driver's maximum supported version, which may differ.
-    """
-    # Try nvcc first - this gives the actual installed CUDA toolkit version
+    """Detect CUDA version from nvcc (preferred) or nvidia-smi (fallback)."""
     result = remote.run("nvcc --version 2>/dev/null")
     if result.success:
-        # Look for "release X.Y" in nvcc output
         match = re.search(r"release\s+(\d+\.\d+)", result.stdout)
         if match:
-            version = match.group(1)
-            return _cuda_version_to_torch_tag(version)
+            return _cuda_version_to_torch_tag(match.group(1))
 
-    # Fall back to nvidia-smi (shows driver's max supported version)
     result = remote.run("nvidia-smi")
     if result.success:
         match = re.search(r"CUDA Version:\s*(\d+\.\d+)", result.stdout)
         if match:
-            version = match.group(1)
-            return _cuda_version_to_torch_tag(version)
+            return _cuda_version_to_torch_tag(match.group(1))
 
     return None
 
@@ -58,20 +52,14 @@ def _cuda_version_to_torch_tag(version: str) -> str:
 
 
 def resolve_repo_path(remote: RemoteSession, configured_path: str) -> str:
-    """Resolve repo path to an absolute path on the remote.
-
-    Some providers (e.g. Jarvis Labs) set HOME incorrectly (/home instead of /root),
-    so we resolve ~ by querying the remote's actual home directory via getent.
-    """
+    """Resolve repo path to an absolute path on the remote."""
     if not configured_path.startswith("~"):
         return configured_path
-    # getent passwd is authoritative — reads /etc/passwd regardless of env vars
     result = remote.run("getent passwd $(whoami) | cut -d: -f6")
     if result.success and result.stdout.strip():
         home = result.stdout.strip()
         if home and home != "/":
             return configured_path.replace("~", home, 1)
-    # Fallback for root (some minimal containers lack getent)
     result = remote.run("id -u")
     if result.success and result.stdout.strip() == "0":
         return configured_path.replace("~", "/root", 1)
@@ -101,7 +89,7 @@ def detect_gpu_type(remote: RemoteSession) -> str:
             return "A100"
         elif "L4" in name:
             return "L4"
-    return "H100"  # Default fallback
+    return "H100"
 
 
 def detect_gpu_count(remote: RemoteSession) -> int:
@@ -114,29 +102,25 @@ def detect_gpu_count(remote: RemoteSession) -> int:
                 return count
         except ValueError:
             pass
-    return 1  # Default fallback
+    return 1
 
 
 def detect_sudo(remote: RemoteSession) -> bool:
     """Check if sudo is available and needed."""
-    # Check if we're root
     result = remote.run("id -u")
     if result.success and result.stdout.strip() == "0":
-        return False  # We're root, no sudo needed
-
-    # Check if sudo is available
+        return False
     result = remote.run("which sudo")
     return result.success
 
 
-TORCH_VERSION = "2.12.0"
+# ─── Install commands ─────────────────────────────────────────────────────────
 
-# Only these CUDA tags have dedicated PyTorch wheel indexes
+TORCH_VERSION = "2.12.0"
 _INDEXED_CUDA_TAGS = {"cu126", "cu130", "cu132"}
 
 
 def get_torch_install_cmd(cuda_version: str) -> str:
-    """Get the pip install command for torch with correct CUDA."""
     if cuda_version in _INDEXED_CUDA_TAGS:
         return (
             f"uv pip install torch=={TORCH_VERSION}+{cuda_version} "
@@ -146,8 +130,6 @@ def get_torch_install_cmd(cuda_version: str) -> str:
 
 
 def get_flash_attn_install_cmd(cuda_version: str) -> str:
-    """Get the pip install command for flash_attn_3 with correct CUDA/torch wheel."""
-    # Tag format: cu130_torch2100 (cuda tag + torch version without dots)
     torch_tag = "torch" + TORCH_VERSION.replace(".", "")
     wheel_tag = f"{cuda_version}_{torch_tag}"
     return (
@@ -156,332 +138,369 @@ def get_flash_attn_install_cmd(cuda_version: str) -> str:
     )
 
 
-def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
-    """Run interactive setup on remote machine."""
-    config = Config.load()
+# ─── Setup script generation ─────────────────────────────────────────────────
 
-    def confirm(prompt: str, default: bool = True) -> bool:
-        """Ask for confirmation, or return True if auto_yes is set."""
-        if auto_yes:
-            return True
-        return Confirm.ask(prompt, default=default)
+
+def _generate_setup_script(
+    repo_path: str,
+    home_dir: str,
+    cuda_version: str,
+    sudo_prefix: str,
+    hf_token: Optional[str],
+) -> str:
+    """Generate a bash script that runs the entire setup in one shot on the remote.
+
+    Uses background processes (&) and wait to maximize parallelism while
+    respecting dependency ordering. Outputs structured status lines that we parse.
+    Assumes repo is already cloned (done separately with agent forwarding).
+    """
+    torch_cmd = get_torch_install_cmd(cuda_version)
+    flash_cmd = get_flash_attn_install_cmd(cuda_version)
+    deps = "huggingface-hub[hf_xet] websockets tqdm numpy kernels==0.13.0 setuptools datasets tiktoken nvidia-cuda-nvcc"
+
+    # HF auth block (only if token available)
+    hf_block = ""
+    if hf_token:
+        import base64
+        token_b64 = base64.b64encode(hf_token.encode()).decode()
+        hf_block = f"""
+# ── HF auth (parallel, just writes token file — login happens after deps) ──
+(
+  mkdir -p {home_dir}/.cache/huggingface
+  echo '{token_b64}' | base64 -d > {home_dir}/.cache/huggingface/token
+  echo "STATUS:hf_auth:OK:token written"
+) &
+PID_HF=$!
+"""
+    else:
+        hf_block = """
+echo "STATUS:hf_auth:FAIL:no local HF token"
+PID_HF=""
+"""
+
+    script = f"""#!/bin/bash
+set -o pipefail
+
+REPO="{repo_path}"
+HOME_DIR="{home_dir}"
+
+# Ensure uv and venv python are findable in all subshells
+export PATH="$HOME_DIR/.local/bin:/usr/local/bin:$REPO/.venv/bin:$PATH"
+ACTIVATE="cd $REPO && source .venv/bin/activate"
+
+# ─── PHASE 1: Foundation (apt || uv+clone) ────────────────────────────────
+
+# SSH config for GitHub
+mkdir -p $HOME_DIR/.ssh
+grep -q "Host github.com" $HOME_DIR/.ssh/config 2>/dev/null || printf "Host github.com\\n    AddressFamily inet\\n" >> $HOME_DIR/.ssh/config
+
+# Hostname fix
+python3 -c "import socket; socket.gethostbyname(socket.gethostname())" 2>/dev/null || \\
+  {sudo_prefix}sh -c 'echo "127.0.0.1 $(hostname)" >> /etc/hosts'
+
+# ── apt (background) ──
+(
+  if dpkg -l git curl tmux rsync build-essential python3-dev 2>/dev/null | grep -c '^ii' | grep -q '^6$'; then
+    echo "STATUS:apt:OK:already present"
+  else
+    DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get update -qq -o Acquire::Languages=none && \\
+    DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get install -y -qq --no-install-recommends \\
+      git curl tmux rsync build-essential python3-dev 2>/dev/null
+    if [ $? -eq 0 ]; then echo "STATUS:apt:OK:installed"; else echo "STATUS:apt:FAIL:apt-get failed"; fi
+  fi
+) &
+PID_APT=$!
+
+# ── uv install (background, only needs curl) ──
+(
+  if which uv >/dev/null 2>&1 || $HOME_DIR/.local/bin/uv --version >/dev/null 2>&1; then
+    echo "STATUS:uv:OK:already installed"
+  else
+    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1
+    if [ $? -eq 0 ]; then echo "STATUS:uv:OK:installed"; else echo "STATUS:uv:FAIL:install failed"; fi
+  fi
+) &
+PID_UV=$!
+
+# Wait for uv (needed for venv)
+wait $PID_UV
+
+# Find uv
+UV_BIN=$(which uv 2>/dev/null || echo "$HOME_DIR/.local/bin/uv")
+export PATH="$(dirname $UV_BIN):$PATH"
+
+# ── Venv ──
+if [ -f "$REPO/.venv/bin/python" ]; then
+  echo "STATUS:venv:OK:already exists"
+else
+  cd $REPO && uv venv --python 3.12 >/dev/null 2>&1
+  if [ $? -eq 0 ]; then echo "STATUS:venv:OK:created"; else echo "STATUS:venv:FAIL:uv venv failed"; fi
+fi
+
+# Wait for apt (needed for build-essential in some pip installs)
+wait $PID_APT
+
+# ─── PHASE 2: Packages + data (maximally parallel) ───────────────────────
+
+# ── torch (background) ──
+(
+  cd $REPO && source .venv/bin/activate && python -c "import torch; assert torch.__version__.startswith('{TORCH_VERSION}')" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "STATUS:torch:OK:already installed"
+  else
+    cd $REPO && source .venv/bin/activate && {torch_cmd} 2>&1 | tail -5
+    if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:torch:OK:installed"; else echo "STATUS:torch:FAIL:pip install failed"; fi
+  fi
+) &
+PID_TORCH=$!
+
+# ── deps (background) ──
+(
+  cd $REPO && source .venv/bin/activate && uv pip install {deps} 2>&1 | tail -3
+  if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:deps:OK:installed"; else echo "STATUS:deps:FAIL:pip install failed"; fi
+) &
+PID_DEPS=$!
+
+{hf_block}
+
+# Wait for deps (data needs huggingface-hub; hf login needs huggingface-hub)
+wait $PID_DEPS
+
+# HF login (quick, needs huggingface-hub from deps)
+if [ -f "{home_dir}/.cache/huggingface/token" ]; then
+  cd $REPO && source .venv/bin/activate && python -c "from huggingface_hub import login; login(token=open('{home_dir}/.cache/huggingface/token').read().strip(), add_to_git_credential=True)" 2>/dev/null
+fi
+
+# ── data download (background, uses xet from deps) ──
+(
+  if [ -f "$REPO/data/fineweb10B/fineweb_train_000024.bin" ]; then
+    echo "STATUS:data:OK:already downloaded"
+  else
+    cd $REPO && source .venv/bin/activate && HF_XET_HIGH_PERFORMANCE=1 python $REPO/data/cached_fineweb10B.py 24 >/dev/null 2>&1
+    if [ $? -eq 0 ]; then echo "STATUS:data:OK:downloaded 24 shards"; else echo "STATUS:data:FAIL:download failed"; fi
+  fi
+) &
+PID_DATA=$!
+
+# Wait for torch (flash_attn needs it at runtime, install after)
+wait $PID_TORCH
+
+# ── flash_attn_3 ──
+(
+  cd $REPO && source .venv/bin/activate && python -c "import flash_attn_3" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "STATUS:flash_attn_3:OK:already installed"
+  else
+    cd $REPO && source .venv/bin/activate && {flash_cmd} 2>&1 | tail -3
+    if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:flash_attn_3:OK:installed"; else echo "STATUS:flash_attn_3:FAIL:pip install failed"; fi
+  fi
+) &
+PID_FLASH=$!
+
+# ── CUDA symlink (non-critical, quick) ──
+(
+  CUDA_PKG=$($REPO/.venv/bin/python -c "import nvidia.cu13; import os; print(os.path.dirname(nvidia.cu13.__file__))" 2>/dev/null) && \\
+  [ -n "$CUDA_PKG" ] && {sudo_prefix}ln -sfn $CUDA_PKG /usr/local/cuda 2>/dev/null
+) &
+
+# Wait for all remaining
+wait $PID_FLASH
+wait $PID_DATA
+[ -n "$PID_HF" ] && wait $PID_HF
+
+echo "STATUS:DONE"
+"""
+    return script
+
+
+# ─── Setup implementation ─────────────────────────────────────────────────────
+
+
+class SetupFailure:
+    """A non-fatal failure that gets reported at the end."""
+    def __init__(self, step: str, detail: str):
+        self.step = step
+        self.detail = detail
+
+
+def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
+    """Run fast, non-interactive setup on remote machine.
+
+    Ships a single bash script to the remote that handles all parallelism natively.
+    Only 3 SSH round-trips: detect environment, run setup script, start daemon.
+    """
+    t0 = time.time()
+    config = Config.load()
+    failures: list[SetupFailure] = []
 
     console.print(Panel.fit(
         "[bold cyan]nanorun setup[/bold cyan]\n"
-        "This will set up the remote machine for NanoGPT training.",
+        "Single-script fast provisioning.",
         title="Setup"
     ))
 
-    # Step 1: Detect environment
-    console.print("\n[bold]Step 1: Detecting environment...[/bold]")
+    # ── Detect environment (1 SSH call) ─────────────────────────────────────────
+    console.print("\n[bold]Detecting environment...[/bold]")
 
-    # Detect CUDA
-    cuda_version = detect_cuda_version(remote)
-    if cuda_version:
-        console.print(f"  [green]CUDA version detected: {cuda_version}[/green]")
-    else:
-        console.print("  [yellow]Could not detect CUDA version[/yellow]")
-        cuda_version = Confirm.ask(
-            "Enter CUDA version manually",
-            default="cu130"
-        )
+    detect_cmd = (
+        'echo "CUDA:$(nvidia-smi 2>/dev/null | grep -oP "CUDA Version:\\s*\\K[0-9.]+")"; '
+        'echo "NVCC:$(nvcc --version 2>/dev/null | grep -oP "release\\s+\\K[0-9.]+")"; '
+        'echo "UID:$(id -u)"; '
+        'echo "HOME:$(getent passwd $(whoami) 2>/dev/null | cut -d: -f6)"'
+    )
+    result = remote.run(detect_cmd, timeout=10)
+    detect_info = {}
+    if result.success:
+        for line in result.stdout.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                detect_info[k.strip()] = v.strip()
 
-    # Detect sudo
-    needs_sudo = detect_sudo(remote)
+    # Parse CUDA version (prefer nvcc over nvidia-smi)
+    cuda_version = None
+    if detect_info.get("NVCC"):
+        cuda_version = _cuda_version_to_torch_tag(detect_info["NVCC"])
+    elif detect_info.get("CUDA"):
+        cuda_version = _cuda_version_to_torch_tag(detect_info["CUDA"])
+    if not cuda_version:
+        failures.append(SetupFailure("CUDA detection", "Could not detect CUDA. Defaulting to cu130."))
+        cuda_version = "cu130"
+    console.print(f"  CUDA: [green]{cuda_version}[/green]")
+
+    # Parse sudo needs
+    needs_sudo = detect_info.get("UID") != "0"
     sudo_prefix = "sudo " if needs_sudo else ""
-    console.print(f"  [dim]sudo: {'needed' if needs_sudo else 'not needed (running as root)'}[/dim]")
+    console.print(f"  sudo: {'needed' if needs_sudo else 'not needed (root)'}")
 
-    # Save detected config
     config.session.cuda_version = cuda_version
     config.session.has_sudo = needs_sudo
     config.save()
 
-    # Step 2: System packages
-    console.print("\n[bold]Step 2: System packages[/bold]")
-    console.print("  [dim]Will install: git curl tmux rsync build-essential python3-dev[/dim]")
-
-    if confirm("  Install system packages?", default=True):
-        # Use DEBIAN_FRONTEND to avoid interactive prompts
-        apt_cmd = (
-            f"DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get update && "
-            f"DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get install -y git curl tmux rsync build-essential python3-dev"
-        )
-        console.print("  [dim]Running apt-get...[/dim]")
-        result = remote.run(apt_cmd, timeout=120)
-        if result.success:
-            console.print("  [green]System packages installed[/green]")
-        else:
-            console.print(f"  [red]Failed: {result.stderr}[/red]")
-            if not confirm("  Continue anyway?", default=False):
-                return
-
-    # Ensure hostname resolves (Docker providers like Jarvis Labs set hostname
-    # to container ID without adding it to /etc/hosts, breaking torchrun)
-    result = remote.run("python3 -c \"import socket; socket.gethostbyname(socket.gethostname())\"")
-    if not result.success:
-        remote.run(f"{sudo_prefix}sh -c 'echo \"127.0.0.1 $(hostname)\" >> /etc/hosts'")
-        console.print("  [yellow]Added hostname to /etc/hosts (was unresolvable)[/yellow]")
-
-    # Step 3: Install uv
-    console.print("\n[bold]Step 3: Install uv[/bold]")
-
-    # Check if uv already installed (search common locations, including $HOME/.local/bin)
-    result = remote.run("which uv || $HOME/.local/bin/uv --version 2>/dev/null || find /usr/local/bin $HOME/.local/bin /root/.local/bin -name uv 2>/dev/null | head -1")
-    if result.success and result.stdout.strip():
-        console.print("  [green]uv already installed[/green]")
-    else:
-        if confirm("  Install uv?", default=True):
-            uv_cmd = "curl -LsSf https://astral.sh/uv/install.sh | sh"
-            console.print("  [dim]Installing uv...[/dim]")
-            result = remote.run(uv_cmd, timeout=60)
-            if result.success:
-                console.print("  [green]uv installed[/green]")
-            else:
-                console.print(f"  [red]Failed: {result.stderr}[/red]")
-
-    # Resolve repo path — some providers (Jarvis Labs) set HOME incorrectly
-    repo_path = resolve_repo_path(remote, config.session.repo_path)
+    # Resolve repo path from detected HOME
+    repo_path = config.session.repo_path
+    if repo_path.startswith("~"):
+        detected_home = detect_info.get("HOME", "").strip()
+        if detected_home and detected_home != "/":
+            repo_path = repo_path.replace("~", detected_home, 1)
+        elif detect_info.get("UID") == "0":
+            repo_path = repo_path.replace("~", "/root", 1)
     if repo_path != config.session.repo_path:
-        console.print(f"  [yellow]HOME is misconfigured on remote, using absolute path: {repo_path}[/yellow]")
+        console.print(f"  [yellow]HOME misconfigured, using: {repo_path}[/yellow]")
         config.session.repo_path = repo_path
         config.save()
 
-    # Derive home_dir from resolved repo_path (parent of /root/nanorun -> /root)
-    from pathlib import PurePosixPath
     home_dir = str(PurePosixPath(repo_path).parent)
 
-    # Build a PATH prefix that finds uv regardless of where it's installed
-    # (some providers put it in ~/.local/bin, others in conda, etc.)
-    result = remote.run(f"which uv || find {home_dir}/.local/bin /usr/local/bin -name uv 2>/dev/null | head -1")
-    uv_dir = ""
-    if result.success and result.stdout.strip():
-        uv_dir = str(PurePosixPath(result.stdout.strip().splitlines()[0]).parent)
-    path_prefix = f"export PATH={uv_dir}:$PATH && " if uv_dir else ""
+    # Get repo URL
+    from .project_config import get_repo_url
+    repo_url = get_repo_url() or "git@github.com:varunneal/nanorun-private.git"
 
-    # Ensure GitHub SSH uses IPv4 (IPv6/NAT64 can hang under load)
-    remote.run(f'mkdir -p {home_dir}/.ssh && grep -q "Host github.com" {home_dir}/.ssh/config 2>/dev/null '
-               f'|| printf "Host github.com\\n    AddressFamily inet\\n" >> {home_dir}/.ssh/config')
+    # Get HF token
+    from .hub import get_local_token
+    hf_token = get_local_token()
 
-    # Step 4: Clone repo (must happen before venv/packages)
-    console.print("\n[bold]Step 4: Clone repository[/bold]")
-
-    # Check if repo exists
+    # ── Git clone/pull (needs agent forwarding, separate SSH call) ───────────
+    console.print("\n[bold]Syncing repository...[/bold]")
     result = remote.run(f"test -d {repo_path} && echo exists")
     if "exists" in result.stdout:
-        console.print("  [green]Repository already cloned[/green]")
-        if confirm("  Pull latest changes?", default=True):
-            result = remote.run_with_agent(
-                f"cd {repo_path} && git pull origin main",
-                timeout=60,
-            )
-            if result.success:
-                console.print("  [green]Updated[/green]")
-            else:
-                console.print(f"  [yellow]Pull issue: {result.stderr}[/yellow]")
+        r = remote.run_with_agent(f"cd {repo_path} && git pull origin main", timeout=60)
+        if r.success:
+            console.print("  [green]repo: updated[/green]")
+        else:
+            failures.append(SetupFailure("repo", r.stderr[:200]))
+            console.print(f"  [red]repo: pull FAILED[/red]")
     else:
-        if confirm("  Clone nanorun repository?", default=True):
-            from .project_config import get_repo_url
-            repo_url = get_repo_url() or "git@github.com:varunneal/nanorun-private.git"
-            # Use GIT_SSH_COMMAND to auto-accept GitHub's host key
-            clone_cmd = (
-                f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
-                f"git clone {repo_url} nanorun"
-            )
-            console.print("  [dim]Cloning...[/dim]")
-            result = remote.run_with_agent(clone_cmd, timeout=60)
-            if result.success:
-                console.print("  [green]Repository cloned[/green]")
+        clone_cmd = (
+            f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
+            f"git clone {repo_url} {repo_path}"
+        )
+        r = remote.run_with_agent(clone_cmd, timeout=60)
+        if r.success:
+            console.print("  [green]repo: cloned[/green]")
+        else:
+            failures.append(SetupFailure("repo", r.stderr[:200]))
+            console.print(f"  [red]repo: clone FAILED[/red]")
+
+    # ── Run setup script (1 SSH call, all parallelism inside) ─────────────────
+    console.print("\n[bold]Running setup (parallel)...[/bold]")
+
+    script = _generate_setup_script(
+        repo_path=repo_path,
+        home_dir=home_dir,
+        cuda_version=cuda_version,
+        sudo_prefix=sudo_prefix,
+        hf_token=hf_token,
+    )
+
+    # Ship script via stdin and execute
+    try:
+        client = remote._get_client()
+        stdin, stdout, stderr = client.exec_command("bash -s", timeout=600)
+        stdin.write(script)
+        stdin.channel.shutdown_write()
+        stdout.channel.recv_exit_status()
+        stdout_str = stdout.read().decode('utf-8', errors='replace')
+        stderr_str = stderr.read().decode('utf-8', errors='replace')
+
+        class _Result:
+            success = True
+            def __init__(self, out, err):
+                self.stdout = out
+                self.stderr = err
+        result = _Result(stdout_str, stderr_str)
+    except Exception as e:
+        class _FailResult:
+            success = False
+            stdout = ""
+            def __init__(self, err):
+                self.stderr = str(err)
+        result = _FailResult(e)
+
+    # Parse structured status lines from output
+    if result.success or result.stdout:
+        output = result.stdout + result.stderr
+        for line in output.splitlines():
+            if not line.startswith("STATUS:"):
+                continue
+            parts = line.split(":", 3)
+            if len(parts) < 4:
+                continue
+            _, name, status, detail = parts
+            if name == "DONE":
+                continue
+            if status == "OK":
+                console.print(f"  [green]{name}:[/green] {detail}")
             else:
-                console.print(f"  [red]Failed: {result.stderr}[/red]")
+                failures.append(SetupFailure(name, detail))
+                console.print(f"  [red]{name}: FAILED — {detail}[/red]")
+    else:
+        failures.append(SetupFailure("setup script", f"Script failed: {result.stderr[:200]}"))
+        console.print(f"  [red]Setup script failed to run[/red]")
 
-    # Step 5: Create venv
-    console.print("\n[bold]Step 5: Create Python environment[/bold]")
-
-    # Source uv and create venv in repo directory
-    venv_cmd = f"{path_prefix}cd {repo_path} && uv venv --python 3.12"
-    if confirm("  Create Python 3.12 venv?", default=True):
-        console.print("  [dim]Creating venv in repo directory...[/dim]")
-        result = remote.run(venv_cmd, timeout=60)
-        if result.success:
-            console.print("  [green]Venv created[/green]")
-        else:
-            console.print(f"  [yellow]Note: {result.stderr}[/yellow]")
-
-    # Step 6: Install torch
-    console.print("\n[bold]Step 6: Install PyTorch[/bold]")
-    torch_cmd = get_torch_install_cmd(cuda_version)
-    console.print(f"  [dim]{torch_cmd}[/dim]")
-
-    if confirm("  Install PyTorch nightly?", default=True):
-        full_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && {torch_cmd}"
-        console.print("  [dim]Installing PyTorch (this may take a few minutes)...[/dim]")
-        result = remote.run(full_cmd, timeout=300)
-        if result.success:
-            console.print("  [green]PyTorch installed[/green]")
-        else:
-            console.print(f"  [red]Failed: {result.stderr}[/red]")
-
-    # Step 7: Install flash_attn_3
-    console.print("\n[bold]Step 7: Install flash_attn_3[/bold]")
-    flash_cmd = get_flash_attn_install_cmd(cuda_version)
-    console.print(f"  [dim]{flash_cmd}[/dim]")
-
-    if confirm("  Install flash_attn_3?", default=True):
-        full_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && {flash_cmd}"
-        console.print("  [dim]Installing flash_attn_3...[/dim]")
-        result = remote.run(full_cmd, timeout=300)
-        if result.success:
-            console.print("  [green]flash_attn_3 installed[/green]")
-        else:
-            console.print(f"  [red]Failed: {result.stderr}[/red]")
-
-    # Step 8: Install other deps
-    console.print("\n[bold]Step 8: Install dependencies[/bold]")
-    deps = "huggingface-hub websockets tqdm numpy kernels==0.13.0 setuptools datasets tiktoken nvidia-cuda-nvcc"
-    console.print(f"  [dim]Will install: {deps}[/dim]")
-
-    if confirm("  Install dependencies?", default=True):
-        deps_cmd = f"{path_prefix}cd {repo_path} && source .venv/bin/activate && uv pip install {deps}"
-        console.print("  [dim]Installing...[/dim]")
-        result = remote.run(deps_cmd, timeout=120)
-        if result.success:
-            console.print("  [green]Dependencies installed[/green]")
-        else:
-            console.print(f"  [red]Failed: {result.stderr}[/red]")
-
-        # Symlink /usr/local/cuda -> venv's nvidia CUDA package so torch can find headers
-        cuda_link_cmd = (
-            f"{path_prefix}cd {repo_path} && "
-            f"CUDA_PKG=$(python3 -c \"import nvidia.cu13; import os; print(os.path.dirname(nvidia.cu13.__file__))\" 2>/dev/null "
-            f"|| .venv/bin/python -c \"import nvidia.cu13; import os; print(os.path.dirname(nvidia.cu13.__file__))\") && "
-            f"{sudo_prefix}ln -sfn $CUDA_PKG /usr/local/cuda"
-        )
-        result = remote.run(cuda_link_cmd, timeout=30)
-        if result.success:
-            console.print("  [green]CUDA headers linked at /usr/local/cuda[/green]")
-        else:
-            console.print(f"  [yellow]CUDA symlink failed (non-critical): {result.stderr}[/yellow]")
-
-    # Step 9: HuggingFace auth
-    console.print("\n[bold]Step 9: HuggingFace authentication[/bold]")
-    console.print("  [dim]Provisions HF token on remote for bucket access[/dim]")
-
-    if confirm("  Set up HuggingFace auth on remote?", default=True):
-        from .hub import get_local_token
-        hf_token = get_local_token()
-        if hf_token:
-            # Write token to remote file, then login from it (avoids token in process list)
-            hf_cmd = (
-                f"mkdir -p {home_dir}/.cache/huggingface && "
-                f"cat > {home_dir}/.cache/huggingface/token && "
-                f"{path_prefix}cd {repo_path} && source .venv/bin/activate && "
-                f"hf auth login --token $(cat {home_dir}/.cache/huggingface/token) --add-to-git-credential"
-            )
-            console.print("  [dim]Logging in to HuggingFace on remote...[/dim]")
-            # Use exec_command to pipe token via stdin
-            try:
-                client = remote._get_client()
-                stdin, stdout, stderr = client.exec_command(hf_cmd, timeout=30)
-                stdin.write(hf_token)
-                stdin.channel.shutdown_write()
-                exit_status = stdout.channel.recv_exit_status()
-                if exit_status == 0:
-                    console.print("  [green]HuggingFace auth configured[/green]")
-                else:
-                    err = stderr.read().decode('utf-8', errors='replace')
-                    console.print(f"  [yellow]HF login issue: {err}[/yellow]")
-                    console.print("  [dim]You can run 'hf auth login' on the remote manually[/dim]")
-            except Exception as e:
-                console.print(f"  [yellow]HF login issue: {e}[/yellow]")
-                console.print("  [dim]You can run 'hf auth login' on the remote manually[/dim]")
-        else:
-            console.print("  [yellow]No local HF token found at ~/.cache/huggingface/token[/yellow]")
-            console.print("  [dim]Run 'hf auth login' locally first, then re-run setup[/dim]")
-
-    # Step 10: Download speedrun training data
-    console.print("\n[bold]Step 10: Download speedrun training data[/bold]")
-    console.print("  [dim]Will run data/cached_fineweb10B.py to download 24 FineWeb-10B shards (~2.4B tokens)[/dim]")
-
-    if confirm("  Download speedrun data?", default=True):
-        data_cmd = (
-            f"{path_prefix}cd {repo_path} && "
-            f"source .venv/bin/activate && python data/cached_fineweb10B.py 24"
-        )
-        console.print("  [dim]Downloading data (this may take a while)...[/dim]")
-        result = remote.run(data_cmd, timeout=600)  # 10 min timeout for large downloads
-        if result.success:
-            console.print("  [green]Speedrun data downloaded[/green]")
-        else:
-            console.print(f"  [yellow]Data download issue: {result.stderr}[/yellow]")
-            console.print("  [dim]You can run this manually later if needed[/dim]")
-
-    # # Step 11: Download slowrun training data
-    # console.print("\n[bold]Step 11: Download slowrun training data[/bold]")
-    # console.print("  [dim]Will run data/prepare_slowrun_data.py to tokenize 100M train + 10M val tokens[/dim]")
-    #
-    # if confirm("  Download slowrun data?", default=True):
-    #     data_cmd = (
-    #         f"{path_prefix}cd {repo_path} && "
-    #         f"source .venv/bin/activate && python data/prepare_slowrun_data.py"
-    #     )
-    #     console.print("  [dim]Downloading and tokenizing data (this may take a while)...[/dim]")
-    #     result = remote.run(data_cmd, timeout=600)
-    #     if result.success:
-    #         console.print("  [green]Slowrun data prepared[/green]")
-    #     else:
-    #         console.print(f"  [yellow]Data preparation issue: {result.stderr}[/yellow]")
-    #         console.print("  [dim]You can run this manually later if needed[/dim]")
-
-    # # Step 12: Download parameter golf data
-    # console.print("\n[bold]Step 12: Download parameter golf data[/bold]")
-    # console.print("  [dim]Downloads FineWeb sp1024 + sp8192 tokenized shards for parameter golf competition[/dim]")
-    #
-    # if confirm("  Download parameter golf data?", default=False):
-    #     # sp1024 from official repo
-    #     sp1024_cmd = (
-    #         f"{path_prefix}cd {repo_path} && "
-    #         f"source .venv/bin/activate && "
-    #         f"uv pip install -q sentencepiece huggingface-hub && "
-    #         f"python experiments/parameter-golf/cached_challenge_fineweb.py --variant sp1024 --train-shards 80"
-    #     )
-    #     console.print("  [dim]Downloading sp1024 (80 shards, ~8B tokens)...[/dim]")
-    #     result = remote.run(sp1024_cmd, timeout=1800)
-    #     if result.success:
-    #         console.print("  [green]sp1024 data downloaded[/green]")
-    #     else:
-    #         console.print(f"  [yellow]sp1024 download issue: {result.stderr[:200]}[/yellow]")
-    #
-    #     # sp8192 from sproos/parameter-golf-tokenizers
-    #     sp8192_cmd = (
-    #         f"{path_prefix}cd {repo_path} && "
-    #         f"source .venv/bin/activate && "
-    #         f"python -c \""
-    #         f"from huggingface_hub import snapshot_download; "
-    #         f"snapshot_download('sproos/parameter-golf-tokenizers', "
-    #         f"local_dir='experiments/parameter-golf/', "
-    #         f"allow_patterns=['datasets/fineweb10B_sp8192/*', 'tokenizers/fineweb_8192_bpe.*']); "
-    #         f"print('Done')\""
-    #     )
-    #     console.print("  [dim]Downloading sp8192 from sproos/parameter-golf-tokenizers...[/dim]")
-    #     result = remote.run(sp8192_cmd, timeout=1800)
-    #     if result.success:
-    #         console.print("  [green]sp8192 data downloaded[/green]")
-    #     else:
-    #         console.print(f"  [yellow]sp8192 download issue: {result.stderr[:200]}[/yellow]")
-
-    # Step 13: Start remote daemon
-    console.print("\n[bold]Step 13: Start remote daemon[/bold]")
+    # ── Start daemon (1 SSH call) ─────────────────────────────────────────────
+    console.print("\n[bold]Starting daemon...[/bold]")
     with DaemonClient(remote) as daemon:
         if daemon.is_daemon_running():
-            console.print("  [green]Remote daemon already running[/green]")
+            console.print("  [green]daemon: already running[/green]")
         else:
             if daemon.restart_daemon():
-                console.print("  [green]Remote daemon started[/green]")
+                console.print("  [green]daemon: started[/green]")
             else:
-                console.print("  [yellow]Failed to start remote daemon[/yellow]")
-                console.print("  [dim]Run 'nanorun daemon restart' manually[/dim]")
+                failures.append(SetupFailure("daemon", "Failed to start remote daemon"))
+                console.print("  [red]daemon: FAILED to start[/red]")
 
-    console.print("\n[bold green]Setup complete![/bold green]")
+    # ── Summary ───────────────────────────────────────────────────────────────
+    elapsed = time.time() - t0
+    console.print(f"\n[dim]Completed in {elapsed:.1f}s[/dim]")
+
+    if failures:
+        console.print(Panel(
+            "\n".join(f"  [red]✗[/red] [bold]{f.step}[/bold]: {f.detail}" for f in failures),
+            title="[bold red]FAILURES (fix manually)[/bold red]",
+            border_style="red",
+        ))
+    else:
+        console.print("[bold green]Setup complete — no failures.[/bold green]")
 
 
 def verify_setup(remote: RemoteSession) -> bool:
