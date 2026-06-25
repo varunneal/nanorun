@@ -203,10 +203,10 @@ python3 -c "import socket; socket.gethostbyname(socket.gethostname())" 2>/dev/nu
   if dpkg -l git curl tmux rsync build-essential python3-dev 2>/dev/null | grep -c '^ii' | grep -q '^6$'; then
     echo "STATUS:apt:OK:already present"
   else
-    DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get update -qq -o Acquire::Languages=none && \\
+    OUT=$(DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get update -qq -o Acquire::Languages=none 2>&1 && \\
     DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get install -y -qq --no-install-recommends \\
-      git curl tmux rsync build-essential python3-dev 2>/dev/null
-    if [ $? -eq 0 ]; then echo "STATUS:apt:OK:installed"; else echo "STATUS:apt:FAIL:apt-get failed"; fi
+      git curl tmux rsync build-essential python3-dev 2>&1)
+    if [ $? -eq 0 ]; then echo "STATUS:apt:OK:installed"; else echo "STATUS:apt:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
   fi
 ) &
 PID_APT=$!
@@ -216,8 +216,8 @@ PID_APT=$!
   if which uv >/dev/null 2>&1 || $HOME_DIR/.local/bin/uv --version >/dev/null 2>&1; then
     echo "STATUS:uv:OK:already installed"
   else
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1
-    if [ $? -eq 0 ]; then echo "STATUS:uv:OK:installed"; else echo "STATUS:uv:FAIL:install failed"; fi
+    OUT=$(curl -LsSf https://astral.sh/uv/install.sh 2>&1 | sh 2>&1)
+    if [ $? -eq 0 ]; then echo "STATUS:uv:OK:installed"; else echo "STATUS:uv:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"; fi
   fi
 ) &
 PID_UV=$!
@@ -233,8 +233,8 @@ export PATH="$(dirname $UV_BIN):$PATH"
 if [ -f "$REPO/.venv/bin/python" ]; then
   echo "STATUS:venv:OK:already exists"
 else
-  cd $REPO && uv venv --python 3.12 >/dev/null 2>&1
-  if [ $? -eq 0 ]; then echo "STATUS:venv:OK:created"; else echo "STATUS:venv:FAIL:uv venv failed"; fi
+  OUT=$(cd $REPO && uv venv --python 3.12 2>&1)
+  if [ $? -eq 0 ]; then echo "STATUS:venv:OK:created"; else echo "STATUS:venv:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"; fi
 fi
 
 # Wait for apt (needed for build-essential in some pip installs)
@@ -248,16 +248,16 @@ wait $PID_APT
   if [ $? -eq 0 ]; then
     echo "STATUS:torch:OK:already installed"
   else
-    cd $REPO && source .venv/bin/activate && {torch_cmd} 2>&1 | tail -5
-    if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:torch:OK:installed"; else echo "STATUS:torch:FAIL:pip install failed"; fi
+    OUT=$(cd $REPO && source .venv/bin/activate && {torch_cmd} 2>&1)
+    if [ $? -eq 0 ]; then echo "STATUS:torch:OK:installed"; else echo "STATUS:torch:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
   fi
 ) &
 PID_TORCH=$!
 
 # ── deps (background) ──
 (
-  cd $REPO && source .venv/bin/activate && uv pip install {deps} 2>&1 | tail -3
-  if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:deps:OK:installed"; else echo "STATUS:deps:FAIL:pip install failed"; fi
+  OUT=$(cd $REPO && source .venv/bin/activate && uv pip install {deps} 2>&1)
+  if [ $? -eq 0 ]; then echo "STATUS:deps:OK:installed"; else echo "STATUS:deps:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
 ) &
 PID_DEPS=$!
 
@@ -276,8 +276,8 @@ fi
   if [ -f "$REPO/data/fineweb10B/fineweb_train_000024.bin" ]; then
     echo "STATUS:data:OK:already downloaded"
   else
-    cd $REPO && source .venv/bin/activate && HF_XET_HIGH_PERFORMANCE=1 python $REPO/data/cached_fineweb10B.py 24 >/dev/null 2>&1
-    if [ $? -eq 0 ]; then echo "STATUS:data:OK:downloaded 24 shards"; else echo "STATUS:data:FAIL:download failed"; fi
+    OUT=$(cd $REPO && source .venv/bin/activate && HF_XET_HIGH_PERFORMANCE=1 python $REPO/data/cached_fineweb10B.py 24 2>&1)
+    if [ $? -eq 0 ]; then echo "STATUS:data:OK:downloaded 24 shards"; else echo "STATUS:data:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
   fi
 ) &
 PID_DATA=$!
@@ -291,8 +291,8 @@ wait $PID_TORCH
   if [ $? -eq 0 ]; then
     echo "STATUS:flash_attn_3:OK:already installed"
   else
-    cd $REPO && source .venv/bin/activate && {flash_cmd} 2>&1 | tail -3
-    if [ ${{PIPESTATUS[0]}} -eq 0 ]; then echo "STATUS:flash_attn_3:OK:installed"; else echo "STATUS:flash_attn_3:FAIL:pip install failed"; fi
+    OUT=$(cd $REPO && source .venv/bin/activate && {flash_cmd} 2>&1)
+    if [ $? -eq 0 ]; then echo "STATUS:flash_attn_3:OK:installed"; else echo "STATUS:flash_attn_3:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
   fi
 ) &
 PID_FLASH=$!

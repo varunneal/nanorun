@@ -17,11 +17,20 @@ LOCAL_DIR = os.path.join(os.path.dirname(__file__), "dolma_blend_smol")
 
 
 def main():
+    print("Downloading val shards first...")
     snapshot_download(
         repo_id=REPO_ID,
         repo_type="dataset",
         local_dir=LOCAL_DIR,
-        allow_patterns=["*.bin"],
+        allow_patterns=["dolma_val_*.bin"],
+        max_workers=16,
+    )
+    print("Val shards done. Downloading train shards...")
+    snapshot_download(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        local_dir=LOCAL_DIR,
+        allow_patterns=["dolma_train_*.bin"],
         max_workers=16,
     )
     print(f"Done! Files in {LOCAL_DIR}")

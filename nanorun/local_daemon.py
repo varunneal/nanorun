@@ -283,24 +283,40 @@ class HubSyncer:
         if not hasattr(self, '_session_errors_logged'):
             self._session_errors_logged = {}
         sessions = [s.name for s in Config.list_sessions()]
+
+        # Sync all sessions in parallel so one slow/hanging session doesn't block others
+        sync_errors: dict[str, Exception] = {}
+
+        def _sync_one(name):
+            try:
+                self._sync_with_timeout(name)
+            except Exception as e:
+                sync_errors[name] = e
+
+        threads = [threading.Thread(target=_sync_one, args=(s,), daemon=True) for s in sessions]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=self.SYNC_TIMEOUT + 5)
+
+        # Parse metrics and handle errors sequentially
         for session_name in sessions:
             had_error = False
-            try:
-                self._sync_with_timeout(session_name)
-            except TimeoutError:
-                self._log_session_error(
-                    session_name,
-                    f"[hub] Sync timed out for {session_name}",
-                    exc_info=True,
-                )
-                continue
-            except Exception as e:
+            if session_name in sync_errors:
+                e = sync_errors[session_name]
                 had_error = True
-                self._log_session_error(
-                    session_name,
-                    f"[hub] Sync failed for {session_name}: {e}",
-                    exc_info=True,
-                )
+                if isinstance(e, TimeoutError):
+                    self._log_session_error(
+                        session_name,
+                        f"[hub] Sync timed out for {session_name}",
+                        exc_info=True,
+                    )
+                else:
+                    self._log_session_error(
+                        session_name,
+                        f"[hub] Sync failed for {session_name}: {e}",
+                        exc_info=True,
+                    )
 
             try:
                 self._parse_metrics_for_session(session_name)
@@ -325,13 +341,15 @@ class HubSyncer:
             self._parse_iris_metrics(session_name)
         else:
             # For SSH sessions: parse metrics here if the session tracker is dead
+            # OR alive but disconnected (it only parses while in the event loop).
             tracker = self.daemon.trackers.get(session_name)
-            tracker_alive = (
+            tracker_connected = (
                 isinstance(tracker, SessionTracker)
                 and tracker._thread is not None
                 and tracker._thread.is_alive()
+                and tracker.state.status == "connected"
             )
-            if not tracker_alive:
+            if not tracker_connected:
                 self._parse_ssh_metrics(session_name)
 
     def _parse_ssh_metrics(self, session_name: str):
@@ -594,9 +612,31 @@ class SessionTracker:
         except Exception:
             pass
 
+    def _adopt_running_experiment(self):
+        """If state.json lost tracking info but the DB still has a running experiment
+        for this session, adopt it so _finalize_dead_session can mark it failed."""
+        if self.current_experiment_id:
+            return
+        try:
+            conn = get_db()
+            row = conn.execute(
+                "SELECT id, remote_run_id FROM experiments "
+                "WHERE status = 'running' AND session_name = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (self.session_name,),
+            ).fetchone()
+            conn.close()
+            if row:
+                self.current_experiment_id = row["id"]
+                self.current_run_id = row["remote_run_id"]
+                self.event(f"Adopted running experiment {row['id']} from DB")
+        except Exception as e:
+            log.warning(f"[{self.session_name}] Failed to adopt running experiment: {e}")
+
     def _session_loop(self):
         log.info(f"[{self.session_name}] Tracker starting")
         self.event("Session tracker starting")
+        self._adopt_running_experiment()
         backoff = self.RECONNECT_BASE_DELAY
         while self.running:
             try:

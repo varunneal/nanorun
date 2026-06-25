@@ -584,8 +584,15 @@ class _IrisBackend:
                 if wandb_run_id in self._finalized_jobs:
                     continue
 
+                # Permanently skip: terminal + we already have the final datapoint
                 if local_status in ("completed", "failed", "cancelled") and row["has_final_metric"]:
                     self._finalized_jobs.add(wandb_run_id)
+                    continue
+
+                # Soft skip: terminal without final metric — don't hit W&B, but
+                # don't add to _finalized_jobs so we re-check if status changes back
+                effective_status = (iris_status if iris_job_id else "") or local_status
+                if effective_status in ("completed", "failed", "cancelled"):
                     continue
 
                 local_path = local_logs_dir / f"{wandb_run_id}.txt"
