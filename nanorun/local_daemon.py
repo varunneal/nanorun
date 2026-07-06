@@ -121,6 +121,68 @@ def _append_queue_history(session_name: str, ts: str, queue_items: list):
         f.write(entry + "\n")
 
 
+# Guards every write to queue_cache.json so the SessionTracker (event/STATUS
+# fast-path) and the HubSyncer (hub-snapshot reconcile) can't clobber each other.
+_queue_cache_lock = threading.Lock()
+
+
+def _queue_ts_should_overwrite(new_ts, old_ts) -> bool:
+    """Precedence test: True if a write stamped `new_ts` should overwrite a cache
+    stamped `old_ts`. The skip condition is `old_ts >= new_ts`, so a duplicate
+    same-ts write is a harmless no-op (an event and its hub snapshot line carry
+    the same remote ts). On parse failure fall back to lexicographic compare; if
+    that is ambiguous, favor freshness (write)."""
+    if not old_ts:
+        return True
+    try:
+        return datetime.fromisoformat(new_ts) > datetime.fromisoformat(old_ts)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return new_ts > old_ts  # lexicographic fallback (ISO8601 sorts by time)
+    except TypeError:
+        return True  # ambiguous — favor freshness
+
+
+def _write_queue_cache_with_precedence(session_name, ts, queue_items, connected=None):
+    """Write queue_cache.json under the newest-ts-wins precedence rule.
+
+    Two threads write this file: the SessionTracker (event / STATUS fast-path,
+    passes connected=True) and the HubSyncer (hub-snapshot reconcile, passes
+    connected=None to preserve). Both stamp `synced_at` with a remote-clock ts so
+    they're directly comparable; the newer ts wins.
+    """
+    with _queue_cache_lock:
+        path = get_queue_cache_file(session_name)
+        existing = safe_json_load(path, default=None)
+        old_ts = existing.get("synced_at") if isinstance(existing, dict) else None
+        overwrite = _queue_ts_should_overwrite(ts, old_ts)
+
+        if connected is not None:
+            resolved_connected = connected
+        elif isinstance(existing, dict):
+            resolved_connected = existing.get("connected", True)
+        else:
+            resolved_connected = True
+
+        if overwrite:
+            data = {"synced_at": ts, "queue": queue_items, "connected": resolved_connected}
+        else:
+            # Stale queue write: preserve existing queue/synced_at. Still apply an
+            # explicit connected flag if it changed; otherwise nothing to do.
+            if not isinstance(existing, dict):
+                return
+            if connected is None or existing.get("connected") == connected:
+                return
+            data = dict(existing)
+            data["connected"] = connected
+
+        try:
+            path.write_text(json.dumps(data, indent=2))
+        except OSError:
+            pass
+
+
 # Track file offsets for hub-syncer mappings ingestion (keyed by session_name -> {filename: offset})
 _hub_mappings_offsets: Dict[str, Dict[str, int]] = {}
 
@@ -202,6 +264,50 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
                     update_experiment_status(exp_id, remote_status)
             if mapping.get("run_id") and not existing.remote_run_id:
                 update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
+
+
+def _ingest_queue_for_session(session_name: str):
+    """Reconcile queue_cache.json from the hub-synced queue snapshot stream.
+
+    Mirrors _ingest_mappings_for_session: SSH-independent, runs every hub cycle.
+    Latest queue state = the LAST non-empty line of the HIGHEST-index queue
+    segment. Reading the tail each cycle is fine (segments are <=500 small lines)
+    and idempotent — the precedence writer discards stale writes — so no offset
+    tracking is needed.
+    """
+    session_logs = PATHS.logs_dir / session_name
+    queue_dir = session_logs / "queue"
+    if not queue_dir.exists():
+        return
+
+    # Walk segments from highest index down; take the last non-empty line of the
+    # newest segment. If the newest segment is empty, fall back to the previous.
+    last_line = None
+    for path in sorted(queue_dir.glob("queue-*.jsonl"), reverse=True):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if line.strip():
+                last_line = line
+                break
+        if last_line is not None:
+            break
+    if last_line is None:
+        return
+
+    try:
+        snapshot = json.loads(last_line)
+    except json.JSONDecodeError:
+        return
+    ts = snapshot.get("ts")
+    if not ts:
+        # No ordering key: skip rather than clobber a fresh event write with an
+        # unorderable snapshot (contract: prefer skipping to a local-now stamp).
+        return
+    queue = snapshot.get("queue", [])
+    _write_queue_cache_with_precedence(session_name, ts, queue, connected=None)
 
 
 def _sync_all_logs(session_name: str):
@@ -317,6 +423,19 @@ class HubSyncer:
                         f"[hub] Sync failed for {session_name}: {e}",
                         exc_info=True,
                     )
+
+            # SSH-independent queue reconcile — must run for EVERY session, whether
+            # or not its SessionTracker is alive. Isolated so a failure here can't
+            # abort the loop or the metrics parse below.
+            try:
+                _ingest_queue_for_session(session_name)
+            except Exception as e:
+                had_error = True
+                self._log_session_error(
+                    session_name,
+                    f"[hub] Queue ingest failed for {session_name}: {e}",
+                    exc_info=True,
+                )
 
             try:
                 self._parse_metrics_for_session(session_name)
@@ -783,7 +902,7 @@ class SessionTracker:
         elif ev.event == Event.EXPERIMENT_RUN_ID:
             self._on_run_id(data)
         elif ev.event == Event.QUEUE_CHANGED:
-            self._sync_queue_cache(data.get("queue", []))
+            self._sync_queue_cache(data.get("queue", []), ts=data.get("ts"))
         elif ev.event == Event.HUB_SYNC_FAILED:
             self.event(f"WARNING: Hub log sync failing on remote — run 'nanorun daemon restart --session {self.session_name}' to fix")
         self.state.save(self.session_name)
@@ -894,7 +1013,7 @@ class SessionTracker:
                 status.get("current_experiment_id"), status.get("current_run_id"),
             )
             if status.get("queue") is not None:
-                self._sync_queue_cache(status["queue"])
+                self._sync_queue_cache(status["queue"], ts=status.get("ts"))
             # Mappings + metrics are synced by the 3s _sync_logs_and_metrics loop
             self.event("Initial sync: connected")
             self.state.save(self.session_name)
@@ -920,14 +1039,19 @@ class SessionTracker:
 
     def _set_cache_connected(self, connected: bool):
         """Flip the queue cache's connected flag in place, preserving the
-        last-known queue and its synced_at so the data stays stale-but-honest."""
-        path = PATHS.queue_cache_file(self.session_name)
-        data = safe_json_load(path, default=None) or {"synced_at": None, "queue": []}
-        data["connected"] = connected
-        try:
-            path.write_text(json.dumps(data, indent=2))
-        except OSError:
-            pass
+        last-known queue and its synced_at so the data stays stale-but-honest.
+
+        Guarded by the module-level queue-cache lock so it can't race the
+        precedence writer. Inlines its own read-modify-write — it must NOT call
+        the precedence helper while holding the lock (that would deadlock)."""
+        with _queue_cache_lock:
+            path = PATHS.queue_cache_file(self.session_name)
+            data = safe_json_load(path, default=None) or {"synced_at": None, "queue": []}
+            data["connected"] = connected
+            try:
+                path.write_text(json.dumps(data, indent=2))
+            except OSError:
+                pass
 
     def _finalize_dead_session(self, outage: float):
         """The machine has been unreachable past the grace window — presume it's
@@ -1080,16 +1204,15 @@ class SessionTracker:
                 if mapping.get("run_id") and not existing.remote_run_id:
                     update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
 
-    def _sync_queue_cache(self, queue_items: list):
+    def _sync_queue_cache(self, queue_items, ts=None):
+        # Dedup on queue CONTENT only (not ts): a byte-identical queue is a no-op.
         queue_key = json.dumps(queue_items, sort_keys=True)
         if self._last_queue_key == queue_key:
             return
         self._last_queue_key = queue_key
-        now = datetime.now(timezone.utc).isoformat()
-        PATHS.queue_cache_file(self.session_name).write_text(json.dumps({
-            "synced_at": now, "queue": queue_items, "connected": True,
-        }, indent=2))
-        _append_queue_history(self.session_name, now, queue_items)
+        ts = ts or datetime.now(timezone.utc).isoformat()
+        _write_queue_cache_with_precedence(self.session_name, ts, queue_items, connected=True)
+        _append_queue_history(self.session_name, ts, queue_items)
 
     # --- experiment helpers ---
 

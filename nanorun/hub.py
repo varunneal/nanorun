@@ -79,7 +79,7 @@ class _HfBackend:
         self._sync_bucket(
             str(local_logs_dir),
             f"{self.bucket_handle}/logs/{session}",
-            include=["*.txt", "*.jsonl", "mappings/*.jsonl"],
+            include=["*.txt", "*.jsonl", "mappings/*.jsonl", "queue/*.jsonl"],
             quiet=True,
         )
 
@@ -88,7 +88,7 @@ class _HfBackend:
         self._sync_bucket(
             f"{self.bucket_handle}/logs/{session}",
             str(local_logs_dir),
-            include=include or ["*.txt", "*.jsonl", "mappings/*.jsonl"],
+            include=include or ["*.txt", "*.jsonl", "mappings/*.jsonl", "queue/*.jsonl"],
             quiet=True,
         )
 

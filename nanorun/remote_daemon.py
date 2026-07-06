@@ -46,6 +46,7 @@ STATE_FILE = DAEMON_DIR / "state.json"
 PID_FILE = DAEMON_DIR / "daemon.pid"
 LOGS_DIR = REPO_DIR / "logs"
 MAPPINGS_LOG_DIR = LOGS_DIR / "mappings"
+QUEUE_LOG_DIR = LOGS_DIR / "queue"
 
 TMUX_SESSION = "nanorun"
 HUB_SYNC_INTERVAL_S = 15
@@ -56,6 +57,7 @@ GIT_HASH_LENGTH = 12
 TMUX_WINDOW_NAME_MAX = 40
 LOG_TAIL_BYTES = 50_000
 MAPPINGS_SEGMENT_LINES = 500
+QUEUE_SEGMENT_LINES = 500
 
 RUN_ID_PATTERN = re.compile(
     r"logs/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\.txt"
@@ -65,6 +67,7 @@ PARENT_FIELD_PATTERN = re.compile(r"parent:\s*(.+?)(?:\n|$)")
 KERNELS_FIELD_PATTERN = re.compile(r"kernels:\s*(.+?)(?:\n|$)")
 STEP_PATTERN = re.compile(r"^step:(\d+)/(\d+)", re.MULTILINE)
 SEGMENT_FILE_PATTERN = re.compile(r"^mappings-(\d{6})\.jsonl$")
+QUEUE_SEGMENT_FILE_PATTERN = re.compile(r"^queue-(\d{6})\.jsonl$")
 
 
 class _MappingsSegmentWriter:
@@ -113,6 +116,54 @@ class _MappingsSegmentWriter:
 
 
 _mappings_writer = _MappingsSegmentWriter()
+
+
+class _QueueSegmentWriter:
+    """Appends queue snapshot lines to segmented JSONL files.
+
+    Each segment holds up to QUEUE_SEGMENT_LINES lines; once full we roll
+    forward to the next index. Sealed segments are never touched again, which
+    keeps xet happy (hub bulk sync doesn't have to re-upload a growing tail).
+    """
+
+    def __init__(self):
+        self._idx = 0
+        self._lines = 0
+        self._initialized = False
+
+    def _initialize(self):
+        QUEUE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        max_idx = -1
+        for entry in QUEUE_LOG_DIR.iterdir():
+            m = QUEUE_SEGMENT_FILE_PATTERN.match(entry.name)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+        if max_idx < 0:
+            self._idx = 0
+            self._lines = 0
+        else:
+            self._idx = max_idx
+            top = QUEUE_LOG_DIR / f"queue-{self._idx:06d}.jsonl"
+            with open(top, "rb") as f:
+                self._lines = sum(1 for _ in f)
+            if self._lines >= QUEUE_SEGMENT_LINES:
+                self._idx += 1
+                self._lines = 0
+        self._initialized = True
+
+    def append(self, line: str):
+        if not self._initialized:
+            self._initialize()
+        path = QUEUE_LOG_DIR / f"queue-{self._idx:06d}.jsonl"
+        with open(path, "a") as f:
+            f.write(line if line.endswith("\n") else line + "\n")
+        self._lines += 1
+        if self._lines >= QUEUE_SEGMENT_LINES:
+            self._idx += 1
+            self._lines = 0
+
+
+_queue_writer = _QueueSegmentWriter()
 
 
 @dataclass
@@ -198,7 +249,7 @@ class NanorunDaemon:
         self._ws_clients: Set = set()
         self._uploaded_weights: Set[str] = set()
         self._startup_time = time.monotonic()
-        for d in [DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, LOGS_DIR, MAPPINGS_LOG_DIR]:
+        for d in [DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, LOGS_DIR, MAPPINGS_LOG_DIR, QUEUE_LOG_DIR]:
             d.mkdir(parents=True, exist_ok=True)
         # Recover from stale "running" state (daemon was killed mid-experiment)
         if self.state.status == "running":
@@ -217,6 +268,9 @@ class NanorunDaemon:
                 self.state.current_window = None
                 self.state.current_run_id = None
                 self.state.save()
+        # Publish current queue snapshot once at startup (so a freshly started
+        # daemon's queue lands on the hub even before the first change).
+        self._emit_queue_changed()
 
     # --- events ---
 
@@ -224,7 +278,10 @@ class NanorunDaemon:
         self._pending_events.append(EventMessage(event=event, data=data))
 
     def _emit_queue_changed(self):
-        self._emit(Event.QUEUE_CHANGED, queue=[asdict(item) for item in self.read_queue()])
+        ts = datetime.now(timezone.utc).isoformat()
+        queue = [asdict(item) for item in self.read_queue()]
+        _queue_writer.append(json.dumps({"ts": ts, "queue": queue}))
+        self._emit(Event.QUEUE_CHANGED, queue=queue, ts=ts)
 
     async def _flush_events(self):
         if not self._pending_events or not self._ws_clients:
@@ -729,7 +786,8 @@ class NanorunDaemon:
             current_window=self.state.current_window,
             current_run_id=self.state.current_run_id,
             queue_length=len(queue), queue=[asdict(item) for item in queue],
-            gpu_processes=self.get_gpu_processes())
+            gpu_processes=self.get_gpu_processes(),
+            ts=datetime.now(timezone.utc).isoformat())
 
     def _rpc_gpu_processes(self, params, rid):
         return Response.ok(rid, gpu_processes=self.get_gpu_processes())
@@ -955,9 +1013,21 @@ class NanorunDaemon:
 
 def main():
     parser = argparse.ArgumentParser(description="nanorun remote daemon")
-    parser.add_argument("--session", default="default")
+    parser.add_argument("--session", default=None)
     args = parser.parse_args()
-    asyncio.run(NanorunDaemon(session_name=args.session).run_async())
+    session_name = args.session
+    if not session_name:
+        state_file = DAEMON_DIR / "state.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+                session_name = state.get("session_name")
+            except (json.JSONDecodeError, OSError):
+                pass
+    if not session_name:
+        print("ERROR: --session is required (no previous session found in .daemon/state.json)")
+        sys.exit(1)
+    asyncio.run(NanorunDaemon(session_name=session_name).run_async())
 
 
 if __name__ == "__main__":
