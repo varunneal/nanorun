@@ -50,6 +50,7 @@ QUEUE_LOG_DIR = LOGS_DIR / "queue"
 
 TMUX_SESSION = "nanorun"
 HUB_SYNC_INTERVAL_S = 15
+QUEUE_PUSH_DEBOUNCE_S = 0.3  # coalesce bursts of queue changes into one event-driven push
 EXPERIMENT_POLL_INTERVAL_S = 2
 WEIGHT_STALENESS_S = 3
 CODE_HASH_LENGTH = 12
@@ -249,6 +250,10 @@ class NanorunDaemon:
         self._ws_clients: Set = set()
         self._uploaded_weights: Set[str] = set()
         self._startup_time = time.monotonic()
+        # Event-driven queue push: _emit_queue_changed sets this, _queue_push_task
+        # drains it (debounced) and uploads just the queue segment to the hub.
+        self._queue_dirty = asyncio.Event()
+        self._queue_push_failures = 0
         for d in [DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, LOGS_DIR, MAPPINGS_LOG_DIR, QUEUE_LOG_DIR]:
             d.mkdir(parents=True, exist_ok=True)
         # Recover from stale "running" state (daemon was killed mid-experiment)
@@ -282,6 +287,10 @@ class NanorunDaemon:
         queue = [asdict(item) for item in self.read_queue()]
         _queue_writer.append(json.dumps({"ts": ts, "queue": queue}))
         self._emit(Event.QUEUE_CHANGED, queue=queue, ts=ts)
+        # Wake the event-driven hub push so the snapshot reaches the hub in ~1s
+        # instead of waiting for the 15s bulk sync. All callers run on the event
+        # loop (or pre-loop in __init__), so a direct .set() is safe.
+        self._queue_dirty.set()
 
     async def _flush_events(self):
         if not self._pending_events or not self._ws_clients:
@@ -972,6 +981,47 @@ class NanorunDaemon:
                 print(f"[hub] Sync task error: {e}", file=sys.stderr)
             await asyncio.sleep(HUB_SYNC_INTERVAL_S)
 
+    async def _hub_push_queue(self):
+        # Event-driven queue-only upload. Mirrors _hub_sync_logs (fresh subprocess to
+        # dodge hf_xet in-process wedging) but scoped to queue/*.jsonl and with a short
+        # timeout since the payload is tiny. Passes LOGS_DIR (not QUEUE_LOG_DIR) so the
+        # queue/ path component is preserved in the remote key. Does NOT emit
+        # HUB_SYNC_FAILED — the 15s bulk sync remains the canonical health signal, so a
+        # failure here (while the bulk path still works) is only logged.
+        if not HUB_AVAILABLE:
+            return
+        cmd = [
+            sys.executable, "-u", "-c",
+            "from pathlib import Path; from nanorun import hub; "
+            f"hub.sync_queue_up(Path({str(LOGS_DIR)!r}), {self.session_name!r})",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                err_text = stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"subprocess exit {proc.returncode}: {err_text}")
+            self._queue_push_failures = 0
+        except Exception as e:
+            self._queue_push_failures += 1
+            print(f"[hub] Queue push failed ({type(e).__name__}): {e}", file=sys.stderr)
+
+    async def _queue_push_task(self):
+        # Drains _queue_dirty (set by _emit_queue_changed) and pushes the queue snapshot
+        # to the hub. Debounce coalesces bursts (e.g. a sweep add): we always upload the
+        # whole current segment file (latest state) and clear the flag before uploading,
+        # so no change is lost — a set arriving during the upload just triggers one more
+        # idempotent push next iteration.
+        if not HUB_AVAILABLE:
+            return
+        while self.running:
+            await self._queue_dirty.wait()
+            await asyncio.sleep(QUEUE_PUSH_DEBOUNCE_S)
+            self._queue_dirty.clear()
+            await self._hub_push_queue()
+
     # --- main ---
 
     async def run_async(self):
@@ -998,6 +1048,7 @@ class NanorunDaemon:
             tasks = [
                 asyncio.create_task(self._experiment_monitor_task()),
                 asyncio.create_task(self._hub_sync_task()),
+                asyncio.create_task(self._queue_push_task()),
             ]
             while self.running:
                 await asyncio.sleep(0.5)

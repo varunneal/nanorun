@@ -83,6 +83,17 @@ class _HfBackend:
             quiet=True,
         )
 
+    def sync_queue_up(self, local_logs_dir: Path, session: str) -> None:
+        # Scoped upload of just the queue snapshot segments (event-driven fast path).
+        # Same root/target as sync_logs_up so the remote layout matches; the narrower
+        # include means only the queue subtree is diffed.
+        self._sync_bucket(
+            str(local_logs_dir),
+            f"{self.bucket_handle}/logs/{session}",
+            include=["queue/*.jsonl"],
+            quiet=True,
+        )
+
     def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
         local_logs_dir.mkdir(parents=True, exist_ok=True)
         self._sync_bucket(
@@ -211,6 +222,28 @@ class _S3Backend:
                 pass
             self._s3.upload_file(str(path), self.bucket_name, key)
 
+    def sync_queue_up(self, local_logs_dir: Path, session: str) -> None:
+        # Scoped variant of sync_logs_up: walk only the queue/ subdir but keep the key
+        # rooted at local_logs_dir so the queue/ path component is preserved remotely.
+        queue_dir = local_logs_dir / "queue"
+        if not queue_dir.exists():
+            return
+        prefix = self._key("logs", session)
+        for path in queue_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix != ".jsonl":
+                continue
+            key = f"{prefix}/{path.relative_to(local_logs_dir)}"
+            local_size = path.stat().st_size
+            try:
+                resp = self._s3.head_object(Bucket=self.bucket_name, Key=key)
+                if resp["ContentLength"] == local_size:
+                    continue
+            except self._s3.exceptions.ClientError:
+                pass
+            self._s3.upload_file(str(path), self.bucket_name, key)
+
     def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
         """Incremental download using Range GETs — only fetches new bytes for growing files."""
         local_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +351,35 @@ class _LocalBackend:
             if not src.is_file():
                 continue
             if src.suffix not in (".txt", ".jsonl"):
+                continue
+            rel = src.relative_to(local_logs_dir)
+            dst = dst_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src_size = src.stat().st_size
+            dst_size = dst.stat().st_size if dst.exists() else 0
+            if dst_size >= src_size:
+                continue
+            if dst_size == 0:
+                self._shutil.copy2(src, dst)
+            else:
+                with open(src, "rb") as sf:
+                    sf.seek(dst_size)
+                    new_bytes = sf.read()
+                with open(dst, "ab") as df:
+                    df.write(new_bytes)
+
+    def sync_queue_up(self, local_logs_dir: Path, session: str) -> None:
+        # Scoped variant of sync_logs_up: walk only the queue/ subdir, keeping rel rooted
+        # at local_logs_dir so the queue/ path component is preserved at the destination.
+        queue_dir = local_logs_dir / "queue"
+        if not queue_dir.exists():
+            return
+        dst_dir = self._dir("logs", session)
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for src in queue_dir.rglob("*"):
+            if not src.is_file():
+                continue
+            if src.suffix != ".jsonl":
                 continue
             rel = src.relative_to(local_logs_dir)
             dst = dst_dir / rel
@@ -743,6 +805,9 @@ class _IrisBackend:
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         pass
 
+    def sync_queue_up(self, local_logs_dir: Path, session: str) -> None:
+        pass
+
     def list_logs(self, session: str) -> List[str]:
         jobs = self.list_jobs()
         return [_iris_job_id_to_filename(j["name"]) for j in jobs if j.get("name")]
@@ -817,6 +882,10 @@ def get_bucket_info():
 
 def sync_logs_up(local_logs_dir: Path, session: str) -> None:
     _get_backend_instance().sync_logs_up(local_logs_dir, session)
+
+
+def sync_queue_up(local_logs_dir: Path, session: str) -> None:
+    _get_backend_instance().sync_queue_up(local_logs_dir, session)
 
 
 def sync_logs_down(local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
