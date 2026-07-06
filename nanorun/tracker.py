@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,15 +23,14 @@ def get_db_path() -> Path:
     return config_dir / "experiments.db"
 
 
-_schema_initialized = False
-
-
 def _init_schema(conn: sqlite3.Connection) -> None:
-    """Create tables and run migrations. Called once per process."""
-    global _schema_initialized
-    if _schema_initialized:
-        return
+    """Create tables and run migrations.
 
+    Called once per connection (connections are now persistent per-thread, so
+    this runs rarely). Every statement is idempotent — CREATE ... IF NOT EXISTS,
+    ALTER only when a column is missing — so running it on an already-migrated
+    DB is a cheap no-op.
+    """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS experiments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +47,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             tmux_window TEXT,
             remote_run_id TEXT,
             status TEXT DEFAULT 'running',
-            crash_log TEXT,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             finished_at TIMESTAMP
         );
@@ -66,20 +65,29 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(experiment_id, step)
         );
 
+        -- crash_log lives in its own table so the experiments table stays small
+        -- (crash blobs are ~30KB each and were bloating every list query).
+        CREATE TABLE IF NOT EXISTS crash_logs (
+            experiment_id INTEGER PRIMARY KEY REFERENCES experiments(id),
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_metrics_experiment ON metrics(experiment_id);
         CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
         CREATE INDEX IF NOT EXISTS idx_experiments_track ON experiments(track);
     """)
     conn.commit()
 
-    # Migration: add new columns if they don't exist (for existing DBs)
+    # Migration: add new columns if they don't exist (for existing DBs).
+    # NOTE: crash_log is intentionally NOT here — it's been extracted to the
+    # crash_logs table (see below); re-adding it would just recreate the bloat.
     cursor = conn.execute("PRAGMA table_info(experiments)")
     columns = [row[1] for row in cursor.fetchall()]
     migrations = {
         "code_hash": "TEXT",
         "parent_hash": "TEXT",
         "remote_run_id": "TEXT",
-        "crash_log": "TEXT",
         "deleted": "INTEGER DEFAULT 0",
         "gpu_type": "TEXT DEFAULT 'H100'",
         "kernels_path": "TEXT",
@@ -100,17 +108,66 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE metrics ADD COLUMN {col} {col_type}")
     conn.commit()
 
-    _schema_initialized = True
+    # NOTE: moving the legacy inlined crash_log data into crash_logs and dropping
+    # the column is a HEAVY, one-time operation (full-table rewrite + VACUUM on a
+    # ~250MB DB) that takes an exclusive write lock. We deliberately do NOT run it
+    # here — that would fire opportunistically on the next connection and could
+    # collide with live metric writes. Run it explicitly in a quiet window via
+    # migrate_crash_logs_out() (see scripts/migrate_crash_logs.py). Until then,
+    # get_crash_log() falls back to the legacy column so old logs stay visible.
+
+
+# Persistent per-thread connections. Each thread (session tracker, hub syncer,
+# dashboard worker, CLI process) keeps one long-lived connection rather than
+# opening/closing one per call — this eliminates the WAL cycling + fsync churn
+# that per-call connections caused (dozens of open/close per metric line).
+_local = threading.local()
 
 
 def get_db() -> sqlite3.Connection:
-    """Get database connection, initializing schema if needed."""
+    """Get the calling thread's persistent database connection.
+
+    The connection is cached in thread-local storage and reused for the life of
+    the thread. WAL mode + one connection per thread is SQLite's recommended
+    concurrency pattern (many readers, one writer, serialized by busy_timeout).
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except sqlite3.Error:
+            # Connection was closed (e.g. by close_db, or a caller's conn.close());
+            # fall through and recreate.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _local.conn = None
+
     db_path = get_db_path()
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     _init_schema(conn)
+    _local.conn = conn
     return conn
+
+
+def close_db() -> None:
+    """Close and drop the calling thread's cached connection.
+
+    Called from daemon/thread shutdown paths for a clean final WAL checkpoint,
+    and from tests to reset connection state between temp databases.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
 
 
 @dataclass
@@ -154,7 +211,10 @@ class Experiment:
             tmux_window=row["tmux_window"],
             remote_run_id=row["remote_run_id"] if "remote_run_id" in keys else None,
             status=row["status"],
-            crash_log=row["crash_log"] if "crash_log" in keys else None,
+            # crash_log now lives in the crash_logs table; fetch on demand via
+            # get_crash_log(). Kept on the dataclass for backwards compatibility,
+            # always None here so list queries never load crash blobs.
+            crash_log=None,
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
             kernels_path=row["kernels_path"] if "kernels_path" in keys else None,
@@ -227,7 +287,6 @@ def create_experiment(
     )
     conn.commit()
     exp_id = cursor.lastrowid
-    conn.close()
     return exp_id
 
 
@@ -278,7 +337,6 @@ def record_metric(
     total_changes_after = conn.execute("SELECT total_changes()").fetchone()[0]
     changed = total_changes_after > total_changes_before
     conn.commit()
-    conn.close()
     return changed
 
 
@@ -302,7 +360,6 @@ def update_experiment_status(experiment_id: int, status: str) -> None:
             (status, experiment_id)
         )
     conn.commit()
-    conn.close()
 
 
 def update_experiment_metadata(
@@ -310,7 +367,6 @@ def update_experiment_metadata(
     code_hash: Optional[str] = None,
     tmux_window: Optional[str] = None,
     remote_run_id: Optional[str] = None,
-    crash_log: Optional[str] = None,
     started_at: Optional[str] = None,
     git_commit: Optional[str] = None,
     parent_hash: Optional[str] = None,
@@ -320,6 +376,7 @@ def update_experiment_metadata(
     """Update experiment metadata.
 
     Used to update fields that are set by the daemon after experiment creation.
+    (crash_log is stored separately — use set_crash_log().)
     """
     conn = get_db()
     updates = []
@@ -334,9 +391,6 @@ def update_experiment_metadata(
     if remote_run_id is not None:
         updates.append("remote_run_id = ?")
         params.append(remote_run_id)
-    if crash_log is not None:
-        updates.append("crash_log = ?")
-        params.append(crash_log)
     if started_at is not None:
         updates.append("started_at = ?")
         params.append(started_at)
@@ -358,14 +412,103 @@ def update_experiment_metadata(
         query = f"UPDATE experiments SET {', '.join(updates)} WHERE id = ?"
         conn.execute(query, params)
         conn.commit()
-    conn.close()
+
+
+def set_crash_log(experiment_id: int, content: str) -> None:
+    """Store (or replace) the crash/output log for an experiment."""
+    if content is None:
+        return
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO crash_logs (experiment_id, content) VALUES (?, ?) "
+        "ON CONFLICT(experiment_id) DO UPDATE SET content = excluded.content",
+        (experiment_id, content),
+    )
+    conn.commit()
+
+
+def get_crash_log(experiment_id: int) -> Optional[str]:
+    """Fetch the crash/output log for an experiment, or None if not stored.
+
+    Reads the crash_logs table first. For DBs where the one-time extraction
+    (migrate_crash_logs_out) hasn't run yet, falls back to the legacy inlined
+    experiments.crash_log column so historical logs remain visible. The fallback
+    self-heals once the column is dropped (the SELECT raises and we return None).
+    """
+    conn = get_db()
+    row = conn.execute(
+        "SELECT content FROM crash_logs WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if row:
+        return row["content"]
+    try:
+        legacy = conn.execute(
+            "SELECT crash_log FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # column already dropped by migrate_crash_logs_out()
+    return legacy["crash_log"] if legacy and legacy["crash_log"] else None
+
+
+def migrate_crash_logs_out(vacuum: bool = True) -> Dict[str, object]:
+    """Move legacy inlined crash_log blobs into crash_logs and drop the column.
+
+    HEAVY one-time operation: rewrites the whole experiments table under an
+    exclusive write lock, then (optionally) VACUUMs to reclaim file space. Run
+    it only when the daemon is stopped / no experiments are writing. Idempotent
+    and crash-safe: the backfill is INSERT OR IGNORE (never loses data) and the
+    DROP is transactional (an interrupt rolls back cleanly), so re-running after
+    an interruption finishes the job.
+
+    Returns a stats dict: {done, migrated, dropped, already_migrated}.
+
+    If the column is already gone (e.g. a prior migration ran without VACUUM),
+    VACUUM still runs when requested so a bloated file gets reclaimed.
+    """
+    conn = get_db()
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(experiments)")]
+    already_migrated = "crash_log" not in columns
+
+    migrated = 0
+    dropped = False
+    if not already_migrated:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO crash_logs (experiment_id, content) "
+            "SELECT id, crash_log FROM experiments WHERE crash_log IS NOT NULL"
+        )
+        migrated = cur.rowcount
+        conn.commit()
+
+        dropped = True
+        try:
+            conn.execute("ALTER TABLE experiments DROP COLUMN crash_log")
+        except sqlite3.OperationalError:
+            # SQLite < 3.35 has no DROP COLUMN — free the blobs in place instead so
+            # a VACUUM can still reclaim the space (column stays but empty).
+            conn.execute("UPDATE experiments SET crash_log = NULL WHERE crash_log IS NOT NULL")
+            dropped = False
+        conn.commit()
+
+    if vacuum:
+        # VACUUM cannot run inside a transaction; commits above leave us idle.
+        # Runs even when already_migrated so a prior no-VACUUM drop is reclaimed.
+        conn.execute("VACUUM")
+        conn.commit()
+
+    return {
+        "done": True,
+        "already_migrated": already_migrated,
+        "migrated": migrated,
+        "dropped": dropped,
+    }
 
 
 def get_experiment(experiment_id: int) -> Optional[Experiment]:
     """Get an experiment by ID."""
     conn = get_db()
     row = conn.execute("SELECT * FROM experiments WHERE id = ?", (experiment_id,)).fetchone()
-    conn.close()
     return Experiment.from_row(row) if row else None
 
 
@@ -374,7 +517,6 @@ def delete_experiment(experiment_id: int) -> None:
     conn = get_db()
     conn.execute("UPDATE experiments SET deleted = 1 WHERE id = ?", (experiment_id,))
     conn.commit()
-    conn.close()
 
 
 def get_experiment_by_window(tmux_window: str) -> Optional[Experiment]:
@@ -384,7 +526,6 @@ def get_experiment_by_window(tmux_window: str) -> Optional[Experiment]:
         "SELECT * FROM experiments WHERE tmux_window = ? ORDER BY started_at DESC LIMIT 1",
         (tmux_window,)
     ).fetchone()
-    conn.close()
     return Experiment.from_row(row) if row else None
 
 
@@ -398,7 +539,6 @@ def get_running_experiments(session_name: Optional[str] = None) -> List[Experime
         params.append(session_name)
     query += " ORDER BY started_at DESC"
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     return [Experiment.from_row(row) for row in rows]
 
 
@@ -410,7 +550,6 @@ def get_experiments_by_status(statuses: List[str]) -> List[Experiment]:
         f"SELECT * FROM experiments WHERE status IN ({placeholders}) AND (deleted IS NULL OR deleted = 0) ORDER BY started_at DESC",
         statuses
     ).fetchall()
-    conn.close()
     return [Experiment.from_row(row) for row in rows]
 
 
@@ -418,7 +557,6 @@ def get_all_experiment_ids() -> set:
     """Get set of all experiment IDs in local database."""
     conn = get_db()
     rows = conn.execute("SELECT id FROM experiments").fetchall()
-    conn.close()
     return {row["id"] for row in rows}
 
 
@@ -452,8 +590,8 @@ def create_experiment_from_mapping(
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, crash_log, started_at, finished_at, kernels_path, session_name, queue_command)
-        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :crash_log, :started_at, :finished_at, :kernels_path, :session_name, :queue_command)
+        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, session_name, queue_command)
+        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :session_name, :queue_command)
         """,
         {
             "id": experiment_id,
@@ -469,7 +607,6 @@ def create_experiment_from_mapping(
             "tmux_window": tmux_window,
             "remote_run_id": remote_run_id,
             "status": status,
-            "crash_log": crash_log,
             "started_at": started_at,
             "finished_at": finished_at,
             "kernels_path": kernels_path,
@@ -478,7 +615,8 @@ def create_experiment_from_mapping(
         }
     )
     conn.commit()
-    conn.close()
+    if crash_log is not None:
+        set_crash_log(experiment_id, crash_log)
     return experiment_id
 
 
@@ -521,7 +659,6 @@ def get_experiments(
     params.append(limit)
 
     rows = conn.execute(query, params).fetchall()
-    conn.close()
     return [Experiment.from_row(row) for row in rows]
 
 
@@ -532,7 +669,6 @@ def get_metrics(experiment_id: int) -> List[Metric]:
         "SELECT * FROM metrics WHERE experiment_id = :id ORDER BY step",
         {"id": experiment_id}
     ).fetchall()
-    conn.close()
     return [
         Metric(
             step=row["step"],
@@ -554,7 +690,6 @@ def get_latest_metric(experiment_id: int) -> Optional[Metric]:
         "SELECT * FROM metrics WHERE experiment_id = :id ORDER BY step DESC LIMIT 1",
         {"id": experiment_id}
     ).fetchone()
-    conn.close()
     if not row:
         return None
     return Metric(
@@ -575,7 +710,6 @@ def get_final_metric(experiment_id: int) -> Optional[Metric]:
         "SELECT * FROM metrics WHERE experiment_id = :id AND is_final_step = 1 LIMIT 1",
         {"id": experiment_id}
     ).fetchone()
-    conn.close()
     if not row:
         return None
     return Metric(
@@ -875,7 +1009,6 @@ def show_diff(exp1_name: str, exp2_name: str) -> None:
         "SELECT * FROM experiments WHERE name LIKE ? ORDER BY started_at DESC LIMIT 1",
         (f"%{exp2_name}%",)
     ).fetchone()
-    conn.close()
 
     if not row1:
         console.print(f"[red]Could not find experiment matching '{exp1_name}'[/red]")

@@ -25,9 +25,10 @@ from .config import Config, SessionConfig, infer_track_from_path
 from .rpc_client import RpcClient, RpcError, kill_tunnel
 from .rpc_types import Event, EventMessage, Method
 from .tracker import (
-    get_db, parse_metric_line, record_metric,
+    get_db, close_db, parse_metric_line, record_metric,
     update_experiment_status, update_experiment_metadata,
     get_experiment, create_experiment_from_mapping,
+    set_crash_log, get_crash_log,
 )
 
 
@@ -374,6 +375,7 @@ class HubSyncer:
                 self._do_sync()
                 self._last_sync = now
             time.sleep(1)
+        close_db()  # release this thread's DB connection (final WAL checkpoint)
         log.info("[hub] Syncer stopped")
 
     SYNC_TIMEOUT = 60.0
@@ -823,6 +825,7 @@ class SessionTracker:
                 backoff = self.RECONNECT_BASE_DELAY
             else:
                 backoff = min(backoff * 2, self.RECONNECT_MAX_DELAY)
+        close_db()  # release this thread's DB connection (final WAL checkpoint)
         log.info(f"[{self.session_name}] Tracker stopped")
 
     def _sleep_interruptible(self, seconds: float) -> float:
@@ -918,8 +921,7 @@ class SessionTracker:
         if self.current_experiment_id:
             self._finalize_experiment("failed")
         if exp_id:
-            exp = get_experiment(exp_id)
-            record_crash(self.session_name, exp_id, exp.crash_log if exp else data.get("crash_log"))
+            record_crash(self.session_name, exp_id, get_crash_log(exp_id) or data.get("crash_log"))
 
     def _on_run_id(self, data: dict):
         self._reconcile_tracking(data.get("experiment_id"), data.get("run_id"))
@@ -989,11 +991,11 @@ class SessionTracker:
         if exp and exp.status in ("running", "queued", "cancelled"):
             update_experiment_status(exp_id, final_status)
         # Fetch output log from remote
-        if exp and not exp.crash_log and self.rpc:
+        if exp and self.rpc and not get_crash_log(exp_id):
             try:
                 r = self.rpc.call(Method.GET_CRASH_LOG, experiment_id=exp_id, timeout=10)
                 if r.get("success") and r.get("content"):
-                    update_experiment_metadata(exp_id, crash_log=r["content"])
+                    set_crash_log(exp_id, r["content"])
             except Exception:
                 pass
         self.current_experiment_id = None
@@ -1065,8 +1067,8 @@ class SessionTracker:
         if self.current_experiment_id:
             exp = get_experiment(self.current_experiment_id)
             if exp and exp.status == "running":
-                if not exp.crash_log:
-                    update_experiment_metadata(self.current_experiment_id, crash_log=note)
+                if not get_crash_log(self.current_experiment_id):
+                    set_crash_log(self.current_experiment_id, note)
                 update_experiment_status(self.current_experiment_id, "failed")
                 self.event(f"Experiment {self.current_experiment_id} marked failed — machine gone "
                            f"({outage:.0f}s of awake retries)")
@@ -1129,16 +1131,16 @@ class SessionTracker:
         if self.rpc:
             conn = get_db()
             missing_output = conn.execute(
-                "SELECT id FROM experiments WHERE crash_log IS NULL AND status IN ('completed', 'failed') "
+                "SELECT id FROM experiments WHERE id NOT IN (SELECT experiment_id FROM crash_logs) "
+                "AND status IN ('completed', 'failed') "
                 "AND session_name = ? ORDER BY id DESC LIMIT 5",
                 (self.session_name,),
             ).fetchall()
-            conn.close()
             for row in missing_output:
                 try:
                     r = self.rpc.call(Method.GET_CRASH_LOG, experiment_id=row["id"], timeout=10)
                     if r.get("success") and r.get("content"):
-                        update_experiment_metadata(row["id"], crash_log=r["content"])
+                        set_crash_log(row["id"], r["content"])
                 except Exception:
                     pass
 
@@ -1423,6 +1425,7 @@ class LocalMetricsDaemon:
             for name in list(self.trackers):
                 self._stop_tracker(name)
             self._stop_hub_syncer()
+            close_db()  # release the main thread's DB connection
             remove_pid_file()
             log.info("Daemon stopped")
 

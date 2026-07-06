@@ -498,7 +498,10 @@ class _IrisBackend:
         rows = conn.execute(
             """
             SELECT
-                e.id, e.remote_run_id, e.status, e.env_vars, e.crash_log,
+                e.id, e.remote_run_id, e.status, e.env_vars,
+                EXISTS (
+                    SELECT 1 FROM crash_logs c WHERE c.experiment_id = e.id
+                ) AS has_crash_log,
                 EXISTS (
                     SELECT 1 FROM metrics m
                     WHERE m.experiment_id = e.id AND m.is_final_step = 1
@@ -568,11 +571,11 @@ class _IrisBackend:
 
                     # Fetch crash log for failed jobs that don't have one yet.
                     effective_status = iris_status or local_status
-                    if effective_status == "failed" and not row["crash_log"]:
-                        from .tracker import update_experiment_metadata
+                    if effective_status == "failed" and not row["has_crash_log"]:
+                        from .tracker import set_crash_log
                         result = self._run_iris("job", "logs", "--no-tail", iris_job_id, timeout=30)
                         if result.returncode == 0 and result.stdout.strip():
-                            update_experiment_metadata(row["id"], crash_log=result.stdout[-4000:])
+                            set_crash_log(row["id"], result.stdout[-4000:])
                         elif result.returncode != 0:
                             log.warning(
                                 "[hub] Failed to fetch iris crash log for experiment %s (%s): %s",

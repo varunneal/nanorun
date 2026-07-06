@@ -21,6 +21,7 @@ from ..tracker import (
     get_latest_metric,
     get_final_metric,
     get_db,
+    get_crash_log as get_crash_log_content,
 )
 
 app = FastAPI(title="nanorun Dashboard")
@@ -89,7 +90,6 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
             ) eval ON latest.experiment_id = eval.experiment_id""",
         experiment_ids + experiment_ids,
     ).fetchall()
-    conn.close()
     return {
         row["experiment_id"]: {
             "step": row["step"],
@@ -432,20 +432,17 @@ async def get_metrics_version(experiment_ids: Optional[str] = None):
     if experiment_ids:
         ids = [int(x) for x in experiment_ids.split(",") if x.strip()]
         if not ids:
-            conn.close()
             return {"version": 0, "counts": {}}
         placeholders = ",".join("?" for _ in ids)
         rows = conn.execute(
             f"SELECT experiment_id, COUNT(*) as cnt FROM metrics WHERE experiment_id IN ({placeholders}) GROUP BY experiment_id",
             ids,
         ).fetchall()
-        conn.close()
         counts = {str(row["experiment_id"]): row["cnt"] for row in rows}
         version = sum(counts.values())
         return {"version": version, "counts": counts}
     else:
         row = conn.execute("SELECT COUNT(*) as cnt FROM metrics").fetchone()
-        conn.close()
         return {"version": row["cnt"]}
 
 
@@ -497,7 +494,7 @@ async def get_experiment_detail(exp_id: int):
         "env_vars": exp.env_vars,
         "git_commit": exp.git_commit,
         "tmux_window": exp.tmux_window,
-        "crash_log": exp.crash_log,
+        "crash_log": get_crash_log_content(exp.id),
         "session_name": exp.session_name,
         "started_at": exp.started_at.isoformat() if exp.started_at else None,
         "finished_at": exp.finished_at.isoformat() if exp.finished_at else None,
@@ -566,7 +563,6 @@ async def list_tracks():
            WHERE (deleted IS NULL OR deleted = 0) AND track IS NOT NULL
            GROUP BY track"""
     ).fetchall()
-    conn.close()
     recency = {row["track"]: row["latest"] or "" for row in rows}
 
     track_list = [
@@ -669,10 +665,11 @@ async def get_crash_log(exp_id: int):
     if not exp:
         return JSONResponse({"error": "Experiment not found"}, status_code=404)
 
-    if not exp.crash_log:
+    content = get_crash_log_content(exp_id)
+    if not content:
         return JSONResponse({"error": "No crash log for this experiment"}, status_code=404)
 
-    return PlainTextResponse(exp.crash_log)
+    return PlainTextResponse(content)
 
 
 @app.get("/api/env-defaults/{script_path:path}")
