@@ -1,0 +1,46 @@
+# Local config and logs (session-specific, not tracked)
+.nanorun/
+
+# Local visualization scratch
+viz/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+.DS_Store
+.DS_Store
+
+# Large tensor dumps
+*.pkl
+*.pt
+*.ptz
+
+# Parameter golf data (downloaded on-demand)
+experiments/parameter-golf/datasets/
+experiments/parameter-golf/tokenizers/
+experiments/parameter-golf/manifest.json
+experiments/parameter-golf/.cache/
+experiments/parameter-golf-refactors/exploit_tokenizer/
+
+_C.abi3.so
+
+# Local-only scripts
+scripts/gpu_monitor.py
+scripts/.gpu_monitor_blocked.json
+
+# data shards
+data/dolma_blend/
+data/dolma_blend_sc2/
+data/dolma_blend_smol/
