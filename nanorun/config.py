@@ -7,7 +7,7 @@ with an active session pointer in .nanorun/active_session.
 import json
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from datetime import datetime, timezone
 
 TRACK_FILE = ".track.json"
@@ -36,6 +36,7 @@ class SessionConfig:
     iris_workspace: Optional[str] = None  # Working directory for iris CLI (marin repo root)
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
+    sync_paused: bool = False  # If True, the local daemon skips background metric/log/status scanning for this session
 
 
 @dataclass
@@ -199,6 +200,24 @@ class Config:
         return SessionConfig(**data)
 
     @classmethod
+    def set_session_paused(cls, name: str, paused: bool) -> bool:
+        """Set the sync_paused flag on a session, persisting to its file.
+
+        Writes the raw dict (preserving any keys the current dataclass may not
+        know about) and does NOT touch the active-session pointer. The local
+        daemon re-reads session configs every sync cycle, so the change takes
+        effect within one HubSyncer interval without a daemon restart. Returns
+        False if the session doesn't exist.
+        """
+        session_file = cls._get_session_file(name)
+        if not session_file.exists():
+            return False
+        data = json.loads(session_file.read_text())
+        data["sync_paused"] = paused
+        session_file.write_text(json.dumps(data, indent=2))
+        return True
+
+    @classmethod
     def load(cls) -> "Config":
         """Load config with the active session."""
         name = cls.get_active_session_name()
@@ -214,18 +233,35 @@ class Config:
             self.set_active_session(self.session.name)
 
     @classmethod
-    def delete_session(cls, name: str) -> bool:
-        """Delete a session by name. Returns True if deleted."""
+    def delete_session(cls, name: str) -> Tuple[bool, int]:
+        """Delete a session by name, cancelling its in-flight experiments.
+
+        Removing a session is the deterministic counterpart to the daemon's
+        dead-session reconciliation: any 'running'/'queued' experiments for this
+        session are marked 'cancelled' so they can't linger after the session is
+        gone. Doing it here — rather than at each call site — guarantees that
+        every removal path (CLI cleanup, dashboard delete, any future caller)
+        cancels in-flight work.
+
+        Returns (removed, cancelled): whether a session file was removed, and how
+        many in-flight experiments were cancelled.
+        """
+        # Lazy import: tracker imports config at module load, so importing at
+        # module top would be circular.
+        from .tracker import terminate_session_experiments
+        running_ids, queued_ids = terminate_session_experiments(name)
+        cancelled = len(running_ids) + len(queued_ids)
+
         session_file = cls._get_session_file(name)
         if not session_file.exists():
-            return False
+            return False, cancelled
         session_file.unlink()
         if cls.get_active_session_name() is None:
             # Active pointer was pointing to deleted session (now dangling)
             active_file = cls.get_active_session_file()
             if active_file.exists():
                 active_file.unlink()
-        return True
+        return True, cancelled
 
     @classmethod
     def rename_session(cls, old_name: str, new_name: str) -> None:

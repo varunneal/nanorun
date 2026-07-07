@@ -187,6 +187,8 @@ header h1:hover { opacity: 0.8; }
     margin-left: 0.1rem;
 }
 .session-chip .chip-suffix.connecting { color: var(--warning); }
+.session-chip .chip-suffix.paused { color: var(--warning); opacity: 0.85; }
+.session-chip.paused .chip-dot { background: var(--warning); opacity: 0.6; }
 
 .session-chip .chip-overflow {
     color: var(--text-secondary);

@@ -657,9 +657,10 @@ function renderSessionChips() {
     const shown = _sessionData.slice(0, MAX_SESSION_CHIPS);
     const overflow = _sessionData.length - shown.length;
     container.innerHTML = shown.map(s => {
-        const statusClass = s.status || 'disconnected';
+        const statusClass = (s.status || 'disconnected') + (s.sync_paused ? ' paused' : '');
         let suffix = '';
         if (s.status === 'connecting') suffix = ' <span class="chip-suffix connecting">reconnecting...</span>';
+        else if (s.sync_paused) suffix = ' <span class="chip-suffix paused">paused</span>';
         return `<div class="session-chip ${statusClass}" onclick="onSessionChipClick('${s.name}')" data-session="${s.name}"><span class="chip-dot"></span>${s.name}${suffix}</div>`;
     }).join('') + (overflow > 0 ? `<span class="session-chip chip-overflow">+${overflow}</span>` : '');
 
@@ -716,20 +717,26 @@ function openSessionPopover(name) {
     popover.id = 'session-popover';
     const gpuLabel = s.gpu_count > 1 ? `${s.gpu_count}× ${s.gpu_type}` : s.gpu_type;
     let body = `<div class="sp-header"><span class="sp-name">${s.name}</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info"><span style="color:var(--text-primary)">${s.host}</span> <span style="color:#888">${gpuLabel}</span></div>`;
-    if (s.status === 'iris') {
-        body += `<div class="sp-actions"><button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
+    const pauseBtn = `<button class="sp-btn sp-btn-secondary" id="sp-sync-${name}" onclick="doToggleSync('${name}', true)">⏸ Pause Sync</button>`;
+    const resumeBtn = `<button class="sp-btn sp-btn-primary" id="sp-sync-${name}" onclick="doToggleSync('${name}', false)">▶ Resume Sync</button>`;
+    if (s.sync_paused) {
+        // Paused: the daemon isn't scanning this session — only offer Resume.
+        body += `<div class="sp-info" style="color:var(--warning)">⏸ Sync paused — not scanning</div>`;
+        body += `<div class="sp-actions">${resumeBtn}</div>`;
+    } else if (s.status === 'iris') {
+        body += `<div class="sp-actions">${pauseBtn}<button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
     } else if (s.status === 'connected') {
         body += `<div class="sp-status-detail" id="sp-detail-${name}">Loading...</div>`;
-        body += `<div class="sp-actions"><button class="sp-btn sp-btn-secondary" onclick="doDaemonRestart('${name}')">Daemon Restart</button></div>`;
+        body += `<div class="sp-actions">${pauseBtn}<button class="sp-btn sp-btn-secondary" onclick="doDaemonRestart('${name}')">Daemon Restart</button></div>`;
     } else {
         if (s.last_error) body += `<div class="sp-error">${s.last_error}</div>`;
-        body += `<div class="sp-actions"><button class="sp-btn sp-btn-primary" onclick="doReconnect('${name}')">Reconnect</button><button class="sp-btn sp-btn-secondary" onclick="doDaemonRestart('${name}')">Daemon Restart</button><button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
+        body += `<div class="sp-actions"><button class="sp-btn sp-btn-primary" onclick="doReconnect('${name}')">Reconnect</button>${pauseBtn}<button class="sp-btn sp-btn-secondary" onclick="doDaemonRestart('${name}')">Daemon Restart</button><button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
     }
     popover.innerHTML = body;
     popover.onclick = e => e.stopPropagation();
     chip.style.position = 'relative';
     chip.appendChild(popover);
-    if (s.status === 'connected') loadDaemonStatus(name);
+    if (!s.sync_paused && s.status === 'connected') loadDaemonStatus(name);
     setTimeout(() => document.addEventListener('click', _popoverOutsideClick), 0);
 }
 
@@ -773,6 +780,17 @@ async function loadDaemonStatus(name) {
         }
         el.innerHTML = html;
     } catch { el.innerHTML = '<span style="color:var(--error)">Error loading status</span>'; }
+}
+
+async function doToggleSync(name, paused) {
+    await fetch(`/api/sessions/${name}/sync-pause?paused=${paused}`, { method: 'POST' });
+    // Reflect immediately: update local cache and re-render the popover so the
+    // button flips (Pause <-> Resume) without waiting for the next server poll.
+    const s = _sessionData.find(x => x.name === name);
+    if (s) s.sync_paused = paused;
+    closeSessionPopover();
+    openSessionPopover(name);
+    setTimeout(refreshSessionChips, 800);
 }
 
 async function doReconnect(name) {

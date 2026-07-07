@@ -231,13 +231,14 @@ def session_cleanup():
     for sc in sessions:
         state = SessionState.load(sc.name)
         if state.status == "disconnected":
-            # Remove session config
-            Config.delete_session(sc.name)
+            # Remove session config (also cancels any in-flight experiments)
+            _, cancelled = Config.delete_session(sc.name)
             # Remove per-session state dir
             state_dir = Config.get_session_state_dir(sc.name)
             if state_dir.exists():
                 shutil.rmtree(state_dir, ignore_errors=True)
-            console.print(f"  Removed [bold]{sc.name}[/bold] ({sc.user}@{sc.host})")
+            suffix = f" — cancelled {cancelled} in-flight experiment(s)" if cancelled else ""
+            console.print(f"  Removed [bold]{sc.name}[/bold] ({sc.user}@{sc.host}){suffix}")
             removed += 1
 
     if removed:
@@ -1288,7 +1289,8 @@ def local_daemon_status():
         for sc in sessions:
             state = SessionState.load(sc.name)
             status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
-            console.print(f"  [bold]{sc.name}[/bold] [{status_color}]{state.status}[/{status_color}]")
+            paused_tag = "  [yellow]⏸ sync paused[/yellow]" if getattr(sc, "sync_paused", False) else ""
+            console.print(f"  [bold]{sc.name}[/bold] [{status_color}]{state.status}[/{status_color}]{paused_tag}")
             if state.tracking_experiment_id:
                 console.print(f"    Tracking: [cyan]experiment #{state.tracking_experiment_id}[/cyan]")
                 if state.tracking_run_id:
@@ -1308,6 +1310,35 @@ def local_daemon_status():
             console.print(f"  [red]Experiment {exp_id}[/red] failed at {timestamp}")
         console.print(f"\n  [dim]Run 'nanorun local crashes' for full crash logs[/dim]")
         mark_crashes_seen()
+
+
+@local_daemon.command("pause")
+@session_option
+def local_daemon_pause(session_name: str):
+    """Pause the local daemon's background scanning for a session.
+
+    Stops the periodic metric/log/status sync for this session. For iris/marin
+    sessions this halts the persistent W&B + iris job polling entirely. On-demand
+    commands ('nanorun job queue', 'nanorun job logs', 'nanorun job status') still
+    hit the backend directly and keep working. The flag is persistent (survives
+    daemon restarts) and takes effect within ~10s with no restart needed.
+    """
+    if Config.set_session_paused(session_name, True):
+        console.print(f"[yellow]⏸ Paused[/yellow] background sync for [bold]{session_name}[/bold]")
+        console.print(f"[dim]Daemon stops scanning within ~10s. Resume with 'nanorun local resume --session {session_name}'.[/dim]")
+    else:
+        console.print(f"[red]Session '{session_name}' does not exist[/red]")
+
+
+@local_daemon.command("resume")
+@session_option
+def local_daemon_resume(session_name: str):
+    """Resume the local daemon's background scanning for a paused session."""
+    if Config.set_session_paused(session_name, False):
+        console.print(f"[green]▶ Resumed[/green] background sync for [bold]{session_name}[/bold]")
+        console.print("[dim]Daemon resumes scanning within ~10s.[/dim]")
+    else:
+        console.print(f"[red]Session '{session_name}' does not exist[/red]")
 
 
 @local_daemon.command("logs")

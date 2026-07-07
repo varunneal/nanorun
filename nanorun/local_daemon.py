@@ -28,7 +28,7 @@ from .tracker import (
     get_db, close_db, parse_metric_line, record_metric,
     update_experiment_status, update_experiment_metadata,
     get_experiment, create_experiment_from_mapping,
-    set_crash_log, get_crash_log,
+    set_crash_log, get_crash_log, terminate_session_experiments,
 )
 
 
@@ -390,7 +390,20 @@ class HubSyncer:
     def _do_sync(self):
         if not hasattr(self, '_session_errors_logged'):
             self._session_errors_logged = {}
-        sessions = [s.name for s in Config.list_sessions()]
+
+        # Honor the per-session sync_paused flag: skip its scan entirely. For iris
+        # sessions this is the whole background footprint (W&B + iris job polling);
+        # on-demand CLI commands still hit the backend directly and are unaffected.
+        # The flag is re-read every cycle, so pause/resume applies without a restart.
+        all_sessions = Config.list_sessions()
+        paused = {s.name for s in all_sessions if getattr(s, "sync_paused", False)}
+        prev_paused = getattr(self, "_paused_sessions", set())
+        for name in sorted(paused - prev_paused):
+            self.event(f"[{name}] sync paused — skipping background metric/log scan")
+        for name in sorted(prev_paused - paused):
+            self.event(f"[{name}] sync resumed")
+        self._paused_sessions = paused
+        sessions = [s.name for s in all_sessions if s.name not in paused]
 
         # Sync all sessions in parallel so one slow/hanging session doesn't block others
         sync_errors: dict[str, Exception] = {}
@@ -754,12 +767,46 @@ class SessionTracker:
         except Exception as e:
             log.warning(f"[{self.session_name}] Failed to adopt running experiment: {e}")
 
+    def _is_paused(self) -> bool:
+        """Re-read the session's sync_paused flag from disk (cheap small JSON).
+
+        Read live rather than cached so a `nanorun local pause` / dashboard toggle
+        takes effect without restarting the daemon."""
+        sc = Config.load_session(self.session_name)
+        return bool(sc and getattr(sc, "sync_paused", False))
+
     def _session_loop(self):
         log.info(f"[{self.session_name}] Tracker starting")
         self.event("Session tracker starting")
         self._adopt_running_experiment()
         backoff = self.RECONNECT_BASE_DELAY
+        was_paused = False
         while self.running:
+            # Paused: drop the connection and idle. The thread stays alive (so the
+            # discovery loop won't restart it and it isn't flagged "reconnectable"),
+            # but we hold no SSH tunnel and do no scanning. We never enter the
+            # disconnect/backoff/dead-session path while paused, so a pause can't be
+            # mistaken for a dead machine. Resume reconnects and reconciles.
+            if self._is_paused():
+                if not was_paused:
+                    self.event("Sync paused — tracker idle, connection dropped")
+                    was_paused = True
+                    if self.rpc:
+                        try: self.rpc.close()
+                        except Exception: pass
+                        self.rpc = None
+                    kill_tunnel(self.session_name)
+                    self._set_cache_connected(False)
+                    self._outage_started_mono = None
+                    self._dead_finalized = False
+                    backoff = self.RECONNECT_BASE_DELAY
+                self.state.status = "paused"
+                self.state.save(self.session_name)
+                self._sleep_interruptible(2.0)
+                continue
+            if was_paused:
+                self.event("Sync resumed — reconnecting tracker")
+                was_paused = False
             try:
                 self._connect()
                 if not self.rpc:
@@ -1064,29 +1111,20 @@ class SessionTracker:
         """
         note = (f"Machine disconnected — session '{self.session_name}' unreachable across "
                 f"{outage:.0f}s of reconnect attempts; experiment did not complete.")
-        if self.current_experiment_id:
-            exp = get_experiment(self.current_experiment_id)
-            if exp and exp.status == "running":
-                if not get_crash_log(self.current_experiment_id):
-                    set_crash_log(self.current_experiment_id, note)
-                update_experiment_status(self.current_experiment_id, "failed")
-                self.event(f"Experiment {self.current_experiment_id} marked failed — machine gone "
-                           f"({outage:.0f}s of awake retries)")
-
-        # Queued experiments that never started -> cancelled (best-effort; SSH
-        # sessions usually create DB rows only on start, so this often matches none).
-        conn = get_db()
-        now = datetime.now(timezone.utc).isoformat()
-        cursor = conn.execute(
-            "UPDATE experiments SET status = 'cancelled', finished_at = COALESCE(finished_at, ?) "
-            "WHERE status = 'queued' AND session_name = ?",
-            (now, self.session_name),
+        # In-flight training run got killed by infra (-> failed); queued
+        # experiments never ran (-> cancelled). Shared with the session-removal
+        # path (see tracker.terminate_session_experiments).
+        failed_ids, cancelled_ids = terminate_session_experiments(
+            self.session_name,
+            running_status="failed",
+            queued_status="cancelled",
+            note=note,
         )
-        conn.commit()
-        cancelled = cursor.rowcount or 0
-        conn.close()
-        if cancelled:
-            self.event(f"Marked {cancelled} queued experiments cancelled — machine gone")
+        if failed_ids:
+            self.event(f"Marked {len(failed_ids)} experiment(s) failed — machine gone "
+                       f"({outage:.0f}s of awake retries)")
+        if cancelled_ids:
+            self.event(f"Marked {len(cancelled_ids)} queued experiments cancelled — machine gone")
 
         # Clear tracking so reconnect re-attaches cleanly (and self-heals).
         self.current_experiment_id = None

@@ -362,6 +362,65 @@ def update_experiment_status(experiment_id: int, status: str) -> None:
     conn.commit()
 
 
+def terminate_session_experiments(
+    session_name: str,
+    running_status: str = "cancelled",
+    queued_status: str = "cancelled",
+    note: Optional[str] = None,
+) -> Tuple[List[int], List[int]]:
+    """Move a session's in-flight experiments to a terminal state.
+
+    Shared by the two paths that end a session's in-flight work:
+      - **session removed** (deleted from the session list): both running and
+        queued experiments -> 'cancelled' (the default), so nothing is left
+        dangling as 'running'/'queued' after the session is gone.
+      - **session dies** (daemon dead-session reconciliation, machine gone past
+        the grace window): the training run -> 'failed', queued runs ->
+        'cancelled'.
+
+    Running rows go to ``running_status``, queued rows to ``queued_status``. When
+    ``note`` is given it's stamped as the crash log on each running row that
+    doesn't already have one, so the reason survives in the UI. Returns
+    ``(running_ids, queued_ids)`` — the experiments that were transitioned — for
+    the caller to log or emit events on.
+    """
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+
+    running_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM experiments WHERE status = 'running' AND session_name = ?",
+            (session_name,),
+        ).fetchall()
+    ]
+    queued_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM experiments WHERE status = 'queued' AND session_name = ?",
+            (session_name,),
+        ).fetchall()
+    ]
+
+    if note:
+        for exp_id in running_ids:
+            if not get_crash_log(exp_id):
+                set_crash_log(exp_id, note)
+
+    if running_ids:
+        conn.execute(
+            "UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            "WHERE status = 'running' AND session_name = ?",
+            (running_status, now, session_name),
+        )
+    if queued_ids:
+        conn.execute(
+            "UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            "WHERE status = 'queued' AND session_name = ?",
+            (queued_status, now, session_name),
+        )
+    conn.commit()
+    return running_ids, queued_ids
+
+
 def update_experiment_metadata(
     experiment_id: int,
     code_hash: Optional[str] = None,

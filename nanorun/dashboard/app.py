@@ -334,6 +334,7 @@ async def get_sessions():
             "gpu_type": sc.gpu_type,
             "gpu_count": sc.gpu_count,
             "status": status,
+            "sync_paused": getattr(sc, "sync_paused", False),
             "last_error": state.last_error,
             "metrics_synced": state.metrics_synced,
             "tracking_experiment_id": state.tracking_experiment_id,
@@ -381,14 +382,36 @@ async def delete_session(name: str):
             {"error": "Cannot remove a connected session. Disconnect first."},
             status_code=400,
         )
-    Config.delete_session(name)
+    # delete_session also cancels any in-flight (running/queued) experiments for
+    # this session so they don't linger after the session is gone.
+    _, cancelled = Config.delete_session(name)
     state_dir = Config.get_session_state_dir(name)
     if state_dir.exists():
         shutil.rmtree(state_dir, ignore_errors=True)
     daemon = getattr(app.state, "daemon", None)
     if daemon and hasattr(daemon, "remove_session"):
         daemon.remove_session(name)
-    return {"success": True, "message": f"Session '{name}' removed"}
+    msg = f"Session '{name}' removed"
+    if cancelled:
+        msg += f" ({cancelled} in-flight experiment(s) cancelled)"
+    return {"success": True, "message": msg}
+
+
+@app.post("/api/sessions/{name}/sync-pause")
+async def set_session_sync_pause(name: str, paused: bool = True):
+    """Pause or resume the local daemon's background scanning for a session.
+
+    Persists the per-session `sync_paused` flag. The HubSyncer skips paused
+    sessions, and SSH SessionTrackers idle (dropping their connection) until
+    resumed. On-demand commands still work. Takes effect within one sync cycle.
+    """
+    if not Config.set_session_paused(name, paused):
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return {
+        "success": True,
+        "paused": paused,
+        "message": "Sync paused" if paused else "Sync resumed",
+    }
 
 
 @app.post("/api/sessions/{name}/daemon-restart")
