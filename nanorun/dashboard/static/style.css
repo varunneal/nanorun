@@ -294,6 +294,17 @@ header h1:hover { opacity: 0.8; }
     border-color: var(--error);
 }
 
+/* Pause = amber/caution, distinct from Resume (green/go) */
+.sp-btn-warning {
+    color: var(--warning);
+    border-color: var(--warning);
+}
+.sp-btn-warning:hover {
+    background: rgba(224, 184, 104, 0.1);
+    color: var(--warning);
+    border-color: var(--warning);
+}
+
 main {
     display: grid;
     grid-template-columns: auto 1fr;

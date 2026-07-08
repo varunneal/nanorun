@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from .config import Config, SessionConfig, infer_track_from_path
 from .rpc_client import RpcClient, RpcError, kill_tunnel
@@ -227,6 +227,10 @@ def _ingest_mappings_for_session(session_name: str):
 
 def _ingest_mapping_lines_for_session(session_name: str, content: str):
     """Parse mapping lines and create/update experiments in DB."""
+    # Per-incarnation scope id from the live session config (falls back to bare
+    # name for pre-upgrade sessions). Constant per session, so resolve once here.
+    sc = Config.load_session(session_name)
+    session_id = sc.session_id if sc else session_name
     for line in content.strip().split("\n"):
         if not line.strip():
             continue
@@ -252,6 +256,7 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
                     gpus=mapping.get("gpus", 1), gpu_type=mapping.get("gpu_type", "H100"),
                     git_commit=mapping.get("git_commit"), parent_hash=mapping.get("parent_hash"),
                     kernels_path=mapping.get("kernels_path"), session_name=session_name,
+                    session_id=session_id,
                 )
                 log.info(f"[hub] Created experiment {exp_id} ({Path(script).name}) for {session_name}")
             except Exception as e:
@@ -311,15 +316,18 @@ def _ingest_queue_for_session(session_name: str):
     _write_queue_cache_with_precedence(session_name, ts, queue, connected=None)
 
 
-def _sync_all_logs(session_name: str):
+def _sync_all_logs(session_name: str) -> Optional[List[str]]:
+    """Pull a session's logs from the hub. Returns the backend's changed-file list
+    (paths relative to the session log dir), or None if the backend can't report
+    deltas (iris = whole-file mode)."""
     from . import hub
     session_config = Config.load_session(session_name)
     session_logs_dir = PATHS.logs_dir / session_name
     if session_config and session_config.session_type == "iris":
         backend = hub._IrisBackend(session_config)
-        backend.sync_logs_down(session_logs_dir, session_name)
+        return backend.sync_logs_down(session_logs_dir, session_name)
     else:
-        hub.sync_logs_down(session_logs_dir, session_name)
+        return hub.sync_logs_down(session_logs_dir, session_name)
 
 
 class HubSyncer:
@@ -340,6 +348,11 @@ class HubSyncer:
         self._thread: Optional[threading.Thread] = None
         self._was_connected: bool = False
         self._last_sync: float = 0
+        # Sessions that have had their one-time full catch-up parse since daemon
+        # start. First pass per session re-parses everything the hub delivered
+        # (restart-to-recover); subsequent passes are delivery-driven. Reset on
+        # restart (fresh __init__), which re-triggers catch-up — the intended behavior.
+        self._first_synced: set = set()
 
     def start(self):
         self._thread = threading.Thread(
@@ -405,12 +418,15 @@ class HubSyncer:
         self._paused_sessions = paused
         sessions = [s.name for s in all_sessions if s.name not in paused]
 
-        # Sync all sessions in parallel so one slow/hanging session doesn't block others
+        # Sync all sessions in parallel so one slow/hanging session doesn't block others.
+        # Each pull returns the files it changed; we thread that into the parse below so
+        # only changed logs get parsed (delivery-driven).
         sync_errors: dict[str, Exception] = {}
+        changed_by_session: dict[str, Optional[List[str]]] = {}
 
         def _sync_one(name):
             try:
-                self._sync_with_timeout(name)
+                changed_by_session[name] = self._sync_with_timeout(name)
             except Exception as e:
                 sync_errors[name] = e
 
@@ -453,7 +469,7 @@ class HubSyncer:
                 )
 
             try:
-                self._parse_metrics_for_session(session_name)
+                self._parse_metrics_for_session(session_name, changed_by_session.get(session_name))
             except Exception as e:
                 had_error = True
                 self._log_session_error(
@@ -468,43 +484,77 @@ class HubSyncer:
                 self.last_error = None
         self.last_sync_at = datetime.now().strftime("%H:%M:%S")
 
-    def _parse_metrics_for_session(self, session_name: str):
-        """Parse metrics from local log files. Dispatches to correct parser by session type."""
+    def _parse_metrics_for_session(self, session_name: str, changed: Optional[List[str]] = None):
+        """Parse metrics from local log files. Dispatches to correct parser by session type.
+
+        The HubSyncer is now the single parse driver for SSH sessions (the tracker's
+        old 3s parse loop is gone), so this always parses — no tracker_connected gate.
+        ``changed`` is the backend's changed-file list from this pull (paths relative to
+        the session log dir), or None if the backend can't report deltas."""
         session_config = Config.load_session(session_name)
         if session_config and session_config.session_type == "iris":
             self._parse_iris_metrics(session_name)
         else:
-            # For SSH sessions: parse metrics here if the session tracker is dead
-            # OR alive but disconnected (it only parses while in the event loop).
-            tracker = self.daemon.trackers.get(session_name)
-            tracker_connected = (
-                isinstance(tracker, SessionTracker)
-                and tracker._thread is not None
-                and tracker._thread.is_alive()
-                and tracker.state.status == "connected"
-            )
-            if not tracker_connected:
-                self._parse_ssh_metrics(session_name)
+            self._parse_ssh_metrics(session_name, changed)
 
-    def _parse_ssh_metrics(self, session_name: str):
-        """Parse metrics from local log files for SSH sessions whose tracker is dead."""
+    def _parse_ssh_metrics(self, session_name: str, changed_paths: Optional[List[str]] = None):
+        """Parse metrics for an SSH session, driven by the files a hub pull changed.
+
+        Three cases:
+          - **First pass per session** since daemon start (guarded by _first_synced):
+            full catch-up — parse every run_id row for the session so a restart
+            re-parses everything the hub delivered (offsets are in-memory, so this
+            re-establishes them). Preserves "restart to recover a missed experiment".
+          - **Subsequent passes**: parse only the top-level ``*.txt`` files this pull
+            changed, mapping run_id (log stem) -> experiment via an indexed point
+            lookup. This is what kills the per-tick stat-storm.
+          - **Fallback** (``changed_paths is None`` on a non-first pass — backend can't
+            report deltas): parse only this session's 'running' rows (cheap, indexed).
+            Correctness stays guarded by _log_offsets; only efficiency is affected.
+        """
         session_logs = PATHS.logs_dir / session_name
         if not session_logs.exists():
             return
 
-        # Ingest mappings first so new experiments get created before we parse their logs
+        # Ingest mappings first so new experiments exist before the run_id lookup below.
         _ingest_mappings_for_session(session_name)
 
+        first_pass = session_name not in self._first_synced
+        self._first_synced.add(session_name)
+
         conn = get_db()
-        rows = conn.execute(
-            "SELECT id, remote_run_id FROM experiments "
-            "WHERE remote_run_id IS NOT NULL AND session_name = ?",
-            (session_name,),
-        ).fetchall()
+        if first_pass:
+            rows = conn.execute(
+                "SELECT id, remote_run_id FROM experiments "
+                "WHERE remote_run_id IS NOT NULL AND session_name = ?",
+                (session_name,),
+            ).fetchall()
+            run_rows = [(r["id"], r["remote_run_id"]) for r in rows]
+        elif changed_paths is not None:
+            # Top-level *.txt only: those are run logs. mappings/*.jsonl and
+            # queue/*.jsonl (which contain "/") are ingested by their own paths.
+            run_ids = [
+                Path(p).stem for p in changed_paths
+                if p.endswith(".txt") and "/" not in p
+            ]
+            run_rows = []
+            for rid in run_ids:
+                row = conn.execute(
+                    "SELECT id FROM experiments WHERE remote_run_id = ?",
+                    (rid,),
+                ).fetchone()
+                if row:
+                    run_rows.append((row["id"], rid))
+        else:
+            rows = conn.execute(
+                "SELECT id, remote_run_id FROM experiments "
+                "WHERE status = 'running' AND remote_run_id IS NOT NULL AND session_name = ?",
+                (session_name,),
+            ).fetchall()
+            run_rows = [(r["id"], r["remote_run_id"]) for r in rows]
         conn.close()
 
-        for row in rows:
-            exp_id, run_id = row["id"], row["remote_run_id"]
+        for exp_id, run_id in run_rows:
             local_log = session_logs / f"{run_id}.txt"
             if not local_log.exists():
                 flat = PATHS.logs_dir / f"{run_id}.txt"
@@ -605,13 +655,17 @@ class HubSyncer:
             if new_count:
                 self.event(f"[{session_name}] Synced {new_count} metric steps for experiment {exp_id}")
 
-    def _sync_with_timeout(self, session_name: str):
-        """Run sync in a worker thread with a timeout to prevent hanging."""
-        exc_box = [None]
+    def _sync_with_timeout(self, session_name: str) -> Optional[List[str]]:
+        """Run sync in a worker thread with a timeout to prevent hanging.
+
+        Returns the backend's changed-file list (paths relative to the session log
+        dir), or None if the backend can't report deltas (whole-file mode)."""
+        exc_box: list = [None]
+        result_box: list = [None]
 
         def _worker():
             try:
-                _sync_all_logs(session_name)
+                result_box[0] = _sync_all_logs(session_name)
             except Exception as e:
                 exc_box[0] = e
 
@@ -622,6 +676,7 @@ class HubSyncer:
             raise TimeoutError(f"Sync for {session_name} hung for >{self.SYNC_TIMEOUT}s")
         if exc_box[0]:
             raise exc_box[0]
+        return result_box[0]
 
 
 _log_offsets: dict[str, int] = {}
@@ -653,10 +708,14 @@ def _parse_local_metrics(experiment_id: int, run_id: str, log_path: Path) -> tup
                 train_loss=metric.get("train_loss"),
                 train_time_ms=metric["train_time_ms"],
                 step_avg_ms=metric.get("step_avg_ms"), is_final_step=is_final,
+                commit=False,
             )
             if inserted:
                 recorded += 1
 
+    # One commit per parse pass instead of one per metric line (N fsyncs -> 1).
+    # Harmless no-op if the pass wrote nothing (no open transaction to flush).
+    get_db().commit()
     _log_offsets[run_id] = new_offset
     if recorded:
         log.info(f"Recorded {recorded} metrics for exp {experiment_id}")
@@ -720,8 +779,6 @@ class SessionTracker:
         self._was_connected: bool = False
         self._outage_started_mono: Optional[float] = None  # monotonic anchor: counts awake retry time only
         self._dead_finalized: bool = False                 # finalized in-flight work for this outage
-        self._mappings_offset: int = 0  # legacy mappings.jsonl offset
-        self._segment_offsets: dict[str, int] = {}  # per-segment byte offset
 
     def start(self):
         self._thread = threading.Thread(
@@ -753,11 +810,15 @@ class SessionTracker:
             return
         try:
             conn = get_db()
+            # Scope to this incarnation (NULL-fallback for pre-upgrade rows) so we
+            # don't adopt a *different* machine's leftover 'running' row under a
+            # reused session name.
             row = conn.execute(
                 "SELECT id, remote_run_id FROM experiments "
-                "WHERE status = 'running' AND session_name = ? "
+                "WHERE status = 'running' "
+                "AND (session_id = ? OR (session_id IS NULL AND session_name = ?)) "
                 "ORDER BY id DESC LIMIT 1",
-                (self.session_name,),
+                (self.config.session_id, self.session_name),
             ).fetchone()
             conn.close()
             if row:
@@ -903,10 +964,14 @@ class SessionTracker:
             self.rpc = None
 
     def _event_loop(self):
-        SYNC_INTERVAL = 3.0
+        # Metrics/mappings are parsed by the HubSyncer now (delivery-driven), not here.
+        # The tracker's only periodic job left is a slow crash-log backfill sweep for
+        # finished experiments that never got their output log — event-driven fetch in
+        # _finalize_experiment covers the common case; this catches the stragglers.
+        CRASH_SWEEP_INTERVAL = 30.0
         last_mono = time.monotonic()
         last_wall = time.time()
-        next_sync = last_mono + SYNC_INTERVAL
+        next_sweep = last_mono + CRASH_SWEEP_INTERVAL
         while self.running and self.rpc:
             # Detect host sleep/suspend cheaply (macOS): time.monotonic() does not
             # advance while the machine is asleep, but the wall clock does. So when
@@ -927,9 +992,9 @@ class SessionTracker:
                 if ev:
                     self._handle_event(ev)
                 now = time.monotonic()
-                if now >= next_sync:
-                    next_sync = now + SYNC_INTERVAL
-                    self._sync_logs_and_metrics()
+                if now >= next_sweep:
+                    next_sweep = now + CRASH_SWEEP_INTERVAL
+                    self._backfill_crash_logs()
             except ConnectionError:
                 log.warning(f"[{self.session_name}] WebSocket disconnected")
                 return
@@ -1008,15 +1073,21 @@ class SessionTracker:
                 except Exception as e:
                     log.warning(f"[{self.session_name}] Failed to fetch mapping for {exp_id}: {e}")
             if not exp:
-                # Still not available — process local mappings as fallback
-                self._process_mappings_file()
+                # Still not available — ingest local mappings as fallback (shared
+                # module-level path; the tracker's private ingest is gone).
+                _ingest_mappings_for_session(self.session_name)
                 exp = get_experiment(exp_id)
         name = Path(exp.script).name if exp and getattr(exp, "script", None) else None
         self.event(f"Tracking experiment {exp_id}" + (f" ({name})" if name else ""))
         conn = get_db()
+        # Demote *this incarnation's* other running rows to queued (a session runs
+        # one experiment at a time). Scoped by session_id (NULL-fallback for
+        # pre-upgrade rows) so a new run can't demote a prior incarnation's row that
+        # merely reused this session name.
         conn.execute(
-            "UPDATE experiments SET status = 'queued' WHERE status = 'running' AND id != ? AND session_name = ?",
-            (exp_id, self.session_name),
+            "UPDATE experiments SET status = 'queued' WHERE status = 'running' AND id != ? "
+            "AND (session_id = ? OR (session_id IS NULL AND session_name = ?))",
+            (exp_id, self.config.session_id, self.session_name),
         )
         conn.commit(); conn.close()
         update_experiment_status(exp_id, "running")
@@ -1063,7 +1134,7 @@ class SessionTracker:
             )
             if status.get("queue") is not None:
                 self._sync_queue_cache(status["queue"], ts=status.get("ts"))
-            # Mappings + metrics are synced by the 3s _sync_logs_and_metrics loop
+            # Mappings + metrics are synced by the HubSyncer (delivery-driven), not here.
             self.event("Initial sync: connected")
             self.state.save(self.session_name)
         except Exception as e:
@@ -1119,6 +1190,7 @@ class SessionTracker:
             running_status="failed",
             queued_status="cancelled",
             note=note,
+            session_id=self.config.session_id,
         )
         if failed_ids:
             self.event(f"Marked {len(failed_ids)} experiment(s) failed — machine gone "
@@ -1133,116 +1205,32 @@ class SessionTracker:
         self.state.tracking_run_id = None
         self.state.save(self.session_name)
 
-    def _sync_logs_and_metrics(self):
-        """Process local log files (downloaded by HubSyncer) and reparse metrics."""
-        # Process mappings.jsonl — discover new experiments, update statuses
-        self._process_mappings_file()
+    def _backfill_crash_logs(self):
+        """Fetch output logs for finished experiments that never got one.
 
-        # Build set of known run_ids
+        Runs on a slow (~30s) timer from the event loop. Event-driven fetch in
+        _finalize_experiment covers the common case; this catches stragglers (e.g. an
+        experiment that finished while we were briefly disconnected). Metrics and
+        mapping ingest are handled by the HubSyncer now — this is the tracker's only
+        remaining periodic DB touch, and it's cheap (indexed status filter, capped 5).
+        """
+        if not self.rpc:
+            return
         conn = get_db()
-        rows = conn.execute(
-            "SELECT id, remote_run_id FROM experiments WHERE remote_run_id IS NOT NULL AND session_name = ?",
+        missing_output = conn.execute(
+            "SELECT id FROM experiments WHERE id NOT IN (SELECT experiment_id FROM crash_logs) "
+            "AND status IN ('completed', 'failed') "
+            "AND session_name = ? ORDER BY id DESC LIMIT 5",
             (self.session_name,),
         ).fetchall()
         conn.close()
-        known = {row["remote_run_id"]: row["id"] for row in rows}
-
-        # Reparse known experiments whose log files have new bytes
-        session_logs = PATHS.logs_dir / self.session_name
-        for run_id, exp_id in known.items():
-            local_log = session_logs / f"{run_id}.txt"
-            if not local_log.exists():
-                # Fallback: pre-migration flat dir
-                flat = PATHS.logs_dir / f"{run_id}.txt"
-                if flat.exists():
-                    local_log = flat
-                else:
-                    continue
-            if local_log.stat().st_size <= _log_offsets.get(run_id, 0):
-                continue
-            recorded, _ = _parse_local_metrics(exp_id, run_id, local_log)
-            if recorded:
-                self.state.metrics_synced += recorded
-                self.event(f"Synced {recorded} new metric steps for experiment {exp_id}")
-
-        # Fetch output logs for experiments missing one
-        if self.rpc:
-            conn = get_db()
-            missing_output = conn.execute(
-                "SELECT id FROM experiments WHERE id NOT IN (SELECT experiment_id FROM crash_logs) "
-                "AND status IN ('completed', 'failed') "
-                "AND session_name = ? ORDER BY id DESC LIMIT 5",
-                (self.session_name,),
-            ).fetchall()
-            for row in missing_output:
-                try:
-                    r = self.rpc.call(Method.GET_CRASH_LOG, experiment_id=row["id"], timeout=10)
-                    if r.get("success") and r.get("content"):
-                        set_crash_log(row["id"], r["content"])
-                except Exception:
-                    pass
-
-    def _process_mappings_file(self):
-        """Read mappings from session-specific log directory.
-
-        Segments live under logs/{session}/mappings/mappings-NNNNNN.jsonl (sealed once full,
-        so xet sync doesn't choke on a growing tail). Legacy file is still processed
-        so older remote daemons' data isn't lost.
-        """
-        session_logs = PATHS.logs_dir / self.session_name
-
-        # Legacy flat file — kept for dual-read until all remotes are on segments
-        legacy = session_logs / "mappings.jsonl"
-        if legacy.exists():
-            size = legacy.stat().st_size
-            if size > self._mappings_offset:
-                with open(legacy) as f:
-                    f.seek(self._mappings_offset)
-                    new_content = f.read()
-                    self._mappings_offset = f.tell()
-                self._ingest_mapping_lines(new_content)
-
-        # Segmented files — process in index order
-        segments_dir = session_logs / "mappings"
-        if segments_dir.exists():
-            for path in sorted(segments_dir.glob("mappings-*.jsonl")):
-                size = path.stat().st_size
-                offset = self._segment_offsets.get(path.name, 0)
-                if size <= offset:
-                    continue
-                with open(path) as f:
-                    f.seek(offset)
-                    new_content = f.read()
-                    self._segment_offsets[path.name] = f.tell()
-                self._ingest_mapping_lines(new_content)
-
-    def _ingest_mapping_lines(self, content: str):
-        for line in content.strip().split("\n"):
-            if not line.strip():
-                continue
+        for row in missing_output:
             try:
-                mapping = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            exp_id = mapping.get("experiment_id")
-            if not exp_id:
-                continue
-            existing = get_experiment(exp_id)
-            if not existing:
-                self._create_experiment(exp_id, mapping)
-            else:
-                # Update status if remote is more authoritative — but never
-                # downgrade "completed" to "failed" (local metric parsing is
-                # more reliable than remote's tail-based classification).
-                remote_status = mapping.get("status")
-                if remote_status and remote_status != existing.status:
-                    if existing.status == "completed" and remote_status == "failed":
-                        pass
-                    elif remote_status in ("completed", "failed") or existing.status in ("running", "queued"):
-                        update_experiment_status(exp_id, remote_status)
-                # Backfill run_id if we didn't have it
-                if mapping.get("run_id") and not existing.remote_run_id:
-                    update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
+                r = self.rpc.call(Method.GET_CRASH_LOG, experiment_id=row["id"], timeout=10)
+                if r.get("success") and r.get("content"):
+                    set_crash_log(row["id"], r["content"])
+            except Exception:
+                pass
 
     def _sync_queue_cache(self, queue_items, ts=None):
         # Dedup on queue CONTENT only (not ts): a byte-identical queue is a no-op.
@@ -1261,7 +1249,11 @@ class SessionTracker:
         if not exp:
             self._create_experiment(exp_id, data)
         elif exp.session_name != self.session_name:
-            update_experiment_metadata(exp_id, session_name=self.session_name)
+            # Claim for this incarnation: stamp both name and session_id so later
+            # reconciliation scopes correctly.
+            update_experiment_metadata(
+                exp_id, session_name=self.session_name, session_id=self.config.session_id,
+            )
             log.info(f"[{self.session_name}] Claimed experiment {exp_id} from '{exp.session_name}'")
 
     def _create_experiment(self, exp_id: int, data: dict):
@@ -1280,6 +1272,7 @@ class SessionTracker:
                 gpus=data.get("gpus", 1), gpu_type=data.get("gpu_type", "H100"),
                 git_commit=data.get("git_commit"), parent_hash=data.get("parent_hash"),
                 kernels_path=data.get("kernels_path"), session_name=self.session_name,
+                session_id=self.config.session_id,
             )
             self.event(f"Created experiment {exp_id} ({Path(script).name})")
         except Exception as e:

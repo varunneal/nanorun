@@ -92,6 +92,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "gpu_type": "TEXT DEFAULT 'H100'",
         "kernels_path": "TEXT",
         "session_name": "TEXT",
+        "session_id": "TEXT",
         "queue_command": "TEXT",
     }
     metric_migrations = {
@@ -106,6 +107,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     for col, col_type in metric_migrations.items():
         if col not in metric_columns:
             conn.execute(f"ALTER TABLE metrics ADD COLUMN {col} {col_type}")
+
+    # Indexes on migration-added columns go AFTER the ALTER loop above (the column
+    # must exist first — putting these in the CREATE-TABLE executescript would fail
+    # on an existing DB whose column hasn't been added yet). idx_experiments_run_id
+    # backs the delivery-driven parse's run_id (log stem) -> experiment point lookup;
+    # a plain index is perf-identical to UNIQUE for that lookup and safe on the prod
+    # DB. idx_experiments_session_id backs incarnation-scoped reconciliation. Both
+    # are idempotent (IF NOT EXISTS).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_experiments_run_id ON experiments(remote_run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_experiments_session_id ON experiments(session_id)")
     conn.commit()
 
     # NOTE: moving the legacy inlined crash_log data into crash_logs and dropping
@@ -192,6 +203,7 @@ class Experiment:
     finished_at: Optional[datetime]
     kernels_path: Optional[str] = None
     session_name: Optional[str] = None
+    session_id: Optional[str] = None  # {name}::{started_at} — per-incarnation scope key
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Experiment":
@@ -219,6 +231,7 @@ class Experiment:
             finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
             kernels_path=row["kernels_path"] if "kernels_path" in keys else None,
             session_name=row["session_name"] if "session_name" in keys else None,
+            session_id=row["session_id"] if "session_id" in keys else None,
         )
 
 
@@ -261,13 +274,14 @@ def create_experiment(
     run_number: Optional[int] = None,
     tmux_window: Optional[str] = None,
     session_name: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> int:
     """Create a new experiment record. Returns the experiment ID."""
     conn = get_db()
     cursor = conn.execute(
         """
-        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, session_name, queue_command)
-        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :session_name, :queue_command)
+        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, session_name, session_id, queue_command)
+        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :session_name, :session_id, :queue_command)
         """,
         {
             "name": name,
@@ -282,6 +296,7 @@ def create_experiment(
             "run_number": run_number,
             "tmux_window": tmux_window,
             "session_name": session_name,
+            "session_id": session_id,
             "queue_command": _build_queue_command(script, env_vars),
         }
     )
@@ -299,11 +314,17 @@ def record_metric(
     train_time_ms: Optional[int] = None,
     step_avg_ms: Optional[float] = None,
     is_final_step: bool = False,
+    commit: bool = True,
 ) -> bool:
-    """Record a metric checkpoint. Returns True only if new data was written."""
+    """Record a metric checkpoint. Returns True only if new data was written.
+
+    Pass ``commit=False`` to batch many rows in one transaction — the caller then
+    commits once at the end of the pass, turning N fsyncs into 1. ``cursor.rowcount``
+    reports whether this row actually inserted/updated (0 on a no-op conflict;
+    verified for this exact upsert).
+    """
     conn = get_db()
-    total_changes_before = conn.execute("SELECT total_changes()").fetchone()[0]
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO metrics
             (experiment_id, step, total_steps, val_loss, train_loss, train_time_ms, step_avg_ms, is_final_step)
@@ -334,9 +355,9 @@ def record_metric(
             "is_final_step": is_final_step,
         }
     )
-    total_changes_after = conn.execute("SELECT total_changes()").fetchone()[0]
-    changed = total_changes_after > total_changes_before
-    conn.commit()
+    changed = cursor.rowcount > 0
+    if commit:
+        conn.commit()
     return changed
 
 
@@ -367,6 +388,7 @@ def terminate_session_experiments(
     running_status: str = "cancelled",
     queued_status: str = "cancelled",
     note: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> Tuple[List[int], List[int]]:
     """Move a session's in-flight experiments to a terminal state.
 
@@ -383,20 +405,34 @@ def terminate_session_experiments(
     doesn't already have one, so the reason survives in the UI. Returns
     ``(running_ids, queued_ids)`` — the experiments that were transitioned — for
     the caller to log or emit events on.
+
+    When ``session_id`` is given, scoping pins to that incarnation (with a NULL
+    fallback so pre-upgrade rows still match by name) — this prevents killing a
+    *different* machine incarnation that happened to reuse ``session_name``. When
+    ``session_id`` is None, falls back to matching by name alone (legacy behavior).
     """
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
 
+    # Transitional scope clause: exact-incarnation match, OR (pre-upgrade rows with
+    # NULL session_id) match by name. Bare-name fallback when caller has no id.
+    if session_id is not None:
+        scope_sql = "(session_id = ? OR (session_id IS NULL AND session_name = ?))"
+        scope_params = (session_id, session_name)
+    else:
+        scope_sql = "session_name = ?"
+        scope_params = (session_name,)
+
     running_ids = [
         row["id"] for row in conn.execute(
-            "SELECT id FROM experiments WHERE status = 'running' AND session_name = ?",
-            (session_name,),
+            f"SELECT id FROM experiments WHERE status = 'running' AND {scope_sql}",
+            scope_params,
         ).fetchall()
     ]
     queued_ids = [
         row["id"] for row in conn.execute(
-            "SELECT id FROM experiments WHERE status = 'queued' AND session_name = ?",
-            (session_name,),
+            f"SELECT id FROM experiments WHERE status = 'queued' AND {scope_sql}",
+            scope_params,
         ).fetchall()
     ]
 
@@ -407,15 +443,15 @@ def terminate_session_experiments(
 
     if running_ids:
         conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
-            "WHERE status = 'running' AND session_name = ?",
-            (running_status, now, session_name),
+            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            f"WHERE status = 'running' AND {scope_sql}",
+            (running_status, now, *scope_params),
         )
     if queued_ids:
         conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
-            "WHERE status = 'queued' AND session_name = ?",
-            (queued_status, now, session_name),
+            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            f"WHERE status = 'queued' AND {scope_sql}",
+            (queued_status, now, *scope_params),
         )
     conn.commit()
     return running_ids, queued_ids
@@ -431,6 +467,7 @@ def update_experiment_metadata(
     parent_hash: Optional[str] = None,
     kernels_path: Optional[str] = None,
     session_name: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> None:
     """Update experiment metadata.
 
@@ -465,6 +502,9 @@ def update_experiment_metadata(
     if session_name is not None:
         updates.append("session_name = ?")
         params.append(session_name)
+    if session_id is not None:
+        updates.append("session_id = ?")
+        params.append(session_id)
 
     if updates:
         params.append(experiment_id)
@@ -588,12 +628,22 @@ def get_experiment_by_window(tmux_window: str) -> Optional[Experiment]:
     return Experiment.from_row(row) if row else None
 
 
-def get_running_experiments(session_name: Optional[str] = None) -> List[Experiment]:
-    """Get all running experiments, optionally filtered by session."""
+def get_running_experiments(
+    session_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> List[Experiment]:
+    """Get all running experiments, optionally filtered by session.
+
+    Pass ``session_id`` to scope to a single incarnation (with a NULL fallback so
+    pre-upgrade rows still match by name). Without it, filtering is by name alone.
+    """
     conn = get_db()
     query = "SELECT * FROM experiments WHERE status = 'running' AND (deleted IS NULL OR deleted = 0)"
     params = []
-    if session_name:
+    if session_id is not None:
+        query += " AND (session_id = ? OR (session_id IS NULL AND session_name = ?))"
+        params.extend([session_id, session_name])
+    elif session_name:
         query += " AND session_name = ?"
         params.append(session_name)
     query += " ORDER BY started_at DESC"
@@ -638,6 +688,7 @@ def create_experiment_from_mapping(
     parent_hash: Optional[str] = None,
     kernels_path: Optional[str] = None,
     session_name: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> int:
     """Create experiment with explicit ID (for recovery from remote).
 
@@ -649,8 +700,8 @@ def create_experiment_from_mapping(
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, session_name, queue_command)
-        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :session_name, :queue_command)
+        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, session_name, session_id, queue_command)
+        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :session_name, :session_id, :queue_command)
         """,
         {
             "id": experiment_id,
@@ -670,6 +721,7 @@ def create_experiment_from_mapping(
             "finished_at": finished_at,
             "kernels_path": kernels_path,
             "session_name": session_name,
+            "session_id": session_id,
             "queue_command": _build_queue_command(script, env_vars),
         }
     )

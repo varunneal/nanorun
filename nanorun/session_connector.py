@@ -365,7 +365,8 @@ class IrisConnector(SessionConnector):
         stored_env = {**env_vars, "_wandb_run_id": wandb_run_id}
         exp_id = create_experiment(
             name=name, script=script, track=track, code_hash=code_hash,
-            gpu_type="TPU", session_name=self.session_name, env_vars=stored_env,
+            gpu_type="TPU", session_name=self.session_name,
+            session_id=self.sc.session_id, env_vars=stored_env,
         )
         update_experiment_status(exp_id, "queued")
 

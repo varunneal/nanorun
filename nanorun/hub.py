@@ -94,14 +94,19 @@ class _HfBackend:
             quiet=True,
         )
 
-    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
+    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> Optional[List[str]]:
         local_logs_dir.mkdir(parents=True, exist_ok=True)
-        self._sync_bucket(
+        plan = self._sync_bucket(
             f"{self.bucket_handle}/logs/{session}",
             str(local_logs_dir),
             include=include or ["*.txt", "*.jsonl", "mappings/*.jsonl", "queue/*.jsonl"],
             quiet=True,
         )
+        # SyncPlan.operations: action=="download" => the file was pulled (new or grew);
+        # op.path is relative to dest (the session log dir), e.g. "abc.txt" or
+        # "mappings/mappings-0.jsonl". This is exactly the key the delivery-driven
+        # parser needs (top-level "*.txt" stem == run_id).
+        return [op.path for op in plan.operations if op.action == "download"]
 
     def list_logs(self, session: str) -> List[str]:
         prefix = f"logs/{session}"
@@ -244,9 +249,13 @@ class _S3Backend:
                 pass
             self._s3.upload_file(str(path), self.bucket_name, key)
 
-    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
-        """Incremental download using Range GETs — only fetches new bytes for growing files."""
+    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> Optional[List[str]]:
+        """Incremental download using Range GETs — only fetches new bytes for growing files.
+
+        Returns the relative paths (within the session log dir) this pull wrote to —
+        new files and files that grew — for the delivery-driven parser."""
         local_logs_dir.mkdir(parents=True, exist_ok=True)
+        changed: List[str] = []
         prefix = self._key("logs", session)
         paginator = self._s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix + "/"):
@@ -272,6 +281,8 @@ class _S3Backend:
                     with open(local_path, "ab") as f:
                         for chunk in resp["Body"].iter_chunks(1024 * 64):
                             f.write(chunk)
+                changed.append(rel)
+        return changed
 
     def list_logs(self, session: str) -> List[str]:
         prefix = self._key("logs", session) + "/"
@@ -397,11 +408,15 @@ class _LocalBackend:
                 with open(dst, "ab") as df:
                     df.write(new_bytes)
 
-    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
+    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> Optional[List[str]]:
+        """Returns the relative paths (within the session log dir) this pull wrote to —
+        new files and files that grew — for the delivery-driven parser. Empty list (not
+        None) when the source dir is missing: the backend can report, there's just nothing."""
         local_logs_dir.mkdir(parents=True, exist_ok=True)
         src_dir = self._dir("logs", session)
         if not src_dir.exists():
-            return
+            return []
+        changed: List[str] = []
         for src in src_dir.rglob("*"):
             if not src.is_file():
                 continue
@@ -422,6 +437,8 @@ class _LocalBackend:
                     new_bytes = sf.read()
                 with open(dst, "ab") as df:
                     df.write(new_bytes)
+            changed.append(rel.as_posix())
+        return changed
 
     def list_logs(self, session: str) -> List[str]:
         logs_dir = self._dir("logs", session)
@@ -547,11 +564,15 @@ class _IrisBackend:
             return []
         return jobs
 
-    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
+    def sync_logs_down(self, local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> Optional[List[str]]:
         """Fetch metrics from W&B and write to local log files in nanorun-parseable format.
 
         remote_run_id is now the wandb_run_id (12-char UUID). The iris job ID
         is stored in env_vars._iris_job_id for status reconciliation.
+
+        Returns None: iris rewrites whole run log files from W&B history each pass, so
+        there's no incremental delta to report. None signals the parser to use its
+        whole-file, dedup-driven path (_parse_iris_metrics) rather than delivery-driven.
         """
         local_logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -801,6 +822,7 @@ class _IrisBackend:
 
         if row_errors and row_errors == len(rows):
             raise RuntimeError(f"Iris W&B sync failed for all {row_errors} experiments in session {session}")
+        return None  # whole-file mode (see docstring)
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         pass
@@ -888,8 +910,10 @@ def sync_queue_up(local_logs_dir: Path, session: str) -> None:
     _get_backend_instance().sync_queue_up(local_logs_dir, session)
 
 
-def sync_logs_down(local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> None:
-    _get_backend_instance().sync_logs_down(local_logs_dir, session, include)
+def sync_logs_down(local_logs_dir: Path, session: str, include: Optional[List[str]] = None) -> Optional[List[str]]:
+    """Pull a session's logs. Returns the paths (relative to the session log dir)
+    this pull changed, or None if the backend can't report deltas (whole-file mode)."""
+    return _get_backend_instance().sync_logs_down(local_logs_dir, session, include)
 
 
 def list_logs(session: str) -> List[str]:

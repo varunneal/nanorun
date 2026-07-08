@@ -185,6 +185,13 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
         if remote.create_tmux_session():
             console.print(f"[dim]tmux session '{session_config.tmux_session}' ready[/dim]")
 
+    # Stamp the incarnation timestamp. `session start` overwrites a same-name
+    # config, so each machine incarnation gets a fresh started_at → a fresh
+    # session_id that scopes reconciliation to this incarnation. Reconnect and
+    # daemon restart never call session_start, so it's stable for the session's life.
+    from datetime import datetime, timezone
+    session_config.started_at = datetime.now(timezone.utc).isoformat()
+
     # Save session
     config = Config(session=session_config)
     config.save()
@@ -856,7 +863,9 @@ def job_logs(tail: bool, window: str, lines: int, job_id: str, session_name):
 
         target_window = window
         if target_window is None:
-            running = get_running_experiments(session_name=session_name)
+            running = get_running_experiments(
+                session_name=session_name, session_id=Config.session_id_for(session_name),
+            )
             if running and running[0].tmux_window:
                 target_window = running[0].tmux_window
             else:

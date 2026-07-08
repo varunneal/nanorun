@@ -56,8 +56,11 @@ def cancel_experiment(start_next: bool = True, session_name: Optional[str] = Non
     Returns:
         True if an experiment was cancelled, False otherwise.
     """
-    # Get local running experiments to update local DB
-    running = get_running_experiments(session_name=session_name)
+    # Get local running experiments to update local DB (scoped to this incarnation)
+    from .config import Config
+    running = get_running_experiments(
+        session_name=session_name, session_id=Config.session_id_for(session_name),
+    )
     if not running:
         console.print("[yellow]No experiment currently running[/yellow]")
         return False
@@ -119,8 +122,11 @@ def resume_queue(session_name: Optional[str] = None) -> bool:
             except DaemonError as e:
                 console.print(f"[yellow]Could not reach daemon: {e}[/yellow]")
 
-    # Check if experiment already running locally
-    running = get_running_experiments(session_name=session_name)
+    # Check if experiment already running locally (scoped to this incarnation)
+    from .config import Config
+    running = get_running_experiments(
+        session_name=session_name, session_id=Config.session_id_for(session_name),
+    )
     if running:
         console.print(f"[dim]Experiment '{running[0].name}' still running - queue will continue when it finishes[/dim]")
         return False

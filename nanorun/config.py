@@ -37,6 +37,23 @@ class SessionConfig:
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     sync_paused: bool = False  # If True, the local daemon skips background metric/log/status scanning for this session
+    # Set once at `session start` (UTC ISO). session_name is reused across machine
+    # incarnations, so it's not unique over time; started_at pins this config to one
+    # incarnation. None for pre-upgrade sessions (they fall back to bare name below).
+    started_at: Optional[str] = None
+
+    @property
+    def session_id(self) -> str:
+        """Globally-unique-across-time id for this session incarnation.
+
+        session_name is reused across machine incarnations (e.g. 'qlabs' spanned
+        many rented machines over weeks under one name), so it can't safely scope
+        reconciliation queries — a new run would match a prior incarnation's rows.
+        session_id pins to one incarnation via the connect timestamp. Falls back to
+        the bare name for pre-upgrade sessions that never stamped started_at, so
+        their behavior is exactly as before.
+        """
+        return f"{self.name}::{self.started_at}" if self.started_at else self.name
 
 
 @dataclass
@@ -218,6 +235,20 @@ class Config:
         return True
 
     @classmethod
+    def session_id_for(cls, name: Optional[str]) -> Optional[str]:
+        """Resolve a session's session_id from its name (active session if None).
+
+        Used by CLI-side callers to scope get_running_experiments() to one
+        incarnation. Returns None if the session can't be loaded, in which case the
+        caller falls back to name-only matching.
+        """
+        name = name or cls.get_active_session_name()
+        if not name:
+            return None
+        sc = cls.load_session(name)
+        return sc.session_id if sc else None
+
+    @classmethod
     def load(cls) -> "Config":
         """Load config with the active session."""
         name = cls.get_active_session_name()
@@ -249,7 +280,11 @@ class Config:
         # Lazy import: tracker imports config at module load, so importing at
         # module top would be circular.
         from .tracker import terminate_session_experiments
-        running_ids, queued_ids = terminate_session_experiments(name)
+        # Load the config for its session_id *before* unlinking, so cancellation is
+        # scoped to this incarnation (not a same-named row from an earlier machine).
+        sc = cls.load_session(name)
+        session_id = sc.session_id if sc else None
+        running_ids, queued_ids = terminate_session_experiments(name, session_id=session_id)
         cancelled = len(running_ids) + len(queued_ids)
 
         session_file = cls._get_session_file(name)

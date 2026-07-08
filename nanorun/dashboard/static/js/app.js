@@ -717,7 +717,7 @@ function openSessionPopover(name) {
     popover.id = 'session-popover';
     const gpuLabel = s.gpu_count > 1 ? `${s.gpu_count}× ${s.gpu_type}` : s.gpu_type;
     let body = `<div class="sp-header"><span class="sp-name">${s.name}</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info"><span style="color:var(--text-primary)">${s.host}</span> <span style="color:#888">${gpuLabel}</span></div>`;
-    const pauseBtn = `<button class="sp-btn sp-btn-secondary" id="sp-sync-${name}" onclick="doToggleSync('${name}', true)">⏸ Pause Sync</button>`;
+    const pauseBtn = `<button class="sp-btn sp-btn-warning" id="sp-sync-${name}" onclick="doToggleSync('${name}', true)">⏸ Pause Sync</button>`;
     const resumeBtn = `<button class="sp-btn sp-btn-primary" id="sp-sync-${name}" onclick="doToggleSync('${name}', false)">▶ Resume Sync</button>`;
     if (s.sync_paused) {
         // Paused: the daemon isn't scanning this session — only offer Resume.
