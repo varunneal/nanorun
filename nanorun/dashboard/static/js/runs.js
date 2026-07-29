@@ -350,7 +350,7 @@ function getVisibleRuns() {
         if (col === 'started_at') {
             va = a.started_at || ''; vb = b.started_at || '';
         } else if (col === 'val_loss') {
-            va = a.final_val_loss ?? Infinity; vb = b.final_val_loss ?? Infinity;
+            va = a.final_loss ?? a.final_val_loss ?? Infinity; vb = b.final_loss ?? b.final_val_loss ?? Infinity;
         } else if (col === 'time') {
             va = a.final_train_time_ms ?? Infinity; vb = b.final_train_time_ms ?? Infinity;
         } else if (col === 'status') {
@@ -427,7 +427,7 @@ function renderRunsTable() {
                 ${showSession ? '<th>Session</th>' : ''}
                 <th class="${sortCls('started_at')}" onclick="toggleRunsSort('started_at')">Started</th>
                 ${runsIsSweep ? `<th>Env</th>` : ''}
-                <th class="${sortCls('val_loss')}" onclick="toggleRunsSort('val_loss')">Val Loss</th>
+                <th class="${sortCls('val_loss')}" onclick="toggleRunsSort('val_loss')">${lossColumnLabel(limited)}</th>
                 <th class="${sortCls('time')}" onclick="toggleRunsSort('time')">Time</th>
                 <th></th>
             </tr>
@@ -454,7 +454,7 @@ function renderRunsTable() {
                     ${sessionHtml}
                     <td class="started-at">${formatStartedAt(d.started_at)}</td>
                     ${envHtml}
-                    <td class="val-loss">${d.final_val_loss ? d.final_val_loss.toFixed(4) : 'n/a'}</td>
+                    <td class="val-loss">${(d.final_loss ?? d.final_val_loss) ? (d.final_loss ?? d.final_val_loss).toFixed(4) : 'n/a'}</td>
                     <td>${d.final_train_time_ms ? (d.final_train_time_ms/1000).toFixed(1) + 's' : 'n/a'}</td>
                     <td>${isBucketView
                         ? `<button class="delete-icon bucket-remove" onclick="event.stopPropagation(); removeFromBucket(${d.id})" title="Remove from bucket"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`
@@ -495,7 +495,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
             <thead>
                 <tr>
                     <th>Step</th>
-                    <th>Val Loss</th>
+                    <th>${lossColumnLabel(currentValidData)}</th>
                     <th>Time</th>
                     <th>Step Avg</th>
                 </tr>
@@ -504,7 +504,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
                 ${recentData.map(m => `
                     <tr>
                         <td>${m.step}</td>
-                        <td class="val-loss">${m.val_loss ? m.val_loss.toFixed(4) : '-'}</td>
+                        <td class="val-loss">${(m.loss ?? m.val_loss) ? (m.loss ?? m.val_loss).toFixed(4) : '-'}</td>
                         <td>${m.train_time_ms ? formatTime(m.train_time_ms) : '-'}</td>
                         <td>${m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-'}</td>
                     </tr>
@@ -519,14 +519,15 @@ function copyMetricsAsMarkdown() {
     if (!currentMetricsData || currentMetricsData.length === 0) return;
 
     // Build markdown table
+    const label = lossColumnLabel(State.get('experimentData'));
     const lines = [
-        '| Step | Val Loss | Time | Step Avg |',
+        `| Step | ${label} | Time | Step Avg |`,
         '|------|----------|------|----------|'
     ];
 
     currentMetricsData.forEach(m => {
         const step = m.step;
-        const valLoss = m.val_loss ? m.val_loss.toFixed(4) : '-';
+        const valLoss = (m.loss ?? m.val_loss) ? (m.loss ?? m.val_loss).toFixed(4) : '-';
         const time = m.train_time_ms ? formatTime(m.train_time_ms) : '-';
         const stepAvg = m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-';
         lines.push(`| ${step} | ${valLoss} | ${time} | ${stepAvg} |`);
@@ -545,18 +546,20 @@ function copyRunsAsMarkdown() {
 
     const statusLabel = (s) => s === 'running' ? 'in progress' : s === 'completed' ? 'success' : s;
 
+    const lossHdr = lossColumnLabel(runs);
+
     let header, separator;
     if (isBucketView && hasEnvVars) {
-        header = '| Script | Run | Status | Env | Val Loss | Time |';
+        header = `| Script | Run | Status | Env | ${lossHdr} | Time |`;
         separator = '|--------|-----|--------|-----|----------|------|';
     } else if (isBucketView) {
-        header = '| Script | Run | Status | Val Loss | Time |';
+        header = `| Script | Run | Status | ${lossHdr} | Time |`;
         separator = '|--------|-----|--------|----------|------|';
     } else if (hasEnvVars) {
-        header = '| Run | Status | Env | Val Loss | Time |';
+        header = `| Run | Status | Env | ${lossHdr} | Time |`;
         separator = '|-----|--------|-----|----------|------|';
     } else {
-        header = '| Run | Status | Val Loss | Time |';
+        header = `| Run | Status | ${lossHdr} | Time |`;
         separator = '|-----|--------|----------|------|';
     }
     const lines = [header, separator];
@@ -564,7 +567,7 @@ function copyRunsAsMarkdown() {
     runs.forEach(d => {
         const runId = d.remote_run_id || `#${d.id}`;
         const status = statusLabel(d.status || 'unknown');
-        const valLoss = d.final_val_loss ? d.final_val_loss.toFixed(4) : '-';
+        const valLoss = (d.final_loss ?? d.final_val_loss) ? (d.final_loss ?? d.final_val_loss).toFixed(4) : '-';
         const time = d.final_train_time_ms ? (d.final_train_time_ms / 1000).toFixed(1) + 's' : '-';
         const script = d.script ? d.script.split('/').pop().replace('.py', '') : d.name;
         const env = Object.entries(d.env_vars || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '-';

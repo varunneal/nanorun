@@ -52,6 +52,50 @@ def _resolve_session(ctx, param, value):
     raise SystemExit(1)
 
 
+def _print_connector_result(result) -> bool:
+    """Print a connector result's message. Returns True if the command should return early."""
+    if result.unsupported:
+        console.print(f"[yellow]{result.message}[/yellow]")
+        return True
+    if not result.success:
+        console.print(f"[red]{result.message}[/red]")
+        return True
+    if result.message:
+        console.print(f"[green]{result.message}[/green]")
+    return False
+
+
+def _require_daemon_client(session_name):
+    """Get daemon client or print error and return None."""
+    from .remote_control import get_daemon_client
+    client = get_daemon_client(session_name)
+    if not client:
+        console.print("[red]No active session[/red]")
+    return client
+
+
+def _resolve_active_sessions(session_name: str | None) -> list[str]:
+    """Resolve session_name to a list of active session names for multi-session commands."""
+    from .local_daemon import SessionState
+
+    if session_name:
+        sc = Config.load_session(session_name)
+        if not sc:
+            console.print(f"[red]Session '{session_name}' not found.[/red]")
+            raise SystemExit(1)
+        return [session_name]
+
+    session_names = []
+    for sc in Config.list_sessions():
+        if sc.session_type == "iris":
+            session_names.append(sc.name)
+        else:
+            state = SessionState.load(sc.name)
+            if state.status == "connected":
+                session_names.append(sc.name)
+    return session_names
+
+
 def session_option(f):
     """Decorator to add --session option. Always resolves to a valid session name."""
     f = click.option(
@@ -781,11 +825,7 @@ def job_resume(session_name):
     from .session_connector import get_connector
 
     result = get_connector(session_name).resume()
-    if result.unsupported:
-        console.print(f"[yellow]{result.message}[/yellow]")
-        return
-    if not result.success:
-        console.print(f"[red]{result.message}[/red]")
+    _print_connector_result(result)
 
 
 @job.command("status")
@@ -794,23 +834,8 @@ def job_resume(session_name):
 def job_status(daemon: bool, session_name):
     """Show current job and queue status."""
     from .session_connector import get_connector
-    from .local_daemon import SessionState
 
-    if session_name:
-        sc = Config.load_session(session_name)
-        if not sc:
-            console.print(f"[red]Session '{session_name}' not found.[/red]")
-            raise SystemExit(1)
-        session_names = [session_name]
-    else:
-        session_names = []
-        for sc in Config.list_sessions():
-            if sc.session_type == "iris":
-                session_names.append(sc.name)
-            else:
-                state = SessionState.load(sc.name)
-                if state.status == "connected":
-                    session_names.append(sc.name)
+    session_names = _resolve_active_sessions(session_name)
 
     if not session_names:
         console.print("[dim]No active sessions[/dim]")
@@ -900,11 +925,10 @@ def job_ps(session_name):
     Lists all processes using the GPU via nvidia-smi.
     The daemon will automatically kill orphan GPU processes when idle.
     """
-    from .remote_control import get_daemon_client, DaemonError
+    from .remote_control import DaemonError
 
-    daemon = get_daemon_client(session_name)
+    daemon = _require_daemon_client(session_name)
     if not daemon:
-        console.print("[red]No active session[/red]")
         return
 
     try:
@@ -951,25 +975,8 @@ def job_queue(ctx, flat, session_name):
         return
 
     from .session_connector import get_connector
-    from .local_daemon import SessionState
 
-    # Determine which sessions to show
-    if session_name:
-        sc = Config.load_session(session_name)
-        if not sc:
-            console.print(f"[red]Session '{session_name}' not found.[/red]")
-            raise SystemExit(1)
-        session_names = [session_name]
-    else:
-        # Show only active (connected or iris) sessions
-        session_names = []
-        for sc in Config.list_sessions():
-            if sc.session_type == "iris":
-                session_names.append(sc.name)
-            else:
-                state = SessionState.load(sc.name)
-                if state.status == "connected":
-                    session_names.append(sc.name)
+    session_names = _resolve_active_sessions(session_name)
 
     if not session_names:
         console.print("[dim]No active sessions[/dim]")
@@ -1062,13 +1069,7 @@ def job_clear(yes: bool, session_name):
 
     connector = get_connector(session_name)
     result = connector.clear()
-    if result.unsupported:
-        console.print(f"[yellow]{result.message}[/yellow]")
-        return
-    if not result.success:
-        console.print(f"[red]{result.message}[/red]")
-        return
-    console.print(f"[green]{result.message}[/green]")
+    _print_connector_result(result)
 
 
 @job.command("remove")
@@ -1080,13 +1081,7 @@ def job_remove(index: int, session_name):
 
     connector = get_connector(session_name)
     result = connector.remove(index)
-    if result.unsupported:
-        console.print(f"[yellow]{result.message}[/yellow]")
-        return
-    if not result.success:
-        console.print(f"[red]{result.message}[/red]")
-        return
-    console.print(f"[green]{result.message}[/green]")
+    _print_connector_result(result)
 
 
 @job.command("history")
@@ -1135,33 +1130,34 @@ def job_history(num: int, verbose: bool, session_name):
     # Take most recent N
     snapshots = deduped[-num:]
 
-    if session_name:
-        for snap in reversed(snapshots):
-            ts = snap["ts"][:19].replace("T", " ")
-            queue = snap.get("queue", [])
+    def print_queue_items(queue, verbose):
+        for i, item in enumerate(queue, 1):
+            name = item.get("name") or item.get("script", "?").split("/")[-1].replace(".py", "")
+            env = item.get("env_vars", {})
+            env_str = " ".join(f"{k}={v}" for k, v in env.items()) if env else ""
+            if verbose:
+                line = f"  {i}. {item.get('script', '?')}"
+                if env_str:
+                    line += f"  {env_str}"
+            else:
+                line = f"  {i}. {name}"
+                if env_str:
+                    line += f" | {env_str}"
+            print(line)
+
+    for snap in reversed(snapshots):
+        ts = snap["ts"][:19].replace("T", " ")
+        session = snap.get("session", "?")
+        queue = snap.get("queue", [])
+        if session_name:
             print(f"{ts}  [{len(queue)} jobs]")
-            for i, item in enumerate(queue, 1):
-                name = item.get("name") or item.get("script", "?").split("/")[-1].replace(".py", "")
-                env = item.get("env_vars", {})
-                env_str = " ".join(f"{k}={v}" for k, v in env.items()) if env else ""
-                if verbose:
-                    script = item.get("script", "?")
-                    line = f"  {i}. {script}"
-                    if env_str:
-                        line += f"  {env_str}"
-                else:
-                    line = f"  {i}. {name}"
-                    if env_str:
-                        line += f" | {env_str}"
-                print(line)
+            print_queue_items(queue, verbose)
             print()
-    else:
-        # Summary view across all sessions
-        for snap in reversed(snapshots):
-            ts = snap["ts"][:19].replace("T", " ")
-            session = snap.get("session", "?")
-            queue = snap.get("queue", [])
+        else:
             print(f"{ts}  {session:<20s}  {len(queue)} jobs")
+            if verbose:
+                print_queue_items(queue, verbose)
+                print()
 
 
 # ============================================================================
@@ -1505,11 +1501,10 @@ def daemon():
 @session_option
 def daemon_status(session_name):
     """Show remote daemon status."""
-    from .remote_control import get_daemon_client, DaemonError
+    from .remote_control import DaemonError
 
-    client = get_daemon_client(session_name)
+    client = _require_daemon_client(session_name)
     if not client:
-        console.print("[red]No active session[/red]")
         return
 
     # Check if daemon window exists
@@ -1561,11 +1556,8 @@ def daemon_status(session_name):
 @session_option
 def daemon_stop(session_name):
     """Stop the remote daemon."""
-    from .remote_control import get_daemon_client
-
-    client = get_daemon_client(session_name)
+    client = _require_daemon_client(session_name)
     if not client:
-        console.print("[red]No active session[/red]")
         return
 
     if client.stop_daemon():
@@ -1578,11 +1570,10 @@ def daemon_stop(session_name):
 @session_option
 def daemon_restart(session_name):
     """Restart the remote daemon (picks up new code)."""
-    from .remote_control import get_daemon_client, DaemonError
+    from .remote_control import DaemonError
 
-    client = get_daemon_client(session_name)
+    client = _require_daemon_client(session_name)
     if not client:
-        console.print("[red]No active session[/red]")
         return
 
     try:
@@ -1601,11 +1592,9 @@ def daemon_restart(session_name):
 def daemon_logs(lines: int, tail: bool, session_name):
     """View remote daemon logs from tmux."""
     import time
-    from .remote_control import get_daemon_client
 
-    client = get_daemon_client(session_name)
+    client = _require_daemon_client(session_name)
     if not client:
-        console.print("[red]No active session[/red]")
         return
 
     if tail:

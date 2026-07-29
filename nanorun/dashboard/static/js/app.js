@@ -219,7 +219,7 @@ function _buildExperimentListHtml(experiments) {
                 </div>
             </div>
             <div class="exp-metrics">
-                <span class="val-loss">${formatValLoss(exp.val_loss, exp.train_time_ms)}${exp.n_runs > 1 ? ` <span class="n-runs-inline">(n=${exp.n_runs})</span>` : ''}</span>
+                <span class="val-loss">${formatLoss(exp.loss ?? exp.val_loss, exp.train_time_ms, exp.loss_metric)}${exp.n_runs > 1 ? ` <span class="n-runs-inline">(n=${exp.n_runs})</span>` : ''}</span>
                 ${exp.status === 'running' ? `
                 <div class="exp-progress">
                     <div class="progress-bar">
@@ -256,7 +256,7 @@ async function refreshExperiments() {
     }
 
     // Only rebuild sidebar DOM if the data actually changed
-    const fingerprint = JSON.stringify(data.experiments.map(e => [e.code_hash || e.id, e.status, e.val_loss, e.current_step]));
+    const fingerprint = JSON.stringify(data.experiments.map(e => [e.code_hash || e.id, e.status, e.loss ?? e.val_loss, e.current_step]));
     if (fingerprint !== _lastExperimentsJson) {
         _lastExperimentsJson = fingerprint;
         listEl.innerHTML = _buildExperimentListHtml(data.experiments);
@@ -356,8 +356,10 @@ async function selectExperiment(codeHashOrId, experimentIds) {
 
     // Compute aggregated stats (exclude running from averages)
     const completedData = validData.filter(d => d.status !== 'running');
-    const valLosses = completedData.map(d => d.final_val_loss).filter(v => v != null);
+    const valLosses = completedData.map(d => d.final_loss ?? d.final_val_loss).filter(v => v != null);
     const trainTimes = completedData.map(d => d.final_train_time_ms).filter(v => v != null);
+    // All runs here share a code_hash, so they share a loss series.
+    const lossMetric = (validData.find(d => d.loss_metric) || {}).loss_metric;
     const meanValLoss = valLosses.length ? valLosses.reduce((a, b) => a + b, 0) / valLosses.length : null;
     const meanTrainTime = trainTimes.length ? trainTimes.reduce((a, b) => a + b, 0) / trainTimes.length : null;
 
@@ -403,8 +405,8 @@ async function selectExperiment(codeHashOrId, experimentIds) {
                 <h4 class="runs-header-clickable" onclick="copyRunsAsMarkdown()" title="Click to copy as markdown">Runs</h4>
                 <div class="stats-hero">
                     <div class="stat-box">
-                        <span class="stat-label">${isMultiple ? 'Mean Loss' : 'Val Loss'}</span>
-                        <span class="stat-value ${meanValLoss && meanValLoss < 3.3 ? 'good' : ''}">${meanValLoss ? meanValLoss.toFixed(4) : 'n/a'}</span>
+                        <span class="stat-label">${isMultiple ? `Mean ${lossLabel(lossMetric, true)} Loss` : lossLabel(lossMetric)}</span>
+                        <span class="stat-value ${lossMetric !== 'train_loss' && meanValLoss && meanValLoss < 3.3 ? 'good' : ''}">${meanValLoss ? meanValLoss.toFixed(4) : 'n/a'}</span>
                         ${isMultiple && valLosses.length > 1 ? `<span class="stat-range">(${Math.min(...valLosses).toFixed(4)}-${Math.max(...valLosses).toFixed(4)})</span>` : ''}
                     </div>
                     <div class="stat-box">
@@ -530,7 +532,7 @@ async function refreshQueue() {
                         </div>
                         <span class="progress-text">${r.current_step || 0}/${r.total_steps || '?'}</span>
                     </div>
-                    ${r.val_loss ? `<div class="queue-running-loss">Val Loss: ${r.val_loss.toFixed(4)}</div>` : ''}
+                    ${(r.loss ?? r.val_loss) ? `<div class="queue-running-loss">${lossLabel(r.loss_metric)}: ${(r.loss ?? r.val_loss).toFixed(4)}</div>` : ''}
                 </div>
             `;
         });

@@ -24,13 +24,31 @@ function formatStartedAt(isoString) {
     return `${month}/${day} ${hour12}:${mins}${ampm}`;
 }
 
-function formatValLoss(val_loss, train_time_ms) {
-    if (!val_loss) return '<span class="val-loss-value">n/a</span>';
-    const loss = val_loss.toFixed(4);
+// Short column/label text for a run's primary loss series. `loss_metric` is
+// inferred server-side from the rows a run actually produced: 'val_loss' when
+// it reports a validation loss, 'train_loss' when training loss is all it has.
+function lossLabel(loss_metric, short = false) {
+    if (loss_metric === 'train_loss') return short ? 'Train' : 'Train Loss';
+    return short ? 'Val' : 'Val Loss';
+}
+
+// Column heading for a set of runs. Bucket views can mix scripts that report
+// different series, in which case neither label is honest — fall back to 'Loss'.
+function lossColumnLabel(items) {
+    const metrics = new Set((items || []).map(d => d && d.loss_metric).filter(Boolean));
+    if (metrics.size > 1) return 'Loss';
+    return lossLabel(metrics.size === 1 ? [...metrics][0] : undefined);
+}
+
+function formatLoss(loss, train_time_ms, loss_metric) {
+    if (!loss) return '<span class="val-loss-value">n/a</span>';
+    // Train-loss runs get a marker so they're never mistaken for val numbers.
+    const tag = loss_metric === 'train_loss' ? '<span class="loss-metric-tag">train</span>' : '';
+    const value = `<span class="val-loss-value">${loss.toFixed(4)}</span>${tag}`;
     if (train_time_ms) {
-        return `<span class="val-loss-value">${loss}</span><span class="val-loss-at">@</span><span class="val-loss-time">${formatTime(train_time_ms)}</span>`;
+        return `${value}<span class="val-loss-at">@</span><span class="val-loss-time">${formatTime(train_time_ms)}</span>`;
     }
-    return `<span class="val-loss-value">${loss}</span>`;
+    return value;
 }
 
 function renderDiff(diffText) {
@@ -126,17 +144,24 @@ function computeAveragedMetrics(allLossCurves) {
             if (!byStep[m.step]) {
                 byStep[m.step] = { val_losses: [], train_times: [], step_avgs: [] };
             }
-            if (m.val_loss != null) byStep[m.step].val_losses.push(m.val_loss);
+            // `loss` is the run's primary series; fall back to val_loss so this
+            // still works on a cached response from before loss_metric existed.
+            const loss = m.loss != null ? m.loss : m.val_loss;
+            if (loss != null) byStep[m.step].val_losses.push(loss);
             if (m.train_time_ms != null) byStep[m.step].train_times.push(m.train_time_ms);
             if (m.step_avg_ms != null) byStep[m.step].step_avgs.push(m.step_avg_ms);
         });
     });
-    const avgMetrics = Object.entries(byStep).map(([step, data]) => ({
-        step: parseInt(step),
-        val_loss: data.val_losses.length ? data.val_losses.reduce((a,b) => a+b, 0) / data.val_losses.length : null,
-        train_time_ms: data.train_times.length ? data.train_times.reduce((a,b) => a+b, 0) / data.train_times.length : null,
-        step_avg_ms: data.step_avgs.length ? data.step_avgs.reduce((a,b) => a+b, 0) / data.step_avgs.length : null,
-        n: data.val_losses.length
-    }));
+    const avgMetrics = Object.entries(byStep).map(([step, data]) => {
+        const mean = data.val_losses.length ? data.val_losses.reduce((a,b) => a+b, 0) / data.val_losses.length : null;
+        return {
+            step: parseInt(step),
+            loss: mean,
+            val_loss: mean,
+            train_time_ms: data.train_times.length ? data.train_times.reduce((a,b) => a+b, 0) / data.train_times.length : null,
+            step_avg_ms: data.step_avgs.length ? data.step_avgs.reduce((a,b) => a+b, 0) / data.step_avgs.length : null,
+            n: data.val_losses.length
+        };
+    });
     return avgMetrics.sort((a, b) => a.step - b.step);
 }

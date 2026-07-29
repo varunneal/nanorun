@@ -53,6 +53,7 @@ def _setup_logging():
     return logger
 
 log = _setup_logging()
+DASHBOARD_HOST = "127.0.0.1"
 
 
 @dataclass
@@ -316,20 +317,6 @@ def _ingest_queue_for_session(session_name: str):
     _write_queue_cache_with_precedence(session_name, ts, queue, connected=None)
 
 
-def _sync_all_logs(session_name: str) -> Optional[List[str]]:
-    """Pull a session's logs from the hub. Returns the backend's changed-file list
-    (paths relative to the session log dir), or None if the backend can't report
-    deltas (iris = whole-file mode)."""
-    from . import hub
-    session_config = Config.load_session(session_name)
-    session_logs_dir = PATHS.logs_dir / session_name
-    if session_config and session_config.session_type == "iris":
-        backend = hub._IrisBackend(session_config)
-        return backend.sync_logs_down(session_logs_dir, session_name)
-    else:
-        return hub.sync_logs_down(session_logs_dir, session_name)
-
-
 class HubSyncer:
     """Single HTTPS connection to Hub, syncs logs for all sessions.
 
@@ -348,6 +335,8 @@ class HubSyncer:
         self._thread: Optional[threading.Thread] = None
         self._was_connected: bool = False
         self._last_sync: float = 0
+        self._sync_processes: Dict[str, subprocess.Popen] = {}
+        self._sync_processes_lock = threading.Lock()
         # Sessions that have had their one-time full catch-up parse since daemon
         # start. First pass per session re-parses everything the hub delivered
         # (restart-to-recover); subsequent passes are delivery-driven. Reset on
@@ -362,6 +351,10 @@ class HubSyncer:
 
     def stop(self):
         self.running = False
+        with self._sync_processes_lock:
+            processes = list(self._sync_processes.values())
+        for proc in processes:
+            self._terminate_sync_process(proc)
         if self._thread:
             self._thread.join(timeout=10)
 
@@ -656,27 +649,115 @@ class HubSyncer:
                 self.event(f"[{session_name}] Synced {new_count} metric steps for experiment {exp_id}")
 
     def _sync_with_timeout(self, session_name: str) -> Optional[List[str]]:
-        """Run sync in a worker thread with a timeout to prevent hanging.
+        """Run sync in a disposable subprocess and reap it on every exit path.
 
         Returns the backend's changed-file list (paths relative to the session log
         dir), or None if the backend can't report deltas (whole-file mode)."""
-        exc_box: list = [None]
-        result_box: list = [None]
+        from .hub_sync_worker import RESULT_PREFIX
 
-        def _worker():
+        with self._sync_processes_lock:
+            if session_name in self._sync_processes:
+                raise RuntimeError(f"Sync already in progress for {session_name}")
+            proc = subprocess.Popen(
+                self._sync_command(session_name),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self._sync_processes[session_name] = proc
+
+        try:
+            stdout, stderr = self._communicate_with_sync_worker(proc, session_name)
+        finally:
+            with self._sync_processes_lock:
+                if self._sync_processes.get(session_name) is proc:
+                    self._sync_processes.pop(session_name, None)
+
+        if proc.returncode != 0:
+            detail = stderr.strip() or stdout.strip() or "no worker output"
+            raise RuntimeError(
+                f"Sync worker for {session_name} exited {proc.returncode}: {detail}"
+            )
+
+        for line in reversed(stdout.splitlines()):
+            if not line.startswith(RESULT_PREFIX):
+                continue
             try:
-                result_box[0] = _sync_all_logs(session_name)
-            except Exception as e:
-                exc_box[0] = e
+                payload = json.loads(line.removeprefix(RESULT_PREFIX))
+                changed = payload["changed"]
+            except (json.JSONDecodeError, KeyError) as exc:
+                raise RuntimeError(
+                    f"Sync worker for {session_name} returned an invalid result"
+                ) from exc
+            if changed is not None and not (
+                isinstance(changed, list)
+                and all(isinstance(path, str) for path in changed)
+            ):
+                raise RuntimeError(
+                    f"Sync worker for {session_name} returned invalid changed paths"
+                )
+            return changed
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        t.join(timeout=self.SYNC_TIMEOUT)
-        if t.is_alive():
-            raise TimeoutError(f"Sync for {session_name} hung for >{self.SYNC_TIMEOUT}s")
-        if exc_box[0]:
-            raise exc_box[0]
-        return result_box[0]
+        raise RuntimeError(f"Sync worker for {session_name} returned no result")
+
+    @staticmethod
+    def _sync_command(session_name: str) -> List[str]:
+        return [
+            sys.executable,
+            "-u",
+            "-m",
+            "nanorun.hub_sync_worker",
+            session_name,
+        ]
+
+    def _communicate_with_sync_worker(
+        self,
+        proc: subprocess.Popen,
+        session_name: str,
+    ) -> tuple[str, str]:
+        try:
+            return proc.communicate(timeout=self.SYNC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            self._terminate_sync_process(proc)
+            raise TimeoutError(
+                f"Sync for {session_name} hung for >{self.SYNC_TIMEOUT}s"
+            ) from None
+
+    @staticmethod
+    def _signal_sync_process(proc: subprocess.Popen, sig: signal.Signals) -> None:
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            action = proc.terminate if sig == signal.SIGTERM else proc.kill
+            action()
+
+    @staticmethod
+    def _wait_for_sync_process(proc: subprocess.Popen, timeout: float) -> bool:
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    @staticmethod
+    def _terminate_sync_process(
+        proc: subprocess.Popen,
+        terminate_timeout: float = 5.0,
+    ) -> None:
+        """Terminate the worker's process group, escalate, and always reap it."""
+        if proc.poll() is not None:
+            proc.wait()
+            return
+
+        HubSyncer._signal_sync_process(proc, signal.SIGTERM)
+        if HubSyncer._wait_for_sync_process(proc, terminate_timeout):
+            return
+
+        HubSyncer._signal_sync_process(proc, signal.SIGKILL)
+        proc.wait()
 
 
 _log_offsets: dict[str, int] = {}
@@ -1333,7 +1414,7 @@ class LocalMetricsDaemon:
         app.state.daemon = self
 
         config = uvicorn.Config(
-            app, host="0.0.0.0", port=self.dashboard_port, log_level="warning"
+            app, host=DASHBOARD_HOST, port=self.dashboard_port, log_level="warning"
         )
         server = uvicorn.Server(config)
 

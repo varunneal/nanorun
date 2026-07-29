@@ -9,12 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 
-from rich.console import Console
-from rich.table import Table
-
-from .config import Config, get_track, discover_tracks
-
-console = Console()
+from .config import Config
 
 
 def get_db_path() -> Path:
@@ -237,14 +232,33 @@ class Experiment:
 
 @dataclass
 class Metric:
-    """A single metric checkpoint."""
+    """A single metric checkpoint.
+
+    ``val_loss`` and ``train_loss`` are independent series: a script may emit
+    either, both, or (at a shared step) have them merged into one row by the
+    upsert in ``record_metric``. Use ``loss``/``loss_metric`` when you want
+    "whichever series this run is actually reporting".
+    """
     step: int
     total_steps: Optional[int]
     val_loss: Optional[float]
+    train_loss: Optional[float]
     train_time_ms: Optional[int]
     step_avg_ms: Optional[float]
     is_final_step: bool
     recorded_at: datetime
+
+    @property
+    def loss(self) -> Optional[float]:
+        """Primary loss for this row — validation wins when both are present."""
+        return self.val_loss if self.val_loss is not None else self.train_loss
+
+    @property
+    def loss_metric(self) -> Optional[str]:
+        """Which series ``loss`` came from, or None if the row has neither."""
+        if self.val_loss is not None:
+            return "val_loss"
+        return "train_loss" if self.train_loss is not None else None
 
 
 # =============================================================================
@@ -618,16 +632,6 @@ def delete_experiment(experiment_id: int) -> None:
     conn.commit()
 
 
-def get_experiment_by_window(tmux_window: str) -> Optional[Experiment]:
-    """Get an experiment by tmux window name."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM experiments WHERE tmux_window = ? ORDER BY started_at DESC LIMIT 1",
-        (tmux_window,)
-    ).fetchone()
-    return Experiment.from_row(row) if row else None
-
-
 def get_running_experiments(
     session_name: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -648,17 +652,6 @@ def get_running_experiments(
         params.append(session_name)
     query += " ORDER BY started_at DESC"
     rows = conn.execute(query, params).fetchall()
-    return [Experiment.from_row(row) for row in rows]
-
-
-def get_experiments_by_status(statuses: List[str]) -> List[Experiment]:
-    """Get experiments with any of the given statuses."""
-    conn = get_db()
-    placeholders = ",".join("?" * len(statuses))
-    rows = conn.execute(
-        f"SELECT * FROM experiments WHERE status IN ({placeholders}) AND (deleted IS NULL OR deleted = 0) ORDER BY started_at DESC",
-        statuses
-    ).fetchall()
     return [Experiment.from_row(row) for row in rows]
 
 
@@ -785,6 +778,7 @@ def get_metrics(experiment_id: int) -> List[Metric]:
             step=row["step"],
             total_steps=row["total_steps"],
             val_loss=row["val_loss"],
+            train_loss=row["train_loss"],
             train_time_ms=row["train_time_ms"],
             step_avg_ms=row["step_avg_ms"],
             is_final_step=bool(row["is_final_step"]),
@@ -807,6 +801,7 @@ def get_latest_metric(experiment_id: int) -> Optional[Metric]:
         step=row["step"],
         total_steps=row["total_steps"],
         val_loss=row["val_loss"],
+        train_loss=row["train_loss"],
         train_time_ms=row["train_time_ms"],
         step_avg_ms=row["step_avg_ms"],
         is_final_step=bool(row["is_final_step"]),
@@ -827,6 +822,7 @@ def get_final_metric(experiment_id: int) -> Optional[Metric]:
         step=row["step"],
         total_steps=row["total_steps"],
         val_loss=row["val_loss"],
+        train_loss=row["train_loss"],
         train_time_ms=row["train_time_ms"],
         step_avg_ms=row["step_avg_ms"],
         is_final_step=True,
@@ -834,12 +830,37 @@ def get_final_metric(experiment_id: int) -> Optional[Metric]:
     )
 
 
-def get_final_metrics(experiment_id: int) -> Optional[Tuple[float, int, int]]:
-    """Get final val_loss, train_time_ms, steps for an experiment."""
-    metric = get_latest_metric(experiment_id)
-    if metric and metric.val_loss:
-        return (metric.val_loss, metric.train_time_ms, metric.step)
-    return None
+def get_loss_metrics(experiment_ids: List[int]) -> Dict[int, str]:
+    """Infer each experiment's primary loss series from the rows it actually has.
+
+    Returns {experiment_id: 'val_loss' | 'train_loss'}; experiments with no
+    loss rows at all are absent from the mapping.
+
+    Inference rather than declaration: a run that reports a validation loss is
+    judged on it, and one that only ever reports training loss is judged on
+    that. This needs no frontmatter field and works retroactively on runs that
+    were recorded before train_loss was surfaced.
+    """
+    if not experiment_ids:
+        return {}
+    conn = get_db()
+    placeholders = ",".join("?" for _ in experiment_ids)
+    rows = conn.execute(
+        f"""SELECT experiment_id,
+                   MAX(val_loss IS NOT NULL) AS has_val,
+                   MAX(train_loss IS NOT NULL) AS has_train
+            FROM metrics
+            WHERE experiment_id IN ({placeholders})
+            GROUP BY experiment_id""",
+        list(experiment_ids),
+    ).fetchall()
+    result = {}
+    for row in rows:
+        if row["has_val"]:
+            result[row["experiment_id"]] = "val_loss"
+        elif row["has_train"]:
+            result[row["experiment_id"]] = "train_loss"
+    return result
 
 
 # =============================================================================
@@ -851,7 +872,11 @@ def get_final_metrics(experiment_id: int) -> Optional[Tuple[float, int, int]]:
 # interleaved without breaking parsing. Numbers require a leading digit so
 # unfilled f-string placeholders like `val_loss:{final_val_loss:.4f}` don't
 # hit the matcher (the `.4` in `:.4f}` would otherwise parse as 0.4).
-_NUM = r"\d+(?:\.\d+)?"
+# The exponent suffix is matched so that `val_loss:1e-3` reads as 0.001. Without
+# it the pattern still matched the leading `1` and silently recorded 1.0 — a
+# 1000x wrong loss with no error. Leading digit is still required, which is what
+# keeps unfilled f-string placeholders (`val_loss:{loss:.4f}`) from matching.
+_NUM = r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
 _STEP_FIELD = re.compile(rf"step:(\d+)/(\d+)")
 _VAL_LOSS_FIELD = re.compile(rf"val_loss:({_NUM})")
 _TRAIN_LOSS_FIELD = re.compile(rf"train_loss:({_NUM})")
@@ -862,317 +887,50 @@ _STEP_AVG_FIELD = re.compile(rf"step_avg:({_NUM})ms")
 def parse_metric_line(line: str) -> Optional[Dict]:
     """Parse a single log line for metrics. Returns dict or None.
 
-    Handles two formats:
-      - Eval lines: step:N/M val_loss:X train_time:Yms [step_avg:Zms]
-      - Train loss lines: step:N/M train_loss:X
+    A line qualifies when it carries ``step:N/M`` plus at least one loss field;
+    every other field is optional and matched independently, so these all work:
+
+      - step:N/M val_loss:X train_time:Yms [step_avg:Zms]   (eval line)
+      - step:N/M train_loss:X [train_time:Yms] [step_avg:Zms]
+      - step:N/M val_loss:X train_loss:Y ...                (both on one line)
+      - step:N/M val_loss:X                                 (no timing available)
+
+    Timing is captured wherever it appears rather than only on val_loss lines —
+    a train-loss-primary script puts train_time on its train_loss lines, and
+    dropping it there left those runs with no wall-clock at all.
+
+    Lines carrying timing but no loss (e.g. the record scripts' trailing
+    ``step:N/M train_time:Xms step_avg:Yms``) are still ignored: without a loss
+    there is nothing to record, and admitting them would let the source-code
+    dump at the top of every log produce spurious rows.
     """
     step_match = _STEP_FIELD.search(line)
     if not step_match:
         return None
 
+    val_loss_match = _VAL_LOSS_FIELD.search(line)
+    train_loss_match = _TRAIN_LOSS_FIELD.search(line)
+    if not (val_loss_match or train_loss_match):
+        return None
+
     result = {
         "step": int(step_match.group(1)),
         "total_steps": int(step_match.group(2)),
-        "val_loss": None,
-        "train_loss": None,
+        "val_loss": float(val_loss_match.group(1)) if val_loss_match else None,
+        "train_loss": float(train_loss_match.group(1)) if train_loss_match else None,
         "train_time_ms": None,
         "step_avg_ms": None,
     }
 
-    val_loss_match = _VAL_LOSS_FIELD.search(line)
-    train_loss_match = _TRAIN_LOSS_FIELD.search(line)
     train_time_match = _TRAIN_TIME_FIELD.search(line)
-
-    if val_loss_match and train_time_match:
+    if train_time_match:
         train_time_val = float(train_time_match.group(1))
-        result["val_loss"] = float(val_loss_match.group(1))
-        result["train_time_ms"] = int(train_time_val * 1000) if train_time_match.group(2) == "s" else int(train_time_val)
-        step_avg_match = _STEP_AVG_FIELD.search(line)
-        result["step_avg_ms"] = float(step_avg_match.group(1)) if step_avg_match else None
-        return result
+        result["train_time_ms"] = (
+            int(train_time_val * 1000) if train_time_match.group(2) == "s" else int(train_time_val)
+        )
 
-    if train_loss_match:
-        result["train_loss"] = float(train_loss_match.group(1))
-        step_avg_match = _STEP_AVG_FIELD.search(line)
-        result["step_avg_ms"] = float(step_avg_match.group(1)) if step_avg_match else None
-        return result
+    step_avg_match = _STEP_AVG_FIELD.search(line)
+    if step_avg_match:
+        result["step_avg_ms"] = float(step_avg_match.group(1))
 
-    return None
-
-
-def parse_log_content(content: str) -> List[Dict]:
-    """Parse log content and return all metric checkpoints."""
-    metrics = []
-    for line in content.split("\n"):
-        metric = parse_metric_line(line)
-        if metric:
-            metrics.append(metric)
-    return metrics
-
-
-# =============================================================================
-# Iris metric parsing (stateful — eval and progress lines arrive separately)
-# =============================================================================
-
-_IRIS_PALOMA = re.compile(r"paloma macro loss:\s*(\d+(?:\.\d+)?)")
-_IRIS_PROGRESS = re.compile(
-    r"Progress on:train\s+(\d+(?:\.\d+)?)(k?)it/(\d+(?:\.\d+)?)(k?)it"
-)
-_IRIS_ELAPSED = re.compile(r"elapsed:(?:(\d+):)?(\d+):(\d+)")
-_IRIS_RATE_IT_S = re.compile(r"rate:(\d+(?:\.\d+)?)it/s")
-_IRIS_RATE_S_IT = re.compile(r"rate:(\d+(?:\.\d+)?)s/it")
-
-
-class IrisMetricParser:
-    """Stateful parser for iris log files.
-
-    Instantiate fresh per parse pass (file is overwritten each tick).
-    Emits a metric dict each time a paloma eval line is seen, pairing it
-    with the inferred step = eval_count * steps_per_eval.
-    """
-
-    def __init__(self, steps_per_eval: int = 1000):
-        self.steps_per_eval = steps_per_eval
-        self.eval_count = 0
-        self.total_steps: Optional[int] = None
-        self.last_elapsed_ms: Optional[int] = None
-        self.last_step_avg_ms: Optional[float] = None
-
-    def parse_line(self, line: str) -> Optional[Dict]:
-        """Parse a single line. Returns metric dict on eval lines, else None."""
-        # tqdm progress line — update running state
-        prog = _IRIS_PROGRESS.search(line)
-        if prog:
-            step_val = float(prog.group(1))
-            if prog.group(2) == "k":
-                step_val *= 1000
-            total_val = float(prog.group(3))
-            if prog.group(4) == "k":
-                total_val *= 1000
-            self.total_steps = int(total_val)
-
-            elapsed = _IRIS_ELAPSED.search(line)
-            if elapsed:
-                h = int(elapsed.group(1)) if elapsed.group(1) else 0
-                m, s = int(elapsed.group(2)), int(elapsed.group(3))
-                self.last_elapsed_ms = (h * 3600 + m * 60 + s) * 1000
-
-            rate_it = _IRIS_RATE_IT_S.search(line)
-            rate_s = _IRIS_RATE_S_IT.search(line)
-            if rate_it:
-                self.last_step_avg_ms = 1000.0 / float(rate_it.group(1))
-            elif rate_s:
-                self.last_step_avg_ms = float(rate_s.group(1)) * 1000.0
-
-            return None
-
-        # Paloma eval line — emit a metric record
-        paloma = _IRIS_PALOMA.search(line)
-        if paloma:
-            self.eval_count += 1
-            step = self.eval_count * self.steps_per_eval
-            return {
-                "step": step,
-                "total_steps": self.total_steps,
-                "val_loss": float(paloma.group(1)),
-                "train_time_ms": self.last_elapsed_ms,
-                "step_avg_ms": self.last_step_avg_ms,
-            }
-
-        return None
-
-    def parse_content(self, content: str) -> List[Dict]:
-        """Parse full log content, returning all metric records."""
-        metrics = []
-        for line in content.split("\n"):
-            m = self.parse_line(line)
-            if m:
-                metrics.append(m)
-        return metrics
-
-
-# =============================================================================
-# Display functions
-# =============================================================================
-
-def show_results(track_filter: Optional[str] = None) -> None:
-    """Show results of experiments from the database."""
-    experiments = get_experiments(track=track_filter, limit=100)
-
-    if not experiments:
-        console.print("[yellow]No experiments found.[/yellow]")
-        console.print("Run an experiment with: nanorun run <script>")
-        return
-
-    # Group by track
-    by_track: Dict[str, List[Experiment]] = {"[untracked]": []}
-    for exp in experiments:
-        track = exp.track or "[untracked]"
-        if track not in by_track:
-            by_track[track] = []
-        by_track[track].append(exp)
-
-    all_with_metrics = []
-
-    for track_name, exps in by_track.items():
-        if not exps:
-            continue
-
-        # Show track header
-        if track_name != "[untracked]":
-            track_info = get_track(track_name)
-            desc = f" - {track_info.description}" if track_info and track_info.description else ""
-            console.print(f"\n[bold cyan]{track_name}[/bold cyan]{desc}")
-        else:
-            console.print(f"\n[dim]{track_name}[/dim]")
-
-        table = Table(show_header=True, header_style="dim")
-        table.add_column("Name", style="cyan", max_width=30)
-        table.add_column("Status", justify="center")
-        table.add_column("Val Loss", justify="right")
-        table.add_column("Time", justify="right")
-        table.add_column("Steps", justify="right")
-
-        for exp in exps[:10]:
-            final = get_final_metrics(exp.id)
-
-            if final:
-                val_loss, train_time, steps = final
-                val_loss_str = f"{val_loss:.4f}"
-                if val_loss < 3.30:
-                    val_loss_str = f"[green]{val_loss_str}[/green]"
-                time_str = f"{train_time/1000:.1f}s" if train_time else "[dim]n/a[/dim]"
-                steps_str = str(steps)
-                all_with_metrics.append((exp, val_loss))
-            else:
-                val_loss_str = "[dim]n/a[/dim]"
-                time_str = "[dim]n/a[/dim]"
-                steps_str = "[dim]n/a[/dim]"
-
-            status_str = {
-                "running": "[yellow]running[/yellow]",
-                "completed": "[green]done[/green]",
-                "failed": "[red]failed[/red]",
-                "cancelled": "[dim]cancelled[/dim]",
-            }.get(exp.status, exp.status)
-
-            table.add_row(exp.name[:30], status_str, val_loss_str, time_str, steps_str)
-
-        console.print(table)
-
-        if len(exps) > 10:
-            console.print(f"[dim]  ... and {len(exps) - 10} more[/dim]")
-
-    # Show overall best
-    if all_with_metrics:
-        best_exp, best_loss = min(all_with_metrics, key=lambda x: x[1])
-        track_str = f" ({best_exp.track})" if best_exp.track else ""
-        console.print(f"\n[green]Best:[/green] {best_exp.name}{track_str} - val_loss: {best_loss:.4f}")
-
-
-def show_experiment_detail(experiment_id: int) -> None:
-    """Show detailed info about an experiment including loss curve."""
-    exp = get_experiment(experiment_id)
-    if not exp:
-        console.print(f"[red]Experiment {experiment_id} not found[/red]")
-        return
-
-    console.print(f"\n[bold cyan]{exp.name}[/bold cyan]")
-    console.print(f"  ID: {exp.id}")
-    console.print(f"  Script: {exp.script}")
-    console.print(f"  Track: {exp.track or '[none]'}")
-    console.print(f"  Status: {exp.status}")
-    console.print(f"  GPUs: {exp.gpus}x {exp.gpu_type}")
-    console.print(f"  Started: {exp.started_at}")
-    if exp.finished_at:
-        console.print(f"  Finished: {exp.finished_at}")
-    if exp.env_vars:
-        console.print(f"  Env: {exp.env_vars}")
-
-    # Show metrics
-    metrics = get_metrics(exp.id)
-    if metrics:
-        console.print(f"\n  [dim]Metrics ({len(metrics)} checkpoints):[/dim]")
-        table = Table(show_header=True, header_style="dim")
-        table.add_column("Step", justify="right")
-        table.add_column("Val Loss", justify="right")
-        table.add_column("Time", justify="right")
-
-        # Show last 10
-        for m in metrics[-10:]:
-            table.add_row(
-                f"{m.step}/{m.total_steps}" if m.total_steps else str(m.step),
-                f"{m.val_loss:.4f}" if m.val_loss else "-",
-                f"{m.train_time_ms/1000:.1f}s" if m.train_time_ms else "-",
-            )
-        console.print(table)
-
-
-def show_diff(exp1_name: str, exp2_name: str) -> None:
-    """Show diff between two experiments."""
-    # Find experiments by name
-    conn = get_db()
-    row1 = conn.execute(
-        "SELECT * FROM experiments WHERE name LIKE ? ORDER BY started_at DESC LIMIT 1",
-        (f"%{exp1_name}%",)
-    ).fetchone()
-    row2 = conn.execute(
-        "SELECT * FROM experiments WHERE name LIKE ? ORDER BY started_at DESC LIMIT 1",
-        (f"%{exp2_name}%",)
-    ).fetchone()
-
-    if not row1:
-        console.print(f"[red]Could not find experiment matching '{exp1_name}'[/red]")
-        return
-    if not row2:
-        console.print(f"[red]Could not find experiment matching '{exp2_name}'[/red]")
-        return
-
-    exp1 = Experiment.from_row(row1)
-    exp2 = Experiment.from_row(row2)
-
-    console.print(f"[cyan]Comparing {exp1.name} vs {exp2.name}[/cyan]")
-
-    # Get final metrics
-    final1 = get_final_metrics(exp1.id)
-    final2 = get_final_metrics(exp2.id)
-
-    table = Table(title="Metrics Comparison")
-    table.add_column("Metric", style="cyan")
-    table.add_column(exp1.name[:20])
-    table.add_column(exp2.name[:20])
-    table.add_column("Diff")
-
-    if final1 and final2:
-        val1, time1, steps1 = final1
-        val2, time2, steps2 = final2
-
-        diff = val2 - val1
-        diff_str = f"{diff:+.4f}"
-        if diff < 0:
-            diff_str = f"[green]{diff_str}[/green]"
-        elif diff > 0:
-            diff_str = f"[red]{diff_str}[/red]"
-        table.add_row("Val Loss", f"{val1:.4f}", f"{val2:.4f}", diff_str)
-
-        if time1 and time2:
-            time_diff = time2 - time1
-            table.add_row(
-                "Train Time",
-                f"{time1/1000:.1f}s",
-                f"{time2/1000:.1f}s",
-                f"{time_diff/1000:+.1f}s",
-            )
-
-    console.print(table)
-
-    # Show env var differences
-    if exp1.env_vars or exp2.env_vars:
-        all_keys = set(exp1.env_vars.keys()) | set(exp2.env_vars.keys())
-        if all_keys:
-            console.print("\n[dim]Environment differences:[/dim]")
-            for key in sorted(all_keys):
-                v1 = exp1.env_vars.get(key, "[not set]")
-                v2 = exp2.env_vars.get(key, "[not set]")
-                if v1 != v2:
-                    console.print(f"  {key}: {v1} → {v2}")
+    return result

@@ -168,6 +168,11 @@ def _generate_setup_script(
 (
   mkdir -p {home_dir}/.cache/huggingface
   echo '{token_b64}' | base64 -d > {home_dir}/.cache/huggingface/token
+  # Also write to $HF_HOME if set and different (RunPod sets HF_HOME=/workspace/...)
+  if [ -n "$HF_HOME" ] && [ "$HF_HOME" != "{home_dir}/.cache/huggingface" ]; then
+    mkdir -p "$HF_HOME"
+    echo '{token_b64}' | base64 -d > "$HF_HOME/token"
+  fi
   echo "STATUS:hf_auth:OK:token written"
 ) &
 PID_HF=$!

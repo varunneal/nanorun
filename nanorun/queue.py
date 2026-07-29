@@ -226,10 +226,19 @@ def add_to_queue_via_daemon(
         AddToQueueResult with position, daemon_status, and whether experiment started
     """
     from .remote_control import get_daemon_client, DaemonError
+    from .config import Config
 
     daemon = get_daemon_client(session_name)
     if not daemon:
         return AddToQueueResult(success=False, error="No active session")
+
+    # Inject NCCL_NVLS_ENABLE=0 on RunPod sessions (use_pty indicates SSH proxy)
+    env_vars = env_vars or {}
+    resolved_name = session_name or Config.get_active_session_name()
+    if resolved_name:
+        session_config = Config.load_session(resolved_name)
+        if session_config and session_config.use_pty and "NCCL_NVLS_ENABLE" not in env_vars:
+            env_vars["NCCL_NVLS_ENABLE"] = "0"
 
     with daemon:
         try:
@@ -239,7 +248,7 @@ def add_to_queue_via_daemon(
             result = daemon.add_to_queue(
                 experiment_id=experiment_id,
                 script=script,
-                env_vars=env_vars or {},
+                env_vars=env_vars,
                 gpus=gpus,
                 gpu_type=gpu_type,
                 name=name,

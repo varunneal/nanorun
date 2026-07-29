@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import discover_tracks, Config
 from ..queue import get_queue_state
-from ..local_daemon import safe_json_load, get_queue_cache_file
+from ..local_daemon import DASHBOARD_HOST, safe_json_load, get_queue_cache_file
 from ..tracker import (
     get_experiments,
     get_experiment,
@@ -20,6 +20,7 @@ from ..tracker import (
     get_metrics,
     get_latest_metric,
     get_final_metric,
+    get_loss_metrics,
     get_db,
     get_crash_log as get_crash_log_content,
 )
@@ -51,14 +52,20 @@ async def list_themes():
 def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
     """Fetch latest metric for each experiment in a single query.
 
-    Returns the current step (MAX step) plus the latest val_loss/train_time_ms
-    which may come from an earlier eval step.
+    Returns the current step (MAX step) plus the latest value of each loss
+    series, which may come from an earlier step than the max: val_loss only
+    lands on eval steps, and train_loss only on steps the script logged one.
+
+    ``loss``/``loss_metric`` collapse the two series into "the number this run
+    is actually judged on" — validation when the run reports it, training loss
+    when validation is all the run ever had.
     """
     if not experiment_ids:
         return {}
     conn = get_db()
     placeholders = ",".join("?" for _ in experiment_ids)
-    # Get latest step (for progress) and latest eval step (for val_loss/train_time)
+    # Get latest step (for progress), latest eval step (val_loss/train_time),
+    # and latest train-loss step — each series tracked independently.
     rows = conn.execute(
         f"""SELECT
                 latest.experiment_id,
@@ -66,10 +73,10 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
                 latest.total_steps,
                 eval.val_loss,
                 eval.train_time_ms,
-                latest.train_loss,
-                latest.step_avg_ms
+                tl.train_loss,
+                COALESCE(eval.step_avg_ms, latest.step_avg_ms) AS step_avg_ms
             FROM (
-                SELECT m.experiment_id, m.total_steps, m.train_loss, m.step_avg_ms, sub.max_step
+                SELECT m.experiment_id, m.total_steps, m.step_avg_ms, sub.max_step
                 FROM metrics m
                 INNER JOIN (
                     SELECT experiment_id, MAX(step) as max_step
@@ -79,7 +86,7 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
                 ) sub ON m.experiment_id = sub.experiment_id AND m.step = sub.max_step
             ) latest
             LEFT JOIN (
-                SELECT m2.experiment_id, m2.val_loss, m2.train_time_ms
+                SELECT m2.experiment_id, m2.val_loss, m2.train_time_ms, m2.step_avg_ms
                 FROM metrics m2
                 INNER JOIN (
                     SELECT experiment_id, MAX(step) as max_eval_step
@@ -87,8 +94,18 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
                     WHERE experiment_id IN ({placeholders}) AND val_loss IS NOT NULL
                     GROUP BY experiment_id
                 ) esub ON m2.experiment_id = esub.experiment_id AND m2.step = esub.max_eval_step
-            ) eval ON latest.experiment_id = eval.experiment_id""",
-        experiment_ids + experiment_ids,
+            ) eval ON latest.experiment_id = eval.experiment_id
+            LEFT JOIN (
+                SELECT m3.experiment_id, m3.train_loss
+                FROM metrics m3
+                INNER JOIN (
+                    SELECT experiment_id, MAX(step) as max_train_step
+                    FROM metrics
+                    WHERE experiment_id IN ({placeholders}) AND train_loss IS NOT NULL
+                    GROUP BY experiment_id
+                ) tsub ON m3.experiment_id = tsub.experiment_id AND m3.step = tsub.max_train_step
+            ) tl ON latest.experiment_id = tl.experiment_id""",
+        experiment_ids + experiment_ids + experiment_ids,
     ).fetchall()
     return {
         row["experiment_id"]: {
@@ -98,6 +115,9 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
             "train_time_ms": row["train_time_ms"],
             "train_loss": row["train_loss"],
             "step_avg_ms": row["step_avg_ms"],
+            "loss": row["val_loss"] if row["val_loss"] is not None else row["train_loss"],
+            "loss_metric": "val_loss" if row["val_loss"] is not None
+                           else ("train_loss" if row["train_loss"] is not None else None),
         }
         for row in rows
     }
@@ -133,6 +153,9 @@ async def list_experiments(track: Optional[str] = None, status: Optional[str] = 
                 "current_step": m["step"] if m else None,
                 "total_steps": m["total_steps"] if m else None,
                 "val_loss": m["val_loss"] if m else None,
+                "train_loss": m["train_loss"] if m else None,
+                "loss": m["loss"] if m else None,
+                "loss_metric": m["loss_metric"] if m else None,
                 "train_time_ms": m["train_time_ms"] if m else None,
             })
         return {"experiments": results[:limit]}
@@ -157,9 +180,12 @@ async def list_experiments(track: Optional[str] = None, status: Optional[str] = 
         group_exps.sort(key=lambda e: e.started_at.isoformat() if e.started_at else "", reverse=True)
         primary = group_exps[0]  # Most recent experiment
 
-        # Collect metrics for all experiments in group
+        # Collect metrics for all experiments in group. Runs are grouped by
+        # code_hash, so every member is the same script and therefore reports
+        # the same loss series — averaging `loss` across the group is safe.
         val_losses = []
         train_times = []
+        loss_metrics = set()
         env_var_sets = set()
         experiment_ids = []
         statuses = []
@@ -170,8 +196,9 @@ async def list_experiments(track: Optional[str] = None, status: Optional[str] = 
             env_var_sets.add(json.dumps(exp.env_vars, sort_keys=True))
             m = latest_metrics.get(exp.id)
             if m:
-                if m["val_loss"] is not None:
-                    val_losses.append(m["val_loss"])
+                if m["loss"] is not None:
+                    val_losses.append(m["loss"])
+                    loss_metrics.add(m["loss_metric"])
                 if m["train_time_ms"] is not None:
                     train_times.append(m["train_time_ms"])
 
@@ -219,8 +246,14 @@ async def list_experiments(track: Optional[str] = None, status: Optional[str] = 
             "current_step": current_step,
             "total_steps": total_steps,
             "val_loss": mean_val_loss,
+            "loss": mean_val_loss,
+            # Single metric for the group, or None if members disagree (only
+            # possible if a script changed which series it logs without a code
+            # change — treat as unknown rather than silently mixing them).
+            "loss_metric": next(iter(loss_metrics)) if len(loss_metrics) == 1 else None,
             "train_time_ms": mean_train_time,
             "val_losses": val_losses,  # Individual values for details
+            "losses": val_losses,
             "train_times": train_times,
         })
 
@@ -245,6 +278,9 @@ async def list_running_experiments():
             "current_step": latest.step if latest else None,
             "total_steps": latest.total_steps if latest else None,
             "val_loss": latest.val_loss if latest else None,
+            "train_loss": latest.train_loss if latest else None,
+            "loss": latest.loss if latest else None,
+            "loss_metric": latest.loss_metric if latest else None,
             "train_time_ms": latest.train_time_ms if latest else None,
         })
 
@@ -281,6 +317,9 @@ async def get_queue_status():
             "current_step": latest.step if latest else None,
             "total_steps": latest.total_steps if latest else None,
             "val_loss": latest.val_loss if latest else None,
+            "train_loss": latest.train_loss if latest else None,
+            "loss": latest.loss if latest else None,
+            "loss_metric": latest.loss_metric if latest else None,
         })
 
     # Get queued items from all session caches
@@ -476,32 +515,38 @@ async def get_experiment_detail(exp_id: int):
     if not exp:
         return JSONResponse({"error": "Experiment not found"}, status_code=404)
 
-    # Get all metrics for loss curve
+    # Get all metrics for loss curve. The curve follows the run's primary
+    # series only — a run that logs train_loss every step and val_loss every
+    # 125th would otherwise produce a curve alternating between two different
+    # quantities. `val_loss` stays on each point for backward compatibility.
     metrics = get_metrics(exp_id)
+    loss_metric = get_loss_metrics([exp_id]).get(exp_id)
     loss_curve = [
         {
             "step": m.step,
+            "loss": getattr(m, loss_metric),
             "val_loss": m.val_loss,
+            "train_loss": m.train_loss,
             "train_time_ms": m.train_time_ms,
             "step_avg_ms": m.step_avg_ms,
         }
         for m in metrics
-        if m.val_loss is not None
+        if loss_metric and getattr(m, loss_metric) is not None
     ]
 
     # Get final metric
     final = get_final_metric(exp_id)
     latest = get_latest_metric(exp_id)
 
-    # For val_loss/train_time: prefer final step, then latest eval (from loss_curve)
-    if final and final.val_loss is not None:
-        summary_val_loss = final.val_loss
+    # For loss/train_time: prefer final step, then latest point on the curve
+    if final and final.loss is not None:
+        summary_val_loss = final.loss
         summary_train_time = final.train_time_ms
     elif loss_curve:
-        summary_val_loss = loss_curve[-1]["val_loss"]
+        summary_val_loss = loss_curve[-1]["loss"]
         summary_train_time = loss_curve[-1]["train_time_ms"]
     else:
-        summary_val_loss = latest.val_loss if latest else None
+        summary_val_loss = latest.loss if latest else None
         summary_train_time = latest.train_time_ms if latest else None
 
     return {
@@ -525,6 +570,8 @@ async def get_experiment_detail(exp_id: int):
         "current_step": latest.step if latest else None,
         "total_steps": latest.total_steps if latest else None,
         "final_val_loss": summary_val_loss,
+        "final_loss": summary_val_loss,
+        "loss_metric": loss_metric,
         "final_train_time_ms": summary_train_time,
         # Full loss curve for plotting
         "loss_curve": loss_curve,
@@ -542,11 +589,14 @@ async def get_experiment_metrics(exp_id: int):
     metrics = get_metrics(exp_id)
     return {
         "experiment_id": exp_id,
+        "loss_metric": get_loss_metrics([exp_id]).get(exp_id),
         "metrics": [
             {
                 "step": m.step,
                 "total_steps": m.total_steps,
                 "val_loss": m.val_loss,
+                "train_loss": m.train_loss,
+                "loss": m.loss,
                 "train_time_ms": m.train_time_ms,
                 "step_avg_ms": m.step_avg_ms,
                 "is_final_step": m.is_final_step,
@@ -769,4 +819,4 @@ def run_dashboard(port: int = 8080, open_browser: bool = True):
     if open_browser:
         webbrowser.open(f"http://localhost:{port}")
 
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(app, host=DASHBOARD_HOST, port=port, log_level="warning")

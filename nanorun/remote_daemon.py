@@ -71,6 +71,58 @@ SEGMENT_FILE_PATTERN = re.compile(r"^mappings-(\d{6})\.jsonl$")
 QUEUE_SEGMENT_FILE_PATTERN = re.compile(r"^queue-(\d{6})\.jsonl$")
 
 
+def _signal_process_group(
+    proc: asyncio.subprocess.Process,
+    sig: signal.Signals,
+) -> None:
+    """Signal a supervised subprocess group, falling back to the direct child."""
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError:
+        action = proc.terminate if sig == signal.SIGTERM else proc.kill
+        action()
+
+
+async def _terminate_and_reap_subprocess(
+    proc: asyncio.subprocess.Process,
+    terminate_timeout: float = 5.0,
+) -> None:
+    """Terminate a process group, escalate to SIGKILL, and consume its pipes."""
+    if proc.returncode is not None:
+        await proc.communicate()
+        return
+
+    _signal_process_group(proc, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=terminate_timeout)
+        return
+    except asyncio.TimeoutError:
+        _signal_process_group(proc, signal.SIGKILL)
+
+    await proc.communicate()
+
+
+async def _run_supervised_subprocess(
+    cmd: List[str],
+    timeout: float,
+) -> tuple[bytes, bytes, int]:
+    """Run an isolated child and guarantee cleanup if it times out or is cancelled."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        await _terminate_and_reap_subprocess(proc)
+        raise
+    return stdout, stderr, proc.returncode
+
+
 class _MappingsSegmentWriter:
     """Appends mapping lines to segmented JSONL files.
 
@@ -918,13 +970,13 @@ class NanorunDaemon:
             f"hub.sync_logs_up(Path({str(LOGS_DIR)!r}), {self.session_name!r})",
         ]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdout, stderr, returncode = await _run_supervised_subprocess(
+                cmd,
+                timeout=120,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-            if proc.returncode != 0:
+            if returncode != 0:
                 err_text = stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"subprocess exit {proc.returncode}: {err_text}")
+                raise RuntimeError(f"subprocess exit {returncode}: {err_text}")
             self._hub_sync_failures = 0
         except Exception as e:
             self._hub_sync_failures = getattr(self, '_hub_sync_failures', 0) + 1
@@ -996,13 +1048,13 @@ class NanorunDaemon:
             f"hub.sync_queue_up(Path({str(LOGS_DIR)!r}), {self.session_name!r})",
         ]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            _, stderr, returncode = await _run_supervised_subprocess(
+                cmd,
+                timeout=30,
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
+            if returncode != 0:
                 err_text = stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"subprocess exit {proc.returncode}: {err_text}")
+                raise RuntimeError(f"subprocess exit {returncode}: {err_text}")
             self._queue_push_failures = 0
         except Exception as e:
             self._queue_push_failures += 1

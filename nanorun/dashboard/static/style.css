@@ -651,6 +651,15 @@ main {
     color: var(--text-secondary);
 }
 
+/* Marks a number as training loss so it is never read as a val loss. */
+.loss-metric-tag {
+    color: var(--text-tertiary);
+    font-size: var(--font-xs);
+    margin-left: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
 .val-loss-time {
     color: var(--accent);
 }

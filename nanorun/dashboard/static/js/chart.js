@@ -49,7 +49,7 @@ function computeHeatmapData(validData, selectedVars = null) {
 
     const getVarInfo = (name) => sweptVars.find(v => v.key === name);
 
-    const allLosses = completedData.map(e => e.final_val_loss).filter(v => v != null);
+    const allLosses = completedData.map(e => e.final_loss ?? e.final_val_loss).filter(v => v != null);
     if (allLosses.length === 0) return null;
     const minLoss = Math.min(...allLosses);
     const maxLoss = Math.max(...allLosses);
@@ -66,8 +66,8 @@ function computeHeatmapData(validData, selectedVars = null) {
             if (xVal !== undefined) {
                 if (!cellLosses[xVal]) cellLosses[xVal] = [];
                 if (!cellExps[xVal]) cellExps[xVal] = [];
-                if (exp.final_val_loss != null) {
-                    cellLosses[xVal].push(exp.final_val_loss);
+                if ((exp.final_loss ?? exp.final_val_loss) != null) {
+                    cellLosses[xVal].push(exp.final_loss ?? exp.final_val_loss);
                 }
                 cellExps[xVal].push(exp);
             }
@@ -115,8 +115,8 @@ function computeHeatmapData(validData, selectedVars = null) {
             if (!cellExps[yVal]) cellExps[yVal] = {};
             if (!cellLosses[yVal][xVal]) cellLosses[yVal][xVal] = [];
             if (!cellExps[yVal][xVal]) cellExps[yVal][xVal] = [];
-            if (exp.final_val_loss != null) {
-                cellLosses[yVal][xVal].push(exp.final_val_loss);
+            if ((exp.final_loss ?? exp.final_val_loss) != null) {
+                cellLosses[yVal][xVal].push(exp.final_loss ?? exp.final_val_loss);
             }
             cellExps[yVal][xVal].push(exp);
         }
@@ -255,7 +255,7 @@ function renderHeatmap1D(heatmapData, controls) {
                                 : allExpIds.includes(selectedRunId);
                             const countLabel = count > 1 ? ` (n=${count})` : '';
                             const title = val != null
-                                ? `${varX}=${x}\nMean Val Loss: ${val.toFixed(4)}${countLabel}`
+                                ? `${varX}=${x}\nMean ${lossColumnLabel(getVisibleRuns())}: ${val.toFixed(4)}${countLabel}`
                                 : `${varX}=${x}\nNo data`;
                             const countDisplay = count > 1 ? `<span class="cell-count">${count}</span>` : '';
                             return `
@@ -326,7 +326,7 @@ function renderHeatmap2D(heatmapData, controls) {
                                             : allExpIds.includes(selectedRunId);
                                         const countLabel = count > 1 ? ` (n=${count})` : '';
                                         const title = val != null
-                                            ? `${varX}=${x}, ${varY}=${y}\nMean Val Loss: ${val.toFixed(4)}${countLabel}`
+                                            ? `${varX}=${x}, ${varY}=${y}\nMean ${lossColumnLabel(getVisibleRuns())}: ${val.toFixed(4)}${countLabel}`
                                             : `${varX}=${x}, ${varY}=${y}\nNo data`;
                                         const countDisplay = count > 1 ? `<span class="cell-count">${count}</span>` : '';
                                         return `<div class="heatmap-cell${isBest ? ' best' : ''}${isSelected ? ' selected' : ''}"
@@ -400,7 +400,7 @@ function computeResidualData(validData) {
             if (!lossesByStep[point.step]) lossesByStep[point.step] = [];
             lossesByStep[point.step].push({
                 curveId: curve.id,
-                loss: point.val_loss
+                loss: point.loss ?? point.val_loss
             });
         });
     });
@@ -425,10 +425,10 @@ function computeResidualData(validData) {
 
     const residualCurves = curves.map(curve => {
         const residuals = curve.data
-            .filter(point => medianByStep[point.step] !== undefined && point.val_loss != null)
+            .filter(point => medianByStep[point.step] !== undefined && (point.loss ?? point.val_loss) != null)
             .map(point => ({
                 step: point.step,
-                residual: point.val_loss - medianByStep[point.step]
+                residual: (point.loss ?? point.val_loss) - medianByStep[point.step]
             }));
         return {
             id: curve.id,
@@ -808,7 +808,7 @@ function updateChartMultiple(runs, totalSteps = 0) {
         const color = CHART_COLORS[i % CHART_COLORS.length];
         return {
             label: labels[i],
-            data: run.data.map(d => ({ x: d.step, y: d.val_loss })),
+            data: run.data.map(d => ({ x: d.step, y: d.loss ?? d.val_loss })),
             borderColor: color,
             backgroundColor: color + '20',
             fill: !isMulti,
@@ -1044,7 +1044,7 @@ async function copyLineChartAsImage(title) {
     ctx.font = '18px SF Mono, Menlo, Monaco, monospace';
     ctx.translate(16, pad.top + h / 2);
     ctx.rotate(-Math.PI / 2);
-    ctx.fillText('Val Loss', 0, 0);
+    ctx.fillText(lossColumnLabel(getVisibleRuns()), 0, 0);
     ctx.restore();
 
     return new Promise(resolve => offscreen.toBlob(resolve, 'image/png'));
