@@ -71,19 +71,29 @@ class Track:
         if not track_file.exists():
             return None
         data = json.loads(track_file.read_text())
+        if not isinstance(data, dict):
+            raise ValueError(f"{track_file} must contain a JSON object")
+        for field in ("name", "description", "created_at"):
+            value = data.get(field)
+            if not isinstance(value, str):
+                raise ValueError(f"{track_file}: {field!r} must be a string")
+        if not data["name"].strip():
+            raise ValueError(f"{track_file}: 'name' must not be empty")
+        if not data["created_at"].strip():
+            raise ValueError(f"{track_file}: 'created_at' must not be empty")
         # Directory is relative to repo root
-        repo_root = Path(__file__).parent.parent
+        repo_root = get_repo_root()
         rel_dir = str(directory.relative_to(repo_root))
         return cls(
-            name=data.get("name", directory.name),
+            name=data["name"],
             directory=rel_dir,
-            description=data.get("description", ""),
-            created_at=data.get("created_at", ""),
+            description=data["description"],
+            created_at=data["created_at"],
         )
 
     def save(self) -> None:
         """Save track to .track.json in directory."""
-        repo_root = Path(__file__).parent.parent
+        repo_root = get_repo_root()
         track_dir = repo_root / self.directory
         track_dir.mkdir(parents=True, exist_ok=True)
         track_file = track_dir / TRACK_FILE
@@ -96,7 +106,7 @@ class Track:
 
     def delete(self) -> None:
         """Delete the .track.json file."""
-        repo_root = Path(__file__).parent.parent
+        repo_root = get_repo_root()
         track_file = repo_root / self.directory / TRACK_FILE
         if track_file.exists():
             track_file.unlink()
@@ -265,38 +275,24 @@ class Config:
 
     @classmethod
     def delete_session(cls, name: str) -> Tuple[bool, int]:
-        """Delete a session by name, cancelling its in-flight experiments.
+        """Delete local session configuration without inventing remote outcomes.
 
-        Removing a session is the deterministic counterpart to the daemon's
-        dead-session reconciliation: any 'running'/'queued' experiments for this
-        session are marked 'cancelled' so they can't linger after the session is
-        gone. Doing it here — rather than at each call site — guarantees that
-        every removal path (CLI cleanup, dashboard delete, any future caller)
-        cancels in-flight work.
-
-        Returns (removed, cancelled): whether a session file was removed, and how
-        many in-flight experiments were cancelled.
+        Removing local connection metadata does not prove that the remote machine,
+        its active experiment, or its queue stopped. Experiment rows therefore keep
+        their last-known states. The second return value remains for API
+        compatibility and is always zero.
         """
-        # Lazy import: tracker imports config at module load, so importing at
-        # module top would be circular.
-        from .tracker import terminate_session_experiments
-        # Load the config for its session_id *before* unlinking, so cancellation is
-        # scoped to this incarnation (not a same-named row from an earlier machine).
-        sc = cls.load_session(name)
-        session_id = sc.session_id if sc else None
-        running_ids, queued_ids = terminate_session_experiments(name, session_id=session_id)
-        cancelled = len(running_ids) + len(queued_ids)
 
         session_file = cls._get_session_file(name)
         if not session_file.exists():
-            return False, cancelled
+            return False, 0
         session_file.unlink()
         if cls.get_active_session_name() is None:
             # Active pointer was pointing to deleted session (now dangling)
             active_file = cls.get_active_session_file()
             if active_file.exists():
                 active_file.unlink()
-        return True, cancelled
+        return True, 0
 
     @classmethod
     def rename_session(cls, old_name: str, new_name: str) -> None:
@@ -338,26 +334,34 @@ class Config:
 
 
 def infer_track_from_path(script_path: str) -> Optional[str]:
-    """Infer track name from script path by checking parent directories for .track.json.
+    """Infer a track from the nearest ancestor containing .track.json.
 
     For example, if script is 'experiments/records/train.py' and
     'experiments/records/.track.json' exists with name='records',
-    returns 'records'.
+    returns 'records'. Nested scripts inherit the nearest enclosing track.
     """
-    repo_root = get_repo_root()
+    repo_root = get_repo_root().resolve()
     path = Path(script_path)
 
-    # Walk up from script directory looking for .track.json
     if path.is_absolute():
         try:
-            path = path.relative_to(repo_root)
+            path = path.resolve().relative_to(repo_root)
         except ValueError:
             return None
 
-    # Check the directory containing the script
-    script_dir = repo_root / path.parent
-    track = Track.load(script_dir)
-    if track:
-        return track.name
+    script_dir = (repo_root / path.parent).resolve()
+    try:
+        script_dir.relative_to(repo_root)
+    except ValueError:
+        return None
+
+    current = script_dir
+    while True:
+        track = Track.load(current)
+        if track:
+            return track.name
+        if current == repo_root:
+            break
+        current = current.parent
 
     return None

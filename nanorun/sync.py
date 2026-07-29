@@ -91,36 +91,37 @@ def generate_lineage_diffs(changed_files: list[str] | None = None) -> int:
     the diff will include changes to both the script and its kernels file.
 
     Args:
-        changed_files: If provided, only process these files (and files that
-            declare them as parents or reference them as kernels). If None,
-            processes all files in experiments/.
+        changed_files: If provided, process Python files from this list,
+            regardless of their directory. If None, process all repository
+            Python files known to git.
 
     Returns:
         Number of diffs generated/updated
     """
     local_repo = get_local_repo_path()
-    script_dirs = [local_repo / "experiments", local_repo / "interp"]
-    script_dirs = [d for d in script_dirs if d.exists()]
-
-    if not script_dirs:
-        return 0
-
-    script_prefixes = ("experiments/", "interp/")
 
     # Determine which files to process
     if changed_files is not None:
-        changed_py = {f for f in changed_files if f.endswith(".py") and f.startswith(script_prefixes)}
+        changed_py = {
+            f for f in changed_files
+            if f.endswith(".py") and not Path(f).is_absolute()
+        }
         if not changed_py:
             return 0
-        # Only process the changed files themselves (skip expensive child scan)
         files_to_process = set(changed_py)
     else:
-        files_to_process = set()
-        for script_dir in script_dirs:
-            files_to_process.update(
-                str(py_file.relative_to(local_repo))
-                for py_file in script_dir.rglob("*.py")
-            )
+        result = subprocess.run(
+            [
+                "git", "ls-files", "--cached", "--others",
+                "--exclude-standard", "--", "*.py",
+            ],
+            cwd=local_repo,
+            capture_output=True,
+            text=True,
+        )
+        files_to_process = {
+            path for path in result.stdout.splitlines() if path
+        }
 
     diffs_generated = 0
 

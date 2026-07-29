@@ -648,9 +648,8 @@ class _IrisBackend:
                 if iris_job_id:
                     iris_status = job_states.get(iris_job_id, "")
                     if iris_status and iris_status != local_status:
-                        if not (local_status == "completed" and iris_status == "failed"):
-                            from .tracker import update_experiment_status
-                            update_experiment_status(row["id"], iris_status)
+                        from .tracker import apply_authoritative_experiment_status
+                        apply_authoritative_experiment_status(row["id"], iris_status)
 
                     # Fetch crash log for failed jobs that don't have one yet.
                     effective_status = iris_status or local_status

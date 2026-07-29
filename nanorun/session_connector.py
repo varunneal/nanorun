@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 from .config import Config, SessionConfig, get_repo_root, infer_track_from_path
 from .hub import _IRIS_STATE_MAP
 from .tracker import (
+    apply_authoritative_experiment_status,
     create_experiment, update_experiment_metadata, update_experiment_status,
     get_db,
 )
@@ -213,8 +214,14 @@ class SshConnector(SessionConnector):
 
     def cancel(self, job_id: Optional[str] = None) -> ConnectorResult:
         from .runner import cancel_experiment
-        cancel_experiment(start_next=False, session_name=self.session_name)
-        return ConnectorResult(success=True)
+        confirmed = cancel_experiment(
+            start_next=False,
+            session_name=self.session_name,
+        )
+        return ConnectorResult(
+            success=confirmed,
+            message=None if confirmed else "Remote cancellation was not confirmed",
+        )
 
     def status(self) -> List[QueueItem]:
         from .tracker import get_running_experiments
@@ -262,8 +269,13 @@ class SshConnector(SessionConnector):
         return ConnectorResult(success=False, message="Daemon not reachable")
 
     def resolve_script(self, script: str) -> Optional[Path]:
-        p = get_repo_root() / script
-        return p if p.exists() else None
+        repo_root = get_repo_root().resolve()
+        p = (repo_root / script).resolve()
+        try:
+            p.relative_to(repo_root)
+        except ValueError:
+            return None
+        return p if p.is_file() and p.suffix == ".py" else None
 
     def check_unsynced(self, script: str) -> bool:
         from .sync import has_unsynced_changes
@@ -389,14 +401,17 @@ class IrisConnector(SessionConnector):
         try:
             result = self._run(*cmd_args, timeout=120)
         except subprocess.TimeoutExpired:
+            apply_authoritative_experiment_status(exp_id, "unknown")
             return SubmitResult(experiment_id=exp_id, error="iris job run timed out")
 
         if result.returncode != 0:
             err = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+            apply_authoritative_experiment_status(exp_id, "failed")
             return SubmitResult(experiment_id=exp_id, error=f"iris job run failed: {err}")
 
         lines = result.stdout.strip().splitlines()
         if not lines:
+            apply_authoritative_experiment_status(exp_id, "unknown")
             return SubmitResult(experiment_id=exp_id, error="No output from iris job run")
         iris_job_id = lines[-1].strip()
 
@@ -461,7 +476,7 @@ class IrisConnector(SessionConnector):
         ).fetchone()
         conn.close()
         if row:
-            update_experiment_status(row["id"], "cancelled")
+            apply_authoritative_experiment_status(row["id"], "cancelled")
 
         return ConnectorResult(success=True, message=job_id)
 

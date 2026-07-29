@@ -25,10 +25,12 @@ from .config import Config, SessionConfig, infer_track_from_path
 from .rpc_client import RpcClient, RpcError, kill_tunnel
 from .rpc_types import Event, EventMessage, Method
 from .tracker import (
+    TERMINAL_EXPERIMENT_STATUSES,
+    apply_authoritative_experiment_status,
     get_db, close_db, parse_metric_line, record_metric,
     update_experiment_status, update_experiment_metadata,
     get_experiment, create_experiment_from_mapping,
-    set_crash_log, get_crash_log, terminate_session_experiments,
+    set_crash_log, get_crash_log,
 )
 
 
@@ -146,13 +148,21 @@ def _queue_ts_should_overwrite(new_ts, old_ts) -> bool:
         return True  # ambiguous — favor freshness
 
 
-def _write_queue_cache_with_precedence(session_name, ts, queue_items, connected=None):
-    """Write queue_cache.json under the newest-ts-wins precedence rule.
+def _apply_queue_snapshot(
+    session_name,
+    session_id,
+    ts,
+    queue_items,
+    connected=None,
+):
+    """Atomically accept a remote queue snapshot into the cache and SQLite.
 
     Two threads write this file: the SessionTracker (event / STATUS fast-path,
     passes connected=True) and the HubSyncer (hub-snapshot reconcile, passes
     connected=None to preserve). Both stamp `synced_at` with a remote-clock ts so
-    they're directly comparable; the newer ts wins.
+    they're directly comparable; the newer ts wins. Cache precedence and
+    experiment reconciliation share one lock so a slower, older snapshot cannot
+    mutate SQLite after a newer snapshot has already won.
     """
     with _queue_cache_lock:
         path = get_queue_cache_file(session_name)
@@ -173,9 +183,9 @@ def _write_queue_cache_with_precedence(session_name, ts, queue_items, connected=
             # Stale queue write: preserve existing queue/synced_at. Still apply an
             # explicit connected flag if it changed; otherwise nothing to do.
             if not isinstance(existing, dict):
-                return
+                return False
             if connected is None or existing.get("connected") == connected:
-                return
+                return False
             data = dict(existing)
             data["connected"] = connected
 
@@ -183,6 +193,71 @@ def _write_queue_cache_with_precedence(session_name, ts, queue_items, connected=
             path.write_text(json.dumps(data, indent=2))
         except OSError:
             pass
+        if overwrite:
+            _reconcile_confirmed_queue(
+                session_name,
+                session_id,
+                queue_items,
+            )
+        return overwrite
+
+
+def _reconcile_confirmed_queue(
+    session_name: str,
+    session_id: str,
+    queue_items: list,
+) -> None:
+    """Project one accepted, complete remote queue snapshot into SQLite.
+
+    A client-side submit request is only intent. The first durable local row is
+    created when the remote daemon reports that exact ID in its queue. A later
+    complete snapshot can prove the row is no longer queued, but not why, so an
+    otherwise unresolved row becomes ``unknown``.
+    """
+    confirmed_ids = set()
+    for item in queue_items:
+        exp_id = item.get("experiment_id")
+        if not isinstance(exp_id, int) or isinstance(exp_id, bool) or exp_id <= 0:
+            continue
+        existing = get_experiment(exp_id)
+        if existing and (
+            (existing.session_name and existing.session_name != session_name)
+            or (existing.session_id and existing.session_id != session_id)
+        ):
+            log.warning(
+                f"[{session_name}] Ignoring queue confirmation for experiment "
+                f"{exp_id}; ID belongs to another session"
+            )
+            continue
+
+        confirmed_ids.add(exp_id)
+        if not existing:
+            script = item.get("script") or "unknown"
+            create_experiment_from_mapping(
+                experiment_id=exp_id,
+                name=item.get("name") or Path(script).stem,
+                script=script,
+                status="queued",
+                track=item.get("track") or infer_track_from_path(script),
+                env_vars=item.get("env_vars"),
+                gpus=item.get("gpus", 1),
+                gpu_type=item.get("gpu_type", "H100"),
+                session_name=session_name,
+                session_id=session_id,
+            )
+        elif existing.status == "unknown":
+            apply_authoritative_experiment_status(exp_id, "queued")
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id FROM experiments WHERE status = 'queued' "
+        "AND (session_id = ? OR (session_id IS NULL AND session_name = ?))",
+        (session_id, session_name),
+    ).fetchall()
+    conn.close()
+    for row in rows:
+        if row["id"] not in confirmed_ids:
+            apply_authoritative_experiment_status(row["id"], "unknown")
 
 
 # Track file offsets for hub-syncer mappings ingestion (keyed by session_name -> {filename: offset})
@@ -265,10 +340,7 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
         else:
             remote_status = mapping.get("status")
             if remote_status and remote_status != existing.status:
-                if existing.status == "completed" and remote_status == "failed":
-                    pass
-                elif remote_status in ("completed", "failed") or existing.status in ("running", "queued"):
-                    update_experiment_status(exp_id, remote_status)
+                apply_authoritative_experiment_status(exp_id, remote_status)
             if mapping.get("run_id") and not existing.remote_run_id:
                 update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
 
@@ -314,14 +386,21 @@ def _ingest_queue_for_session(session_name: str):
         # unorderable snapshot (contract: prefer skipping to a local-now stamp).
         return
     queue = snapshot.get("queue", [])
-    _write_queue_cache_with_precedence(session_name, ts, queue, connected=None)
+    sc = Config.load_session(session_name)
+    _apply_queue_snapshot(
+        session_name,
+        sc.session_id if sc else session_name,
+        ts,
+        queue,
+        connected=None,
+    )
 
 
 class HubSyncer:
-    """Single HTTPS connection to Hub, syncs logs for all sessions.
+    """Coordinates Hub log syncs for all sessions.
 
-    Runs in its own thread, decoupled from SSH/RPC connections.
-    One instance per daemon (not per session) since it's a single auth/endpoint.
+    The coordinator is decoupled from SSH/RPC connections. Each session pull runs
+    in a disposable subprocess so a blocked backend can be terminated safely.
     """
 
     SYNC_INTERVAL = 10.0
@@ -337,6 +416,8 @@ class HubSyncer:
         self._last_sync: float = 0
         self._sync_processes: Dict[str, subprocess.Popen] = {}
         self._sync_processes_lock = threading.Lock()
+        self._sync_failures: Dict[str, int] = {}
+        self._sync_retry_at: Dict[str, float] = {}
         # Sessions that have had their one-time full catch-up parse since daemon
         # start. First pass per session re-parses everything the hub delivered
         # (restart-to-recover); subsequent passes are delivery-driven. Reset on
@@ -385,6 +466,18 @@ class HubSyncer:
         log.info("[hub] Syncer stopped")
 
     SYNC_TIMEOUT = 60.0
+    SYNC_BACKOFF_MAX = 300.0
+
+    def _defer_failed_sync(self, session_name: str) -> None:
+        failures = self._sync_failures.get(session_name, 0) + 1
+        exponent = min(failures - 1, 5)
+        delay = min(self.SYNC_INTERVAL * (2 ** exponent), self.SYNC_BACKOFF_MAX)
+        self._sync_failures[session_name] = failures
+        self._sync_retry_at[session_name] = time.monotonic() + delay
+
+    def _clear_sync_backoff(self, session_name: str) -> None:
+        self._sync_failures.pop(session_name, None)
+        self._sync_retry_at.pop(session_name, None)
 
     def _log_session_error(self, session_name: str, message: str, *, exc_info: bool = False):
         previous = self._session_errors_logged.get(session_name)
@@ -408,8 +501,17 @@ class HubSyncer:
             self.event(f"[{name}] sync paused — skipping background metric/log scan")
         for name in sorted(prev_paused - paused):
             self.event(f"[{name}] sync resumed")
+            self._clear_sync_backoff(name)
         self._paused_sessions = paused
-        sessions = [s.name for s in all_sessions if s.name not in paused]
+        configured = {s.name for s in all_sessions}
+        for name in set(self._sync_failures) - configured:
+            self._clear_sync_backoff(name)
+        now = time.monotonic()
+        sessions = [
+            s.name for s in all_sessions
+            if s.name not in paused
+            and self._sync_retry_at.get(s.name, 0) <= now
+        ]
 
         # Sync all sessions in parallel so one slow/hanging session doesn't block others.
         # Each pull returns the files it changed; we thread that into the parse below so
@@ -427,7 +529,7 @@ class HubSyncer:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=self.SYNC_TIMEOUT + 5)
+            t.join()
 
         # Parse metrics and handle errors sequentially
         for session_name in sessions:
@@ -435,6 +537,7 @@ class HubSyncer:
             if session_name in sync_errors:
                 e = sync_errors[session_name]
                 had_error = True
+                self._defer_failed_sync(session_name)
                 if isinstance(e, TimeoutError):
                     self._log_session_error(
                         session_name,
@@ -447,6 +550,8 @@ class HubSyncer:
                         f"[hub] Sync failed for {session_name}: {e}",
                         exc_info=True,
                     )
+            else:
+                self._clear_sync_backoff(session_name)
 
             # SSH-independent queue reconcile — must run for EVERY session, whether
             # or not its SessionTracker is alive. Isolated so a failure here can't
@@ -608,9 +713,7 @@ class HubSyncer:
                 continue
             iris_status = job_states.get(iris_job_id)
             if iris_status and iris_status != local_status:
-                if local_status == "completed" and iris_status == "failed":
-                    continue
-                update_experiment_status(exp_id, iris_status)
+                apply_authoritative_experiment_status(exp_id, iris_status)
                 if iris_status != "running":
                     self.event(f"[{session_name}] Experiment {exp_id} → {iris_status}")
 
@@ -800,8 +903,6 @@ def _parse_local_metrics(experiment_id: int, run_id: str, log_path: Path) -> tup
     _log_offsets[run_id] = new_offset
     if recorded:
         log.info(f"Recorded {recorded} metrics for exp {experiment_id}")
-    if found_final:
-        update_experiment_status(experiment_id, "completed")
     return recorded, found_final
 
 
@@ -844,7 +945,7 @@ class SessionTracker:
     RECONNECT_BASE_DELAY = 2.0    # first retry after a drop
     RECONNECT_MAX_DELAY = 30.0    # backoff ceiling
     SLEEP_GAP_THRESHOLD = 15.0    # wall-clock jump that implies host sleep/suspend
-    DEAD_SESSION_GRACE = 120.0    # unreachable longer than this => machine is gone
+    UNREACHABLE_NOTICE_AFTER = 120.0
 
     def __init__(self, config: SessionConfig, daemon: "LocalMetricsDaemon"):
         self.config = config
@@ -859,7 +960,7 @@ class SessionTracker:
         self._last_queue_key: Optional[str] = None
         self._was_connected: bool = False
         self._outage_started_mono: Optional[float] = None  # monotonic anchor: counts awake retry time only
-        self._dead_finalized: bool = False                 # finalized in-flight work for this outage
+        self._unreachable_noted: bool = False
 
     def start(self):
         self._thread = threading.Thread(
@@ -886,7 +987,7 @@ class SessionTracker:
 
     def _adopt_running_experiment(self):
         """If state.json lost tracking info but the DB still has a running experiment
-        for this session, adopt it so _finalize_dead_session can mark it failed."""
+        for this session, adopt it so reconnect can reconcile authoritative state."""
         if self.current_experiment_id:
             return
         try:
@@ -940,7 +1041,7 @@ class SessionTracker:
                     kill_tunnel(self.session_name)
                     self._set_cache_connected(False)
                     self._outage_started_mono = None
-                    self._dead_finalized = False
+                    self._unreachable_noted = False
                     backoff = self.RECONNECT_BASE_DELAY
                 self.state.status = "paused"
                 self.state.save(self.session_name)
@@ -962,7 +1063,7 @@ class SessionTracker:
                 self._initial_sync()
                 # Healthy link: clear outage tracking and reset backoff.
                 self._outage_started_mono = None
-                self._dead_finalized = False
+                self._unreachable_noted = False
                 backoff = self.RECONNECT_BASE_DELAY
                 self._event_loop()  # returns on disconnect, sleep, or shutdown
             except Exception as e:
@@ -993,14 +1094,12 @@ class SessionTracker:
             self._on_disconnect()
             kill_tunnel(self.session_name)
 
-            # Unreachable past the grace window (of awake retry time) => treat the
-            # machine as gone and finalize in-flight work. Self-healing: if the
-            # machine comes back, reconnect re-attaches via _reconcile_tracking and
-            # metrics sync restores the true status (failed -> running/completed).
+            # Connectivity loss is not evidence that remote execution stopped.
+            # Emit one long-outage notice, but preserve experiment and queue state.
             outage = time.monotonic() - self._outage_started_mono
-            if outage > self.DEAD_SESSION_GRACE and not self._dead_finalized:
-                self._finalize_dead_session(outage)
-                self._dead_finalized = True
+            if outage > self.UNREACHABLE_NOTICE_AFTER and not self._unreachable_noted:
+                self._on_unreachable_timeout(outage)
+                self._unreachable_noted = True
 
             self.event(f"Disconnected — reconnecting in {backoff:.0f}s")
             suspended = self._sleep_interruptible(backoff)
@@ -1010,7 +1109,7 @@ class SessionTracker:
                 # so restart the grace window — re-verify before declaring it dead.
                 self.event(f"Host suspended ~{suspended:.0f}s during backoff — restarting grace window")
                 self._outage_started_mono = time.monotonic()
-                self._dead_finalized = False
+                self._unreachable_noted = False
                 backoff = self.RECONNECT_BASE_DELAY
             else:
                 backoff = min(backoff * 2, self.RECONNECT_MAX_DELAY)
@@ -1092,7 +1191,7 @@ class SessionTracker:
         if ev.event == Event.EXPERIMENT_STARTED:
             self._on_experiment_started(data)
         elif ev.event == Event.EXPERIMENT_FINISHED:
-            self._reconcile_tracking(None, None)
+            self._on_experiment_finished(data)
         elif ev.event == Event.EXPERIMENT_FAILED:
             self._on_experiment_failed(data)
         elif ev.event == Event.EXPERIMENT_RUN_ID:
@@ -1111,10 +1210,15 @@ class SessionTracker:
 
     def _on_experiment_failed(self, data: dict):
         exp_id = data.get("experiment_id")
-        if self.current_experiment_id:
-            self._finalize_experiment("failed")
         if exp_id:
+            self._finalize_experiment("failed", experiment_id=exp_id)
             record_crash(self.session_name, exp_id, get_crash_log(exp_id) or data.get("crash_log"))
+
+    def _on_experiment_finished(self, data: dict):
+        exp_id = data.get("experiment_id")
+        status = data.get("status") or "completed"
+        if exp_id and status in TERMINAL_EXPERIMENT_STATUSES:
+            self._finalize_experiment(status, experiment_id=exp_id)
 
     def _on_run_id(self, data: dict):
         self._reconcile_tracking(data.get("experiment_id"), data.get("run_id"))
@@ -1129,17 +1233,44 @@ class SessionTracker:
     # --- core reconciliation ---
 
     def _reconcile_tracking(self, remote_exp_id: Optional[int], remote_run_id: Optional[str]):
-        """Compare remote active state with local tracking and fix drift."""
+        """Reconcile direct remote active state without guessing terminal outcomes."""
         if remote_exp_id != self.current_experiment_id:
             if self.current_experiment_id:
-                self._finalize_experiment("completed")
+                status = self._inactive_experiment_status(self.current_experiment_id)
+                self._finalize_experiment(status)
             if remote_exp_id:
                 self._start_tracking(remote_exp_id, remote_run_id)
-        elif remote_exp_id and not self.current_run_id and remote_run_id:
-            self.current_run_id = remote_run_id
-            self.state.tracking_run_id = remote_run_id
-            update_experiment_metadata(remote_exp_id, remote_run_id=remote_run_id)
-            self.event(f"Attached run log: {remote_run_id}.txt")
+        elif remote_exp_id:
+            apply_authoritative_experiment_status(remote_exp_id, "running")
+            if not self.current_run_id and remote_run_id:
+                self.current_run_id = remote_run_id
+                self.state.tracking_run_id = remote_run_id
+                update_experiment_metadata(remote_exp_id, remote_run_id=remote_run_id)
+                self.event(f"Attached run log: {remote_run_id}.txt")
+
+    def _inactive_experiment_status(self, experiment_id: int) -> str:
+        """Resolve how an experiment ended, or return ``unknown`` honestly."""
+        mapping = None
+        if self.rpc:
+            try:
+                response = self.rpc.call(
+                    Method.GET_MAPPING,
+                    experiment_id=experiment_id,
+                    timeout=10,
+                )
+                mapping = response.get("mapping") if response.get("success") else None
+            except Exception as exc:
+                log.warning(
+                    f"[{self.session_name}] Could not resolve experiment "
+                    f"{experiment_id} mapping: {exc}"
+                )
+        remote_status = mapping.get("status") if mapping else None
+        if remote_status in TERMINAL_EXPERIMENT_STATUSES:
+            return remote_status
+        experiment = get_experiment(experiment_id)
+        if experiment and experiment.status in TERMINAL_EXPERIMENT_STATUSES:
+            return experiment.status
+        return "unknown"
 
     def _start_tracking(self, exp_id: int, run_id: Optional[str]):
         exp = get_experiment(exp_id)
@@ -1161,17 +1292,16 @@ class SessionTracker:
         name = Path(exp.script).name if exp and getattr(exp, "script", None) else None
         self.event(f"Tracking experiment {exp_id}" + (f" ({name})" if name else ""))
         conn = get_db()
-        # Demote *this incarnation's* other running rows to queued (a session runs
-        # one experiment at a time). Scoped by session_id (NULL-fallback for
-        # pre-upgrade rows) so a new run can't demote a prior incarnation's row that
-        # merely reused this session name.
-        conn.execute(
-            "UPDATE experiments SET status = 'queued' WHERE status = 'running' AND id != ? "
+        stale_rows = conn.execute(
+            "SELECT id FROM experiments WHERE status = 'running' AND id != ? "
             "AND (session_id = ? OR (session_id IS NULL AND session_name = ?))",
             (exp_id, self.config.session_id, self.session_name),
-        )
-        conn.commit(); conn.close()
-        update_experiment_status(exp_id, "running")
+        ).fetchall()
+        conn.close()
+        for row in stale_rows:
+            status = self._inactive_experiment_status(row["id"])
+            apply_authoritative_experiment_status(row["id"], status)
+        apply_authoritative_experiment_status(exp_id, "running")
         if run_id:
             update_experiment_metadata(exp_id, remote_run_id=run_id)
         self.current_experiment_id = exp_id
@@ -1181,14 +1311,18 @@ class SessionTracker:
         if not run_id:
             self.event(f"Experiment {exp_id} started (waiting for run_id)")
 
-    def _finalize_experiment(self, final_status: str = "completed"):
-        if not self.current_experiment_id:
+    def _finalize_experiment(
+        self,
+        final_status: str,
+        experiment_id: Optional[int] = None,
+    ):
+        exp_id = experiment_id or self.current_experiment_id
+        if not exp_id:
             return
-        exp_id = self.current_experiment_id
         self.event(f"Experiment {exp_id} {final_status}")
         exp = get_experiment(exp_id)
-        if exp and exp.status in ("running", "queued", "cancelled"):
-            update_experiment_status(exp_id, final_status)
+        if exp:
+            apply_authoritative_experiment_status(exp_id, final_status)
         # Fetch output log from remote
         if exp and self.rpc and not get_crash_log(exp_id):
             try:
@@ -1197,10 +1331,11 @@ class SessionTracker:
                     set_crash_log(exp_id, r["content"])
             except Exception:
                 pass
-        self.current_experiment_id = None
-        self.current_run_id = None
-        self.state.tracking_experiment_id = None
-        self.state.tracking_run_id = None
+        if self.current_experiment_id == exp_id:
+            self.current_experiment_id = None
+            self.current_run_id = None
+            self.state.tracking_experiment_id = None
+            self.state.tracking_run_id = None
 
     # --- sync ---
 
@@ -1254,36 +1389,12 @@ class SessionTracker:
             except OSError:
                 pass
 
-    def _finalize_dead_session(self, outage: float):
-        """The machine has been unreachable past the grace window — presume it's
-        gone and move in-flight work to a terminal state. The in-flight experiment
-        was training and got killed by infra (-> failed); queued experiments never
-        ran (-> cancelled). Tracking state is cleared so a later reconnect can
-        re-attach and self-heal if the machine actually returns.
-        """
-        note = (f"Machine disconnected — session '{self.session_name}' unreachable across "
-                f"{outage:.0f}s of reconnect attempts; experiment did not complete.")
-        # In-flight training run got killed by infra (-> failed); queued
-        # experiments never ran (-> cancelled). Shared with the session-removal
-        # path (see tracker.terminate_session_experiments).
-        failed_ids, cancelled_ids = terminate_session_experiments(
-            self.session_name,
-            running_status="failed",
-            queued_status="cancelled",
-            note=note,
-            session_id=self.config.session_id,
+    def _on_unreachable_timeout(self, outage: float):
+        """Report a long outage without changing remote-owned execution state."""
+        self.event(
+            f"Still unreachable after {outage:.0f}s of awake reconnect attempts; "
+            "experiment and queue states remain last-known"
         )
-        if failed_ids:
-            self.event(f"Marked {len(failed_ids)} experiment(s) failed — machine gone "
-                       f"({outage:.0f}s of awake retries)")
-        if cancelled_ids:
-            self.event(f"Marked {len(cancelled_ids)} queued experiments cancelled — machine gone")
-
-        # Clear tracking so reconnect re-attaches cleanly (and self-heals).
-        self.current_experiment_id = None
-        self.current_run_id = None
-        self.state.tracking_experiment_id = None
-        self.state.tracking_run_id = None
         self.state.save(self.session_name)
 
     def _backfill_crash_logs(self):
@@ -1318,9 +1429,17 @@ class SessionTracker:
         queue_key = json.dumps(queue_items, sort_keys=True)
         if self._last_queue_key == queue_key:
             return
-        self._last_queue_key = queue_key
         ts = ts or datetime.now(timezone.utc).isoformat()
-        _write_queue_cache_with_precedence(self.session_name, ts, queue_items, connected=True)
+        accepted = _apply_queue_snapshot(
+            self.session_name,
+            self.config.session_id,
+            ts,
+            queue_items,
+            connected=True,
+        )
+        if not accepted:
+            return
+        self._last_queue_key = queue_key
         _append_queue_history(self.session_name, ts, queue_items)
 
     # --- experiment helpers ---

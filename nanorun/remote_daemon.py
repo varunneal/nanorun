@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -44,6 +45,7 @@ OUTPUT_DIR = DAEMON_DIR / "output"
 QUEUE_FILE = DAEMON_DIR / "queue.txt"
 STATE_FILE = DAEMON_DIR / "state.json"
 PID_FILE = DAEMON_DIR / "daemon.pid"
+PENDING_WEIGHTS_FILE = DAEMON_DIR / "pending_weights.json"
 LOGS_DIR = REPO_DIR / "logs"
 MAPPINGS_LOG_DIR = LOGS_DIR / "mappings"
 QUEUE_LOG_DIR = LOGS_DIR / "queue"
@@ -67,6 +69,10 @@ FRONTMATTER_PATTERN = re.compile(r"^[\s]*(?:\"\"\"|'{3})(.*?)(?:\"\"\"|'{3})", r
 PARENT_FIELD_PATTERN = re.compile(r"parent:\s*(.+?)(?:\n|$)")
 KERNELS_FIELD_PATTERN = re.compile(r"kernels:\s*(.+?)(?:\n|$)")
 STEP_PATTERN = re.compile(r"^step:(\d+)/(\d+)", re.MULTILINE)
+METRIC_STEP_PATTERN = re.compile(r"step:(\d+)/(\d+)")
+LOSS_PATTERN = re.compile(
+    r"(?:val_loss|train_loss):\d+(?:\.\d+)?(?:[eE][+-]?\d+)?"
+)
 SEGMENT_FILE_PATTERN = re.compile(r"^mappings-(\d{6})\.jsonl$")
 QUEUE_SEGMENT_FILE_PATTERN = re.compile(r"^queue-(\d{6})\.jsonl$")
 
@@ -301,6 +307,7 @@ class NanorunDaemon:
         self._pending_events: List[EventMessage] = []
         self._ws_clients: Set = set()
         self._uploaded_weights: Set[str] = set()
+        self._pending_weight_uploads: Dict[str, Dict[str, Any]] = {}
         self._startup_time = time.monotonic()
         # Event-driven queue push: _emit_queue_changed sets this, _queue_push_task
         # drains it (debounced) and uploads just the queue segment to the hub.
@@ -308,6 +315,7 @@ class NanorunDaemon:
         self._queue_push_failures = 0
         for d in [DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, LOGS_DIR, MAPPINGS_LOG_DIR, QUEUE_LOG_DIR]:
             d.mkdir(parents=True, exist_ok=True)
+        self._load_pending_weight_uploads()
         # Recover from stale "running" state (daemon was killed mid-experiment)
         if self.state.status == "running":
             window = self.state.current_window
@@ -512,7 +520,10 @@ class NanorunDaemon:
 
     def _tmux_create(self, window: str, command: str) -> bool:
         self._run_cmd(f"tmux has-session -t {TMUX_SESSION} 2>/dev/null || tmux new-session -d -s {TMUX_SESSION}")
-        ok, _, err = self._run_cmd(f"tmux new-window -t {TMUX_SESSION} -n '{window}'")
+        ok, _, err = self._run_cmd(
+            f"tmux new-window -t {TMUX_SESSION} -n {shlex.quote(window)} "
+            f"-c {shlex.quote(str(REPO_DIR))}"
+        )
         if not ok:
             print(f"Failed to create tmux window: {err}", file=sys.stderr)
             return False
@@ -533,14 +544,28 @@ class NanorunDaemon:
 
     # --- experiment lifecycle ---
 
-    def _resolve_script_path(self, script: str) -> str:
-        """Resolve script path with case-insensitive lookup on Linux."""
-        full = REPO_DIR / script
+    def _resolve_script_path(self, script: str) -> Optional[str]:
+        """Resolve a repository-relative Python entrypoint.
+
+        The local CLI performs the same boundary check, but the daemon repeats
+        it because queue RPC state is an external input.
+        """
+        path = Path(script)
+        if path.is_absolute() or ".." in path.parts:
+            return None
+
+        full = REPO_DIR / path
         if full.exists():
-            return script
+            resolved = full.resolve()
+            try:
+                relative = resolved.relative_to(REPO_DIR.resolve())
+            except ValueError:
+                return None
+            return relative.as_posix() if resolved.is_file() and resolved.suffix == ".py" else None
+
         # Case-insensitive search: walk each path component
         current = REPO_DIR
-        for part in Path(script).parts:
+        for part in path.parts:
             match = None
             try:
                 for entry in current.iterdir():
@@ -550,9 +575,14 @@ class NanorunDaemon:
             except OSError:
                 return script
             if not match:
-                return script
+                return None
             current = match
-        return str(current.relative_to(REPO_DIR))
+        resolved = current.resolve()
+        try:
+            relative = resolved.relative_to(REPO_DIR.resolve())
+        except ValueError:
+            return None
+        return relative.as_posix() if resolved.is_file() and resolved.suffix == ".py" else None
 
     def _build_run_command(self, script: str, env_vars: Dict[str, str], gpus: int,
                            exp_id: int, cmd_prefix: Optional[str] = None,
@@ -577,6 +607,11 @@ class NanorunDaemon:
             return {"success": False, "error": f"Already running experiment {self.state.current_experiment_id}"}
 
         script = self._resolve_script_path(script)
+        if not script:
+            return {
+                "success": False,
+                "error": "Script must be a repository-relative .py file",
+            }
 
         gpu_procs = self.get_gpu_processes()
         if gpu_procs:
@@ -585,6 +620,28 @@ class NanorunDaemon:
             return {"success": False, "error": f"GPU busy: PIDs {pids} ({total_mem}MB)", "gpu_processes": gpu_procs}
 
         parent_path, kernels_path = self._parse_frontmatter(script)
+        if parent_path:
+            resolved_parent = self._resolve_script_path(parent_path)
+            if not resolved_parent:
+                return {
+                    "success": False,
+                    "error": (
+                        "Frontmatter parent must be an existing "
+                        f"repository-relative .py file: {parent_path}"
+                    ),
+                }
+            parent_path = resolved_parent
+        if kernels_path:
+            resolved_kernels = self._resolve_script_path(kernels_path)
+            if not resolved_kernels:
+                return {
+                    "success": False,
+                    "error": (
+                        "Frontmatter kernels must be an existing "
+                        f"repository-relative .py file: {kernels_path}"
+                    ),
+                }
+            kernels_path = resolved_kernels
         symlink_cmd = self._kernels_symlink_cmd(script, kernels_path) if kernels_path else None
         code_hash = self._compute_code_hash(script, kernels_path)
         if not code_hash:
@@ -626,6 +683,14 @@ class NanorunDaemon:
         window = self.state.current_window
 
         if not self._tmux_window_exists(window) or self._tmux_pane_dead(window):
+            # A short-lived script may exit before the normal polling path sees
+            # its (possibly buffered) run-id print. The tee'd output is complete
+            # once the pane is dead, so make one final detection attempt before
+            # classifying the experiment.
+            if not self.state.current_run_id:
+                run_id = self._detect_run_id()
+                if run_id:
+                    self._record_run_id(run_id)
             if self._tmux_window_exists(window):
                 self._tmux_kill(window)
             self._handle_experiment_finished()
@@ -635,15 +700,43 @@ class NanorunDaemon:
         if not self.state.current_run_id:
             run_id = self._detect_run_id()
             if run_id:
-                self.state.current_run_id = run_id
-                self.state.save()
-                mapping = ExperimentMapping.load(self.state.current_experiment_id)
-                if mapping:
-                    mapping.run_id = run_id
-                    mapping.log_file = f"logs/{run_id}.txt"
-                    mapping.save()
-                self._emit(Event.EXPERIMENT_RUN_ID,
-                           experiment_id=self.state.current_experiment_id, run_id=run_id)
+                self._record_run_id(run_id)
+
+        # A final metric is both the success signal and the workload boundary.
+        # Terminate the tmux window before finalizing so no GPU work can continue
+        # after the run is recorded as complete.
+        if self.state.current_run_id:
+            log_path = LOGS_DIR / f"{self.state.current_run_id}.txt"
+            last_metric = self._find_last_metric_step(log_path)
+            if last_metric and last_metric[0] >= last_metric[1]:
+                print(
+                    f"[daemon] Final metric detected for experiment "
+                    f"{self.state.current_experiment_id}: "
+                    f"step:{last_metric[0]}/{last_metric[1]}"
+                )
+                if self._tmux_kill(window):
+                    self._handle_experiment_finished()
+                else:
+                    print(
+                        f"[daemon] Failed to terminate completed experiment "
+                        f"{self.state.current_experiment_id}; will retry",
+                        file=sys.stderr,
+                    )
+
+    def _record_run_id(self, run_id: str):
+        """Persist and emit a run ID detected from experiment stdout."""
+        self.state.current_run_id = run_id
+        self.state.save()
+        mapping = ExperimentMapping.load(self.state.current_experiment_id)
+        if mapping:
+            mapping.run_id = run_id
+            mapping.log_file = f"logs/{run_id}.txt"
+            mapping.save()
+        self._emit(
+            Event.EXPERIMENT_RUN_ID,
+            experiment_id=self.state.current_experiment_id,
+            run_id=run_id,
+        )
 
     def _detect_run_id(self) -> Optional[str]:
         """Check tee'd output file for run_id pattern.
@@ -681,6 +774,21 @@ class NanorunDaemon:
             pass
         return None
 
+    def _find_last_metric_step(self, path: Path) -> tuple[int, int] | None:
+        """Find the last loss-bearing metric step near the end of a live log.
+
+        Live termination deliberately requires a real metric line rather than
+        any ``step:N/M`` text. Training scripts commonly print their own source
+        at startup, and an unfilled f-string must never terminate a workload.
+        """
+        output = self._read_file_tail(path)
+        last = None
+        for line in output.splitlines():
+            step = METRIC_STEP_PATTERN.search(line)
+            if step and LOSS_PATTERN.search(line):
+                last = (int(step.group(1)), int(step.group(2)))
+        return last
+
     def _handle_experiment_finished(self):
         exp_id = self.state.current_experiment_id
         run_id = self.state.current_run_id
@@ -700,6 +808,7 @@ class NanorunDaemon:
                 mapping.save()
                 print(f"[daemon] Experiment {exp_id} {status}")
                 if status == "completed":
+                    self._queue_final_weight_upload(exp_id, mapping.run_id)
                     self._emit(Event.EXPERIMENT_FINISHED, experiment_id=exp_id,
                                status="completed", run_id=run_id, code_hash=mapping.code_hash)
                 else:
@@ -953,6 +1062,59 @@ class NanorunDaemon:
 
     # --- hub sync ---
 
+    def _load_pending_weight_uploads(self):
+        """Load durable post-exit checkpoint uploads."""
+        if not PENDING_WEIGHTS_FILE.exists():
+            return
+        try:
+            data = json.loads(PENDING_WEIGHTS_FILE.read_text())
+            if isinstance(data, dict):
+                self._pending_weight_uploads = data
+        except (OSError, json.JSONDecodeError):
+            print("[hub] Ignoring invalid pending weight upload state", file=sys.stderr)
+
+    def _save_pending_weight_uploads(self):
+        """Atomically persist post-exit checkpoint uploads."""
+        tmp = PENDING_WEIGHTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._pending_weight_uploads, indent=2))
+        tmp.replace(PENDING_WEIGHTS_FILE)
+
+    def _queue_final_weight_upload(self, experiment_id: int, run_id: Optional[str]):
+        """Queue closed checkpoints for upload after the GPU process exits."""
+        if not run_id:
+            return
+        weights_dir = LOGS_DIR / run_id
+        if not weights_dir.is_dir():
+            return
+        files = [
+            path.name
+            for path in sorted(weights_dir.glob("*.pt"))
+            if str(path) not in self._uploaded_weights
+        ]
+        if not files:
+            return
+        key = f"{experiment_id}:{run_id}"
+        existing = self._pending_weight_uploads.get(key, {})
+        pending_files = sorted(set(existing.get("files", [])) | set(files))
+        self._pending_weight_uploads[key] = {
+            "experiment_id": experiment_id,
+            "run_id": run_id,
+            "files": pending_files,
+        }
+        try:
+            self._save_pending_weight_uploads()
+        except OSError as e:
+            # The in-memory queue can still upload on the next hub pass. Never
+            # let persistence trouble strand daemon lifecycle finalization.
+            print(
+                f"[hub] Could not persist pending weight uploads: {e}",
+                file=sys.stderr,
+            )
+        print(
+            f"[hub] Queued {len(pending_files)} post-exit weight upload(s) "
+            f"for experiment {experiment_id}"
+        )
+
     async def _hub_sync_logs(self):
         # Runs sync_logs_up in a fresh subprocess on each cycle.
         #
@@ -1009,6 +1171,53 @@ class NanorunDaemon:
         except Exception as e:
             print(f"[hub] Weight check failed: {e}", file=sys.stderr)
 
+    async def _hub_upload_pending_weights(self):
+        """Upload checkpoints queued after a workload has stopped.
+
+        Files need no age check here: the experiment process has already been
+        terminated, so no writer can still be mutating them.
+        """
+        if not HUB_AVAILABLE or not self._pending_weight_uploads:
+            return
+        for key, item in list(self._pending_weight_uploads.items()):
+            exp_id = item.get("experiment_id")
+            run_id = item.get("run_id")
+            remaining = []
+            for filename in item.get("files", []):
+                pt_file = LOGS_DIR / str(run_id) / filename
+                if not pt_file.is_file():
+                    print(
+                        f"[hub] Pending weight disappeared: {pt_file}",
+                        file=sys.stderr,
+                    )
+                    continue
+                try:
+                    print(
+                        f"[hub] Uploading post-exit weight: {filename} "
+                        f"for experiment {exp_id}"
+                    )
+                    await asyncio.to_thread(
+                        hub.upload_weight,
+                        pt_file,
+                        exp_id,
+                        filename,
+                        self.session_name,
+                    )
+                    print(f"[hub] Uploaded post-exit weight: {filename}")
+                except Exception as e:
+                    remaining.append(filename)
+                    print(
+                        f"[hub] Post-exit weight upload failed ({filename}): {e}",
+                        file=sys.stderr,
+                    )
+            if remaining:
+                current = self._pending_weight_uploads.get(key)
+                if current is not None:
+                    current["files"] = remaining
+            else:
+                self._pending_weight_uploads.pop(key, None)
+            self._save_pending_weight_uploads()
+
     # --- background tasks ---
 
     async def _experiment_monitor_task(self):
@@ -1029,6 +1238,7 @@ class NanorunDaemon:
             try:
                 await self._hub_sync_logs()
                 await self._hub_upload_weights()
+                await self._hub_upload_pending_weights()
             except Exception as e:
                 print(f"[hub] Sync task error: {e}", file=sys.stderr)
             await asyncio.sleep(HUB_SYNC_INTERVAL_S)

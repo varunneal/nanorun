@@ -6,7 +6,10 @@ from typing import Dict, List, Optional
 from rich.console import Console
 
 from .remote_control import DaemonError, get_daemon_client
-from .tracker import get_running_experiments, update_experiment_status
+from .tracker import (
+    apply_authoritative_experiment_status,
+    get_running_experiments,
+)
 from .queue import set_queue_state
 
 console = Console()
@@ -70,20 +73,45 @@ def cancel_experiment(start_next: bool = True, session_name: Optional[str] = Non
 
     # Cancel via daemon RPC (daemon kills tmux window and updates remote state)
     daemon = get_daemon_client(session_name)
-    if daemon:
-        with daemon:
-            try:
-                result = daemon.cancel(pause=not start_next)
-                if result.get("success"):
-                    console.print(f"[dim]Daemon cancelled experiment[/dim]")
-                else:
-                    console.print(f"[yellow]Daemon cancel response: {result.get('error', 'unknown')}[/yellow]")
-            except DaemonError as e:
-                console.print(f"[red]Could not reach daemon: {e}[/red]")
+    if not daemon:
+        console.print("[red]Could not reach daemon; cancellation was not confirmed[/red]")
+        return False
 
-    # Update local experiment status to 'cancelled'
-    update_experiment_status(exp.id, "cancelled")
-    console.print(f"[green]Experiment {exp.id} marked as cancelled[/green]")
+    try:
+        with daemon:
+            result = daemon.cancel(pause=not start_next)
+    except DaemonError as e:
+        console.print(f"[red]Could not reach daemon: {e}[/red]")
+        return False
+
+    if not result.get("success"):
+        console.print(
+            f"[yellow]Daemon did not cancel experiment: "
+            f"{result.get('error', 'unknown')}[/yellow]"
+        )
+        return False
+
+    cancelled_id = result.get("cancelled_experiment_id")
+    has_correlated_id = (
+        isinstance(cancelled_id, int)
+        and not isinstance(cancelled_id, bool)
+        and cancelled_id > 0
+    )
+    if has_correlated_id:
+        # The acknowledgement names the authority-owned attempt. Any different
+        # local "running" projection is stale, not the experiment we cancelled.
+        for local_exp in running:
+            if local_exp.id != cancelled_id:
+                apply_authoritative_experiment_status(local_exp.id, "unknown")
+        apply_authoritative_experiment_status(cancelled_id, "cancelled")
+        console.print(
+            f"[green]Experiment {cancelled_id} marked as cancelled[/green]"
+        )
+    else:
+        console.print(
+            "[yellow]Cancellation succeeded remotely, but its experiment ID "
+            "was not reported; local status is unchanged[/yellow]"
+        )
 
     # Handle local queue state
     if not start_next:

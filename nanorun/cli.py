@@ -282,14 +282,14 @@ def session_cleanup():
     for sc in sessions:
         state = SessionState.load(sc.name)
         if state.status == "disconnected":
-            # Remove session config (also cancels any in-flight experiments)
-            _, cancelled = Config.delete_session(sc.name)
+            # Connectivity is not execution authority: removing local connection
+            # metadata preserves every experiment's last-known state.
+            Config.delete_session(sc.name)
             # Remove per-session state dir
             state_dir = Config.get_session_state_dir(sc.name)
             if state_dir.exists():
                 shutil.rmtree(state_dir, ignore_errors=True)
-            suffix = f" — cancelled {cancelled} in-flight experiment(s)" if cancelled else ""
-            console.print(f"  Removed [bold]{sc.name}[/bold] ({sc.user}@{sc.host}){suffix}")
+            console.print(f"  Removed [bold]{sc.name}[/bold] ({sc.user}@{sc.host})")
             removed += 1
 
     if removed:
@@ -699,6 +699,13 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
     if not track:
         # For iris sessions, derive track from script path (e.g. experiments/grug/moe/launch.py → moe)
         track = connector.infer_track(script_rel)
+    if not track and (not sc or sc.session_type == "ssh"):
+        console.print(
+            f"[red]No track found for {script_rel}.[/red]\n"
+            "[dim]Create one in the script directory or an ancestor with: "
+            "nanorun track create <name> <directory>[/dim]"
+        )
+        raise SystemExit(1)
     if track:
         console.print(f"[dim]Track: {track}[/dim]")
 
@@ -769,6 +776,15 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
         raise SystemExit(1)
 
     track = infer_track_from_path(script_rel)
+    if not track:
+        track = connector.infer_track(script_rel)
+    if not track and (not sc or sc.session_type == "ssh"):
+        console.print(
+            f"[red]No track found for {script_rel}.[/red]\n"
+            "[dim]Create one in the script directory or an ancestor with: "
+            "nanorun track create <name> <directory>[/dim]"
+        )
+        raise SystemExit(1)
     if track:
         console.print(f"[dim]Track: {track}[/dim]")
 

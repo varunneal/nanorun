@@ -376,7 +376,7 @@ def record_metric(
 
 
 def update_experiment_status(experiment_id: int, status: str) -> None:
-    """Update experiment status (running, completed, failed)."""
+    """Update experiment status and keep terminal timestamps consistent."""
     conn = get_db()
     if status in ("completed", "failed", "cancelled"):
         conn.execute(
@@ -384,17 +384,50 @@ def update_experiment_status(experiment_id: int, status: str) -> None:
             (status, datetime.now(timezone.utc).isoformat(), experiment_id)
         )
     elif status == "running":
-        # Set started_at when transitioning to running (only if not already set)
+        # A direct remote observation may correct a stale terminal projection.
         conn.execute(
-            "UPDATE experiments SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
+            "UPDATE experiments SET status = ?, started_at = COALESCE(started_at, ?), "
+            "finished_at = NULL WHERE id = ?",
             (status, datetime.now(timezone.utc).isoformat(), experiment_id)
         )
     else:
         conn.execute(
-            "UPDATE experiments SET status = ? WHERE id = ?",
+            "UPDATE experiments SET status = ?, finished_at = NULL WHERE id = ?",
             (status, experiment_id)
         )
     conn.commit()
+
+
+TERMINAL_EXPERIMENT_STATUSES = frozenset({"completed", "failed", "cancelled"})
+OBSERVED_EXPERIMENT_STATUSES = TERMINAL_EXPERIMENT_STATUSES | {
+    "queued", "running", "unknown",
+}
+
+
+def apply_authoritative_experiment_status(
+    experiment_id: int,
+    observed_status: str,
+) -> bool:
+    """Apply execution evidence to the local projection.
+
+    A final metric is direct proof that the training contract completed, so a
+    later exit-classification or stale mapping cannot downgrade it. Other local
+    projections may be corrected by remote active state, terminal mappings,
+    terminal events, or acknowledged control operations.
+    """
+    if observed_status not in OBSERVED_EXPERIMENT_STATUSES:
+        return False
+    experiment = get_experiment(experiment_id)
+    if not experiment or experiment.status == observed_status:
+        return False
+    if (
+        experiment.status == "completed"
+        and observed_status != "completed"
+        and get_final_metric(experiment_id) is not None
+    ):
+        return False
+    update_experiment_status(experiment_id, observed_status)
+    return True
 
 
 def terminate_session_experiments(
@@ -406,13 +439,9 @@ def terminate_session_experiments(
 ) -> Tuple[List[int], List[int]]:
     """Move a session's in-flight experiments to a terminal state.
 
-    Shared by the two paths that end a session's in-flight work:
-      - **session removed** (deleted from the session list): both running and
-        queued experiments -> 'cancelled' (the default), so nothing is left
-        dangling as 'running'/'queued' after the session is gone.
-      - **session dies** (daemon dead-session reconciliation, machine gone past
-        the grace window): the training run -> 'failed', queued runs ->
-        'cancelled'.
+    This is an explicit administrative operation, not a connectivity-recovery
+    primitive. Callers must already have authoritative evidence or direct user
+    intent for the requested terminal transitions.
 
     Running rows go to ``running_status``, queued rows to ``queued_status``. When
     ``note`` is given it's stamped as the crash log on each running row that
@@ -683,10 +712,11 @@ def create_experiment_from_mapping(
     session_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> int:
-    """Create experiment with explicit ID (for recovery from remote).
+    """Idempotently create an experiment with an explicit remote-assigned ID.
 
     Unlike create_experiment(), this uses a specific ID rather than auto-increment.
-    Used when syncing experiments that were created by remote daemon.
+    Used when the remote daemon first confirms a queued or running experiment.
+    Replayed queue snapshots, mappings, and events are harmless.
 
     Returns the experiment ID.
     """
@@ -695,6 +725,7 @@ def create_experiment_from_mapping(
         """
         INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, session_name, session_id, queue_command)
         VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :session_name, :session_id, :queue_command)
+        ON CONFLICT(id) DO NOTHING
         """,
         {
             "id": experiment_id,

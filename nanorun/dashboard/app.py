@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -29,11 +29,19 @@ app = FastAPI(title="nanorun Dashboard")
 
 # Setup templates and static files
 DASHBOARD_DIR = Path(__file__).parent
+REPO_ROOT = DASHBOARD_DIR.parent.parent.resolve()
 templates = Jinja2Templates(directory=DASHBOARD_DIR / "templates")
 app.mount("/static", StaticFiles(directory=DASHBOARD_DIR / "static"), name="static")
 
 # Cache buster: changes on each server start
 BOOT_VERSION = str(int(time.time()))
+
+
+def _resolve_within(root: Path, untrusted_path: str) -> Optional[Path]:
+    """Resolve a user-controlled path only when it remains inside ``root``."""
+    resolved_root = root.resolve()
+    candidate = (resolved_root / untrusted_path).resolve()
+    return candidate if candidate.is_relative_to(resolved_root) else None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -421,9 +429,8 @@ async def delete_session(name: str):
             {"error": "Cannot remove a connected session. Disconnect first."},
             status_code=400,
         )
-    # delete_session also cancels any in-flight (running/queued) experiments for
-    # this session so they don't linger after the session is gone.
-    _, cancelled = Config.delete_session(name)
+    # Removing local connection metadata does not prove remote work stopped.
+    Config.delete_session(name)
     state_dir = Config.get_session_state_dir(name)
     if state_dir.exists():
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -431,8 +438,6 @@ async def delete_session(name: str):
     if daemon and hasattr(daemon, "remove_session"):
         daemon.remove_session(name)
     msg = f"Session '{name}' removed"
-    if cancelled:
-        msg += f" ({cancelled} in-flight experiment(s) cancelled)"
     return {"success": True, "message": msg}
 
 
@@ -662,17 +667,21 @@ async def get_log_file(run_id: str):
     # Try direct name, then legacy iris job ID encoding for old experiments
     candidates = [run_id, _iris_job_id_to_filename(run_id)]
 
+    if _resolve_within(logs_dir, f"{run_id}.txt") is None:
+        return JSONResponse({"error": "Invalid log path"}, status_code=400)
+
     log_file = None
     for rid in candidates:
-        flat = logs_dir / f"{rid}.txt"
-        if flat.exists():
+        flat = _resolve_within(logs_dir, f"{rid}.txt")
+        if flat and flat.is_file():
             log_file = flat
             break
         for session_dir in logs_dir.iterdir():
             if not session_dir.is_dir():
                 continue
-            candidate = session_dir / f"{rid}.txt"
-            if candidate.exists():
+            relative_path = Path(session_dir.name) / f"{rid}.txt"
+            candidate = _resolve_within(logs_dir, str(relative_path))
+            if candidate and candidate.is_file():
                 log_file = candidate
                 break
         if log_file:
@@ -681,20 +690,19 @@ async def get_log_file(run_id: str):
     if not log_file:
         return JSONResponse({"error": f"Log file not found: {run_id}"}, status_code=404)
 
-    try:
-        content = log_file.read_text()
-        return PlainTextResponse(content)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    return FileResponse(str(log_file), media_type="text/plain")
 
 
 @app.get("/api/diff/{code_hash}")
 async def get_diff_file(code_hash: str):
     """Get the diff file content for a code hash."""
     diffs_dir = Config.get_config_dir() / "diffs"
-    diff_file = diffs_dir / f"{code_hash}.diff"
+    diff_file = _resolve_within(diffs_dir, f"{code_hash}.diff")
 
-    if not diff_file.exists():
+    if diff_file is None:
+        return JSONResponse({"error": "Invalid diff path"}, status_code=400)
+
+    if not diff_file.is_file():
         return JSONResponse({"error": f"Diff not found for code hash: {code_hash}"}, status_code=404)
 
     try:
@@ -711,17 +719,25 @@ async def get_script_notes(script_path: str):
     Notes are stored as sidecar files: {script_name}.notes.md
     For example: experiments/records/train_gpt_record52.py -> train_gpt_record52.notes.md
     """
-    # Get the repo root
-    repo_root = Path(__file__).parent.parent.parent
-    script_file = repo_root / script_path
+    script_file = _resolve_within(REPO_ROOT, script_path)
 
-    if not script_file.exists():
+    if script_file is None:
+        return JSONResponse({"error": "Invalid script path"}, status_code=400)
+
+    if not script_file.is_file():
         return JSONResponse({"error": f"Script not found: {script_path}"}, status_code=404)
 
     # Build notes file path: same directory, {stem}.notes.md
-    notes_file = script_file.parent / f"{script_file.stem}.notes.md"
+    notes_relative = (
+        script_file.parent.relative_to(REPO_ROOT.resolve())
+        / f"{script_file.stem}.notes.md"
+    )
+    notes_file = _resolve_within(REPO_ROOT, str(notes_relative))
 
-    if not notes_file.exists():
+    if notes_file is None:
+        return JSONResponse({"error": "Invalid notes path"}, status_code=400)
+
+    if not notes_file.is_file():
         return Response(status_code=204)
 
     try:
@@ -756,10 +772,12 @@ async def get_env_defaults(script_path: str):
     """
     import re
 
-    repo_root = Path(__file__).parent.parent.parent
-    script_file = repo_root / script_path
+    script_file = _resolve_within(REPO_ROOT, script_path)
 
-    if not script_file.exists():
+    if script_file is None:
+        return JSONResponse({"error": "Invalid script path"}, status_code=400)
+
+    if not script_file.is_file():
         return JSONResponse({"error": f"Script not found: {script_path}"}, status_code=404)
 
     try:
@@ -796,11 +814,12 @@ async def reveal_in_finder(exp_id: int):
     if not exp.script:
         return JSONResponse({"error": "No script path for this experiment"}, status_code=404)
 
-    # Get the repo root (where nanorun-platform is)
-    repo_root = Path(__file__).parent.parent.parent
-    script_path = repo_root / exp.script
+    script_path = _resolve_within(REPO_ROOT, exp.script)
 
-    if not script_path.exists():
+    if script_path is None:
+        return JSONResponse({"error": "Invalid script path"}, status_code=400)
+
+    if not script_path.is_file():
         return JSONResponse({"error": f"Script file not found: {exp.script}"}, status_code=404)
 
     try:
