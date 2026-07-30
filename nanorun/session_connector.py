@@ -410,14 +410,8 @@ class BootstrapConnector(SshConnector):
               prefix=None, **kwargs) -> List[SubmitResult]:
         return [SubmitResult(error=self._MESSAGE)]
 
-    def queue(self) -> List[QueueItem]:
-        return []
-
-    def queue_meta(self) -> QueueMeta:
-        return QueueMeta(live=True)
-
-    def status(self) -> List[QueueItem]:
-        return []
+    # queue()/queue_meta()/status() are inherited: they read local caches that
+    # the hub follow path keeps fresh, so read-only views work without SSH.
 
     def cancel(self, job_id=None) -> ConnectorResult:
         return self._unsupported()

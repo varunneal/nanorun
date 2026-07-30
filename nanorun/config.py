@@ -72,9 +72,11 @@ class SessionConfig:
 
         SSH and Iris sessions retain their historical name-based layout. Local
         sessions created before workspace IDs were introduced also fall back to
-        their name until they are migrated by session start/sync.
+        their name until they are migrated by session start/sync. Bootstrap
+        sessions carry the workspace_id they minted for the machine's own local
+        session, and follow that namespace via the hub.
         """
-        if self.session_type == "local" and self.workspace_id:
+        if self.workspace_id and (self.session_type == "local" or self.bootstrap):
             return self.workspace_id
         return self.name
 

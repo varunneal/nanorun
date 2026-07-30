@@ -390,6 +390,13 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
     from datetime import datetime, timezone
     session_config.started_at = datetime.now(timezone.utc).isoformat()
 
+    # Bootstrap sessions mint the machine's hub/branch identity up front:
+    # setup seeds it onto the machine, its local session adopts it, and this
+    # device follows that namespace via the hub from day one.
+    if bootstrap_session:
+        from .sync import _new_local_workspace_id
+        session_config.workspace_id = _new_local_workspace_id(session_config)
+
     # Save session
     config = Config(session=session_config)
     config.save()
@@ -514,6 +521,8 @@ def session_status(session_name):
     table.add_row("Repo path", s.repo_path)
     if s.session_type == "local":
         table.add_row("Git branch", s.git_branch or "[dim]not initialized[/dim]")
+        table.add_row("Hub namespace", s.hub_namespace)
+    elif s.bootstrap:
         table.add_row("Hub namespace", s.hub_namespace)
 
     # Check connection

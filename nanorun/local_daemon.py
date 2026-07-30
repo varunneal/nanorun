@@ -520,10 +520,13 @@ class HubSyncer:
         # sessions this is the whole background footprint (W&B + iris job polling);
         # on-demand CLI commands still hit the backend directly and are unaffected.
         # The flag is re-read every cycle, so pause/resume applies without a restart.
-        # Bootstrap sessions are provision-only (no hub namespace, no queue, no
-        # metrics) — exclude them before any pause bookkeeping so they never sync.
+        # Bootstrap sessions are followed via the hub: they carry the workspace_id
+        # minted at `session start --bootstrap`, which the machine's own local
+        # session publishes under. Legacy bootstrap configs without one have no
+        # namespace to pull — exclude those before any pause bookkeeping.
         all_sessions = [
-            s for s in Config.list_sessions() if not getattr(s, "bootstrap", False)
+            s for s in Config.list_sessions()
+            if not (getattr(s, "bootstrap", False) and not s.workspace_id)
         ]
         paused = {s.name for s in all_sessions if getattr(s, "sync_paused", False)}
         prev_paused = getattr(self, "_paused_sessions", set())

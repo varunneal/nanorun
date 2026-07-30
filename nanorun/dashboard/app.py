@@ -392,7 +392,9 @@ async def get_sessions():
             "status": status,
             "git_branch": sc.git_branch if sc.session_type == "local" else None,
             "hub_namespace": (
-                sc.hub_namespace if sc.session_type == "local" else None
+                sc.hub_namespace
+                if sc.session_type == "local" or getattr(sc, "bootstrap", False)
+                else None
             ),
             "sync_paused": getattr(sc, "sync_paused", False),
             "last_error": state.last_error,

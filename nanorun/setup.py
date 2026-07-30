@@ -199,6 +199,29 @@ def _gather_bootstrap_git_auth() -> tuple[Optional[dict], list[str]]:
     return git_auth, warnings
 
 
+def _bootstrap_seed_session(session, repo_path: str) -> dict:
+    """The machine-side local session identity pre-assigned by this device.
+
+    Written to {repo}/.nanorun/sessions/local.json on the machine so that a
+    plain `nanorun session start --local` there adopts this workspace_id — the
+    same namespace this device's bootstrap session follows via the hub.
+    """
+    return {
+        "name": "local",
+        "host": "localhost",
+        "user": session.user,
+        "port": 0,
+        "repo_path": repo_path,
+        "tmux_session": "nanorun-local",
+        "session_type": "local",
+        "gpu_type": session.gpu_type,
+        "gpu_count": session.gpu_count,
+        "started_at": session.started_at,
+        "workspace_id": session.workspace_id,
+        "git_branch": f"nanorun/local/{session.workspace_id}",
+    }
+
+
 def _gather_agent_auth() -> tuple[dict, list[str]]:
     """Collect Claude Code + Codex credentials from this machine (best effort).
 
@@ -432,6 +455,9 @@ grep -q "Host github.com" $HOME_DIR/.ssh/config 2>/dev/null || printf "Host gith
 # Hostname fix
 python3 -c "import socket; socket.gethostbyname(socket.gethostname())" 2>/dev/null || \\
   {sudo_prefix}sh -c 'echo "127.0.0.1 $(hostname)" >> /etc/hosts'
+
+# Reclaim root-owned $HOME/.config (common cloud-image wart; breaks uv's receipt write)
+[ -d $HOME_DIR/.config ] && [ ! -w $HOME_DIR/.config ] && {sudo_prefix}chown -R $(whoami) $HOME_DIR/.config
 
 # ── apt (background) ──
 (
@@ -678,6 +704,52 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
         else:
             failures.append(SetupFailure("repo", r.stderr[:200]))
             console.print(f"  [red]repo: clone FAILED[/red]")
+
+    # ── Seed the machine's local session identity (bootstrap only) ────────────
+    # Pre-assign the workspace_id so the machine's `session start --local`
+    # adopts it and this device follows the same hub namespace by default.
+    if bootstrap:
+        import base64 as _b64
+        import json as _json
+
+        if not session.workspace_id:
+            from .sync import _new_local_workspace_id
+            session.workspace_id = _new_local_workspace_id(session)
+            Config.save_session(session)
+
+        seed_path = f"{repo_path}/.nanorun/sessions/local.json"
+        existing = remote.run(f"cat {seed_path} 2>/dev/null", timeout=15)
+        existing_id = None
+        if existing.success and existing.stdout.strip():
+            try:
+                existing_id = _json.loads(existing.stdout).get("workspace_id")
+            except ValueError:
+                pass
+        if existing_id:
+            if existing_id != session.workspace_id:
+                # The machine already owns an identity — follow it, don't fork it.
+                session.workspace_id = existing_id
+                Config.save_session(session)
+                console.print(
+                    f"  [yellow]adopted existing local session namespace: {existing_id}[/yellow]"
+                )
+            else:
+                console.print(f"  [green]local session already seeded:[/green] {existing_id}")
+        else:
+            seed = _bootstrap_seed_session(session, repo_path)
+            seed_b64 = _b64.b64encode(_json.dumps(seed, indent=2).encode()).decode()
+            r = remote.run(
+                f"mkdir -p {repo_path}/.nanorun/sessions && "
+                f"echo '{seed_b64}' | base64 -d > {seed_path}",
+                timeout=15,
+            )
+            if r.success:
+                console.print(
+                    f"  [green]local session seeded:[/green] namespace {session.workspace_id}"
+                )
+            else:
+                failures.append(SetupFailure("seed", r.stderr[:200]))
+                console.print("  [red]local session seed FAILED[/red]")
 
     # ── Run setup script (1 SSH call, all parallelism inside) ─────────────────
     console.print("\n[bold]Running setup (parallel)...[/bold]")
