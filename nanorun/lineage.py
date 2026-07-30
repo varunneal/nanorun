@@ -80,7 +80,7 @@ def compute_content_hash(content: bytes) -> str:
 def compute_file_hash(path: str) -> Optional[str]:
     """Compute SHA256 hash of a local file, returning first 12 chars.
 
-    Uses read_bytes() to match remote daemon's hash computation exactly.
+    Uses read_bytes() to match the daemon's hash computation exactly.
 
     Args:
         path: Path relative to repo root

@@ -67,29 +67,85 @@ def resolve_repo_path(remote: RemoteSession, configured_path: str) -> str:
 
 
 _GPU_MATCH_ORDER = [
-    # (substring_to_match, returned_type) — order matters: longer/more-specific first
+    # (substring_to_match, returned_type) — order matters: longer/more-specific first.
+    # Substrings are matched against the uppercased `nvidia-smi --query-gpu=name`
+    # product string (the NVIDIA driver's supported-products name, e.g.
+    # "NVIDIA RTX 6000 Ada Generation", "Tesla V100-SXM2-32GB").
+    # Blackwell datacenter — Grace parts first ("NVIDIA GB200" contains "B200")
     ("GB10", "DGX_SPARK"), ("DGX SPARK", "DGX_SPARK"),
-    ("B200", "B200"), ("RTX PRO 6000", "RTX_PRO_6000"),
-    ("BLACKWELL", "BLACKWELL"), ("B100", "BLACKWELL"),
+    ("GB300", "GB300"), ("GB200", "GB200"),
+    ("B300", "B300"), ("B200", "B200"), ("B100", "BLACKWELL"),
+    # Blackwell workstation ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition") —
+    # must precede the generic BLACKWELL entry, which they all contain
+    ("RTX PRO 6000", "RTX_PRO_6000"), ("RTX PRO 5000", "RTX_PRO_5000"),
+    ("RTX PRO 4500", "RTX_PRO_4500"), ("RTX PRO 4000", "RTX_PRO_4000"),
+    ("RTX PRO 2000", "RTX_PRO_2000"),
+    ("BLACKWELL", "BLACKWELL"),
+    # GeForce Blackwell ("NVIDIA GeForce RTX 5090", "... RTX 5090 D")
+    ("RTX 5090", "RTX_5090"), ("RTX 5080", "RTX_5080"),
+    ("RTX 5070", "RTX_5070"), ("RTX 5060", "RTX_5060"),
+    # Hopper — H200 before H20 ("NVIDIA H200" contains "H20")
     ("GH200", "GH200"), ("H200", "H200"), ("H100", "H100"),
-    ("A100", "A100"), ("A40", "A40"), ("A30", "A30"), ("A16", "A16"),
-    ("A10G", "A10G"), ("A10", "A10"),
-    ("A6000", "A6000"), ("A5000", "A5000"), ("A4000", "A4000"), ("A2", "A2"),
-    ("L40S", "L40S"), ("L40", "L40"), ("L4", "L4"),
+    ("H800", "H800"), ("H20", "H20"),
+    # Ada Lovelace datacenter — L40S before L40 before L4; L20 before L2
+    ("L40S", "L40S"), ("L40", "L40"), ("L20", "L20"), ("L4", "L4"), ("L2", "L2"),
+    # Ada Lovelace workstation ("NVIDIA RTX 6000 Ada Generation") — SFF before plain 4000
+    ("RTX 6000 ADA", "RTX_6000_ADA"), ("RTX 5880 ADA", "RTX_5880_ADA"),
+    ("RTX 5000 ADA", "RTX_5000_ADA"), ("RTX 4500 ADA", "RTX_4500_ADA"),
+    ("RTX 4000 SFF ADA", "RTX_4000_SFF_ADA"), ("RTX 4000 ADA", "RTX_4000_ADA"),
+    ("RTX 2000 ADA", "RTX_2000_ADA"),
+    # GeForce Ada ("NVIDIA GeForce RTX 4090", "... RTX 4090 D")
+    ("RTX 4090", "RTX_4090"), ("RTX 4080", "RTX_4080"),
+    ("RTX 4070", "RTX_4070"), ("RTX 4060", "RTX_4060"),
+    # Ampere workstation ("NVIDIA RTX A6000") — the whole RTX A-series must precede
+    # the bare datacenter entries below: "NVIDIA RTX A4000" contains "A40",
+    # "NVIDIA RTX A3000" contains "A30", "NVIDIA RTX A1000" contains "A100".
+    # Within the block, A4000 precedes A400 for the same reason.
+    ("RTX A6000", "A6000"), ("RTX A5500", "A5500"), ("RTX A5000", "A5000"),
+    ("RTX A4500", "A4500"), ("RTX A4000", "A4000"), ("RTX A3000", "A3000"),
+    ("RTX A2000", "A2000"), ("RTX A1000", "A1000"), ("RTX A400", "A400"),
+    # Ampere datacenter — A100 before A10 ("NVIDIA A100" contains "A10")
+    ("A100", "A100"), ("A800", "A800"), ("A40", "A40"), ("A30", "A30"), ("A16", "A16"),
+    ("A10G", "A10G"), ("A10", "A10"), ("A2", "A2"),
+    # GeForce Ampere ("NVIDIA GeForce RTX 3090", "... RTX 3090 Ti")
+    ("RTX 3090", "RTX_3090"), ("RTX 3080", "RTX_3080"),
+    ("RTX 3070", "RTX_3070"), ("RTX 3060", "RTX_3060"),
+    # Turing workstation ("Quadro RTX 6000" — distinct from the Ada RTX 6000 above)
+    ("QUADRO RTX 8000", "QUADRO_RTX_8000"), ("QUADRO RTX 6000", "QUADRO_RTX_6000"),
+    # Volta / Turing / Pascal datacenter — the "TESLA " prefix is required to avoid
+    # matching "Quadro GV100"/"Quadro GP100" and "NVIDIA T400 4GB"
+    ("TESLA V100", "V100"), ("TESLA T4", "T4"),
+    ("TESLA P100", "P100"), ("TESLA P40", "P40"),
 ]
 
 
 def detect_gpu_type(remote: RemoteSession) -> str:
-    """Detect GPU type from nvidia-smi output, falling back to MPS on macOS."""
+    """Detect GPU type from nvidia-smi output, falling back to MPS on macOS.
+
+    An nvidia-smi product name that matches no entry in `_GPU_MATCH_ORDER` returns
+    "UNKNOWN" and warns with the reported name — previously such GPUs were silently
+    reported as H100. Pass `--gpu-type` to `nanorun session start` to override.
+    """
     result = remote.run("nvidia-smi --query-gpu=name --format=csv,noheader | head -1")
-    if result.success:
-        name = result.stdout.strip().upper()
+    reported = result.stdout.strip() if result.success else ""
+    if reported:
+        name = reported.upper()
         for substr, gpu_type in _GPU_MATCH_ORDER:
             if substr in name:
                 return gpu_type
     mps_check = remote.run("python3 -c \"import torch; print(torch.backends.mps.is_available())\"")
     if mps_check.success and mps_check.stdout.strip() == "True":
         return "MPS"
+    if reported:
+        console.print(
+            f"[yellow]Warning: unrecognized GPU {reported!r} — recording type as UNKNOWN. "
+            "Use --gpu-type to override.[/yellow]"
+        )
+        return "UNKNOWN"
+    console.print(
+        "[yellow]Warning: could not detect GPU type (no nvidia-smi output) — "
+        "assuming H100. Use --gpu-type to override.[/yellow]"
+    )
     return "H100"
 
 
@@ -269,6 +325,39 @@ def _gather_agent_auth() -> tuple[dict, list[str]]:
     return auth, warnings
 
 
+# Shell wrappers dropped on bootstrapped machines. `claude` / `codex` launch
+# inside their own persistent tmux session (so an SSH drop doesn't kill the
+# agent) and skip permission prompts — these are ephemeral rented boxes.
+# Sourced from ~/.bashrc; rewritten on every setup so updates propagate.
+# NOTE: plain string, not an f-string — braces here must stay literal.
+AGENT_TMUX_WRAPPERS = r"""# nanorun: run coding agents inside a dedicated tmux session.
+_nanorun_agent_tmux() {
+    local name="$1"; shift
+    local bin="$HOME/.local/bin/$name"
+    [ -x "$bin" ] || bin="$name"
+    # Already multiplexed, or not a terminal (scripts, nanorun exec): run direct.
+    if [ -n "$TMUX" ] || [ ! -t 1 ]; then
+        command "$bin" "$@"
+        return
+    fi
+    # Headless/one-shot modes print and exit; a tmux session would eat the output.
+    case " $* " in
+        *" -p "*|*" --print "*|*" exec "*)
+            command "$bin" "$@"
+            return
+            ;;
+    esac
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        tmux attach-session -t "=$name"
+        return
+    fi
+    tmux new-session -s "$name" "$(printf '%q ' "$bin" "$@")"
+}
+claude() { _nanorun_agent_tmux claude --dangerously-skip-permissions "$@"; }
+codex() { _nanorun_agent_tmux codex --dangerously-bypass-approvals-and-sandbox "$@"; }
+"""
+
+
 # ─── Setup script generation ─────────────────────────────────────────────────
 
 
@@ -429,6 +518,18 @@ PID_CLAUDE=$!
   fi
 ) &
 PID_CODEX=$!
+
+# ── Shell wrappers: `claude`/`codex` open in their own tmux session ──
+WRAP="$HOME_DIR/.nanorun_agent_wrappers.sh"
+cat > "$WRAP" <<'NANORUN_AGENT_WRAPPERS_EOF'
+{AGENT_TMUX_WRAPPERS}NANORUN_AGENT_WRAPPERS_EOF
+for RC in "$HOME_DIR/.bashrc" "$HOME_DIR/.zshrc"; do
+  [ "$RC" = "$HOME_DIR/.bashrc" ] || [ -f "$RC" ] || continue
+  touch "$RC"
+  grep -q nanorun_agent_wrappers "$RC" 2>/dev/null || \\
+    printf '\\n[ -f ~/.nanorun_agent_wrappers.sh ] && . ~/.nanorun_agent_wrappers.sh\\n' >> "$RC"
+done
+echo "STATUS:agent_wrappers:OK:claude/codex wrapped in tmux, permission prompts skipped"
 """
     else:
         agents_block = """
@@ -822,7 +923,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
                 if daemon.restart_daemon():
                     console.print("  [green]daemon: started[/green]")
                 else:
-                    failures.append(SetupFailure("daemon", "Failed to start remote daemon"))
+                    failures.append(SetupFailure("daemon", "Failed to start daemon"))
                     console.print("  [red]daemon: FAILED to start[/red]")
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -843,7 +944,7 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
             f"ssh {session.user}@{session.host}\n"
             f"cd {repo_path}\n"
             "nanorun session start --local\n"
-            "nanorun local start\n\n"
+            "nanorun watcher start\n\n"
             "[dim]Use a fresh login shell so ~/.local/bin is on PATH.[/dim]",
             title="Next steps (on the machine itself)",
             border_style="cyan",

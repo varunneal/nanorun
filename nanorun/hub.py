@@ -22,7 +22,7 @@ from .project_config import load_project_config
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 warnings.filterwarnings("ignore", message="Cannot enable progress bars", module="huggingface_hub")
 
-log = logging.getLogger("local_daemon")
+log = logging.getLogger(__name__)
 
 
 def _get_hub_config() -> dict:
@@ -74,6 +74,15 @@ class _HfBackend:
 
     def get_bucket_info(self):
         return self._bucket_info(self.bucket_id)
+
+    def describe(self) -> dict:
+        """Backend identity for display. Must not make network calls."""
+        return {
+            "backend": "hf",
+            "label": "Bucket",
+            "location": self.bucket_id or "(not configured)",
+            "details": {},
+        }
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         self._sync_bucket(
@@ -208,6 +217,15 @@ class _S3Backend:
 
     def get_bucket_info(self):
         return {"bucket": self.bucket_name, "prefix": self.prefix}
+
+    def describe(self) -> dict:
+        """Backend identity for display. Must not make network calls."""
+        return {
+            "backend": "s3",
+            "label": "Bucket",
+            "location": self.bucket_name or "(not configured)",
+            "details": {"Prefix": self.prefix} if self.prefix else {},
+        }
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         prefix = self._key("logs", session)
@@ -354,6 +372,15 @@ class _LocalBackend:
 
     def get_bucket_info(self):
         return {"path": str(self.root)}
+
+    def describe(self) -> dict:
+        """Backend identity for display. Must not make network calls."""
+        return {
+            "backend": "local",
+            "label": "Path",
+            "location": str(self.root),
+            "details": {},
+        }
 
     def sync_logs_up(self, local_logs_dir: Path, session: str) -> None:
         dst_dir = self._dir("logs", session)
@@ -852,6 +879,21 @@ class _IrisBackend:
     def download_weight(self, experiment_id: int, filename: str, local_path: Path, session: str) -> None:
         pass
 
+    def get_bucket_info(self):
+        return {"iris_user": self.iris_user, "workspace": self.iris_workspace}
+
+    def describe(self) -> dict:
+        """Backend identity for display. Must not make network calls."""
+        details = {}
+        if self.iris_workspace:
+            details["Workspace"] = str(self.iris_workspace)
+        return {
+            "backend": "iris",
+            "label": "Iris user",
+            "location": self.iris_user or "(unknown)",
+            "details": details,
+        }
+
     def get_local_token(self) -> Optional[str]:
         return None
 
@@ -899,6 +941,16 @@ def ensure_bucket() -> str:
 
 def get_bucket_info():
     return _get_backend_instance().get_bucket_info()
+
+
+def describe() -> dict:
+    """Identity of the configured backend, for display.
+
+    Returns {"backend", "label", "location", "details"} read from the active
+    backend instance — bucket/path identity is per-backend instance state, not
+    a module-level constant.
+    """
+    return _get_backend_instance().describe()
 
 
 def sync_logs_up(local_logs_dir: Path, session: str) -> None:

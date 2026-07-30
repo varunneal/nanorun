@@ -3,8 +3,8 @@
 Queue is stored as a plain text file for easy manual editing.
 Queue state (active/paused) is stored separately.
 
-In the new daemon architecture:
-- The authoritative queue lives on the remote daemon
+In the daemon/watcher architecture:
+- The authoritative queue lives on the daemon
 - Local queue.txt is kept as a mirror/cache for visibility
 - Operations like add/remove/clear delegate to daemon when possible
 """
@@ -84,7 +84,7 @@ def get_queue_state_path() -> Path:
 
 
 def read_queue(session_name: str) -> List[QueuedExperiment]:
-    """Read queued experiments from local cache (synced from remote daemon)."""
+    """Read queued experiments from the watcher-maintained local cache."""
     return _read_session_queue(session_name)
 
 
@@ -92,11 +92,11 @@ def read_queue_meta(session_name: str) -> Dict[str, object]:
     """Freshness metadata for the cached queue.
 
     Returns {"connected": bool, "synced_at": str|None}. `connected` reflects
-    whether the local daemon's session tracker had a live link at last write;
+    whether the watcher's session tracker had a live link at last write;
     when False the queue is the last-known snapshot and may be stale. Defaults
     to connected=True for legacy caches missing the field.
     """
-    from .local_daemon import safe_json_load, get_queue_cache_file
+    from .watcher import safe_json_load, get_queue_cache_file
 
     data = safe_json_load(get_queue_cache_file(session_name), default={}) or {}
     return {
@@ -106,7 +106,7 @@ def read_queue_meta(session_name: str) -> Dict[str, object]:
 
 
 def _read_session_queue(session_name: str) -> List[QueuedExperiment]:
-    from .local_daemon import safe_json_load, get_queue_cache_file
+    from .watcher import safe_json_load, get_queue_cache_file
 
     data = safe_json_load(get_queue_cache_file(session_name), default={})
     queue_items = data.get("queue", []) if data else []
@@ -348,12 +348,12 @@ def read_local_queue_file() -> List[QueuedExperiment]:
 
 
 def push_queue_to_daemon(session_name: Optional[str] = None) -> Optional[int]:
-    """Push local queue file to remote daemon, replacing remote queue.
+    """Push local queue file to the daemon, replacing its queue.
 
     Reads from .nanorun/queue.txt (the editable local file) and sends
-    the contents to the remote daemon. This mimics doing a queue clear
+    the contents to the daemon. This mimics doing a queue clear
     followed by `job add` for each item - generating experiment IDs so
-    the local daemon can create DB entries.
+    the watcher can create DB entries.
 
     Returns:
         Number of items pushed, or None if daemon unreachable.

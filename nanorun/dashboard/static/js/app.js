@@ -729,7 +729,7 @@ function openSessionPopover(name) {
     const pauseBtn = `<button class="sp-btn sp-btn-warning" id="sp-sync-${name}" onclick="doToggleSync('${name}', true)">⏸ Pause Sync</button>`;
     const resumeBtn = `<button class="sp-btn sp-btn-primary" id="sp-sync-${name}" onclick="doToggleSync('${name}', false)">▶ Resume Sync</button>`;
     if (s.sync_paused) {
-        // Paused: the daemon isn't scanning this session — only offer Resume.
+        // Paused: the watcher isn't scanning this session — only offer Resume.
         body += `<div class="sp-info" style="color:var(--warning)">⏸ Sync paused — not scanning</div>`;
         body += `<div class="sp-actions">${resumeBtn}</div>`;
     } else if (s.status === 'iris') {

@@ -153,7 +153,7 @@ class SessionConnector(ABC):
 
 
 class SshConnector(SessionConnector):
-    """Job operations via remote daemon RPC."""
+    """Job operations via daemon RPC."""
 
     def __init__(self, session_name: str):
         self.session_name = session_name
@@ -301,7 +301,7 @@ class LocalConnector(SshConnector):
 
     def check_unsynced(self, script: str) -> bool:
         from .sync import (
-            ensure_local_daemon_namespace,
+            ensure_local_session_daemon_namespace,
             ensure_local_session_branch,
             expand_declared_files,
             has_unsynced_changes,
@@ -311,7 +311,7 @@ class LocalConnector(SshConnector):
         if not config:
             raise ValueError(f"Local session '{self.session_name}' no longer exists")
         ensure_local_session_branch(config, switch_if_needed=False)
-        daemon_ready, _restarted = ensure_local_daemon_namespace(config)
+        daemon_ready, _restarted = ensure_local_session_daemon_namespace(config)
         if not daemon_ready:
             raise ValueError(
                 "The local execution daemon could not reload its unique Hub namespace"

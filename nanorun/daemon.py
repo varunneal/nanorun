@@ -1,8 +1,8 @@
-"""Remote daemon — experiment execution, queue management, hub sync.
+"""nanorun daemon — experiment execution, queue management, and Hub publishing.
 
-Runs on the remote GPU machine. Accepts commands over WebSocket RPC
-(localhost:9321, tunneled through SSH). Executes experiments in tmux,
-monitors completion, pushes logs/weights to HuggingFace Bucket.
+Runs on an SSH-managed GPU machine or as a local-session daemon. Accepts commands
+over WebSocket RPC, executes experiments in tmux, monitors completion, and
+publishes durable artifacts.
 """
 
 import argparse
@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -66,6 +67,8 @@ TMUX_SESSION = "nanorun"
 HUB_SYNC_INTERVAL_S = 15
 QUEUE_PUSH_DEBOUNCE_S = 0.3  # coalesce bursts of queue changes into one event-driven push
 EXPERIMENT_POLL_INTERVAL_S = 2
+START_BLOCK_ALERT_RESOURCE_S = 600  # GPU memory release normally clears within seconds
+START_BLOCK_ALERT_INFRASTRUCTURE_S = 90  # nvidia-smi/tmux failures will not self-heal
 WEIGHT_STALENESS_S = 3
 CODE_HASH_LENGTH = 12
 GIT_HASH_LENGTH = 12
@@ -84,6 +87,23 @@ LOSS_PATTERN = re.compile(
 )
 SEGMENT_FILE_PATTERN = re.compile(r"^mappings-(\d{6})\.jsonl$")
 QUEUE_SEGMENT_FILE_PATTERN = re.compile(r"^queue-(\d{6})\.jsonl$")
+
+
+class StartDisposition(str, Enum):
+    """Classifies a start_experiment outcome by its correct queue response.
+
+    RETRY_* failures are environmental — they would block any item, so the
+    queue head stays in place and the monitor retries next tick. REJECT_ITEM
+    is a deterministic fault of the item itself: it is popped after a durable
+    failed mapping is written. The two retry categories alert on different
+    deadlines: an occupied GPU is expected for seconds after a run ends,
+    while a broken nvidia-smi or tmux needs attention much sooner.
+    """
+
+    STARTED = "started"
+    RETRY_RESOURCE = "retry_resource"
+    RETRY_INFRASTRUCTURE = "retry_infrastructure"
+    REJECT_ITEM = "reject_item"
 
 
 def _signal_process_group(
@@ -327,6 +347,7 @@ class ExperimentMapping:
     parent_hash: Optional[str] = None
     kernels_path: Optional[str] = None
     dependencies: Dict[str, str] = field(default_factory=dict)
+    failure_phase: Optional[str] = None
 
     def save(self):
         (MAPPINGS_DIR / f"{self.experiment_id}.json").write_text(json.dumps(asdict(self), indent=2))
@@ -356,6 +377,26 @@ class QueuedItem:
     cmd_prefix: Optional[str] = None
 
 
+@dataclass
+class PreparedLaunch:
+    """Deterministically validated launch inputs, ready for tmux dispatch."""
+
+    experiment_id: int
+    script: str
+    env_vars: Dict[str, str]
+    gpus: int
+    gpu_type: str
+    name: Optional[str]
+    track: Optional[str]
+    cmd_prefix: Optional[str]
+    code_hash: str
+    parent_path: Optional[str]
+    kernels_path: Optional[str]
+    dependencies: Dict[str, str]
+    symlink_cmd: Optional[str]
+    dependency_overlay: Optional[str]
+
+
 class NanorunDaemon:
     def __init__(
         self,
@@ -375,6 +416,9 @@ class NanorunDaemon:
         self._pending_weight_uploads: Dict[str, Dict[str, Any]] = {}
 
         self._startup_time = time.monotonic()
+        # Set while the queue head cannot start for an environmental reason
+        # (RETRY_* dispositions); cleared on a successful start or item pop.
+        self._start_block: Optional[Dict[str, Any]] = None
         # Event-driven queue push: _emit_queue_changed sets this, _queue_push_task
         # drains it (debounced) and uploads just the queue segment to the hub.
         self._queue_dirty = asyncio.Event()
@@ -524,11 +568,14 @@ class NanorunDaemon:
 
     # --- GPU ---
 
-    def get_gpu_processes(self) -> List[Dict[str, Any]]:
+    def _query_gpu_processes(self) -> tuple[bool, List[Dict[str, Any]], str]:
+        """Query compute processes, distinguishing an empty GPU from a failed probe."""
         cmd = "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits"
-        success, stdout, _ = self._run_cmd(cmd)
+        success, stdout, stderr = self._run_cmd(cmd)
+        if not success:
+            return False, [], stderr.strip() or "nvidia-smi failed"
         processes = []
-        if success and stdout.strip():
+        if stdout.strip():
             for line in stdout.strip().split("\n"):
                 parts = line.strip().split(", ")
                 if len(parts) >= 3:
@@ -536,6 +583,10 @@ class NanorunDaemon:
                         processes.append({"pid": int(parts[0]), "name": parts[1], "memory_mb": int(parts[2])})
                     except ValueError:
                         pass
+        return True, processes, ""
+
+    def get_gpu_processes(self) -> List[Dict[str, Any]]:
+        _, processes, _ = self._query_gpu_processes()
         return processes
 
     # --- queue ---
@@ -776,29 +827,41 @@ class NanorunDaemon:
         parts.append(f"{env_str}{run_cmd} 2>&1 | tee {output_file}")
         return " && ".join(parts)
 
-    def start_experiment(self, experiment_id: int, script: str, env_vars: Dict[str, str],
-                         gpus: int = 1, gpu_type: str = "H100", name: Optional[str] = None,
-                         track: Optional[str] = None, cmd_prefix: Optional[str] = None) -> Dict[str, Any]:
-        if self.state.status == "running":
-            return {"success": False, "error": f"Already running experiment {self.state.current_experiment_id}"}
+    def _start_failure(self, disposition: StartDisposition, error: str, **extra) -> Dict[str, Any]:
+        return {"success": False, "disposition": disposition.value, "error": error, **extra}
 
-        script = self._resolve_script_path(script)
-        if not script:
-            return {
-                "success": False,
-                "error": "Script must be a repository-relative .py file",
-            }
+    def _prepare_experiment(self, experiment_id: int, script: str, env_vars: Dict[str, str],
+                            gpus: int, gpu_type: str, name: Optional[str],
+                            track: Optional[str], cmd_prefix: Optional[str],
+                            ) -> tuple[Optional[PreparedLaunch], Optional[Dict[str, Any]]]:
+        """Deterministic validation and staging; touches no GPU or tmux state.
 
-        gpu_procs = self.get_gpu_processes()
-        if gpu_procs:
-            pids = [p["pid"] for p in gpu_procs]
-            total_mem = sum(p["memory_mb"] for p in gpu_procs)
-            return {"success": False, "error": f"GPU busy: PIDs {pids} ({total_mem}MB)", "gpu_processes": gpu_procs}
+        Runs before the GPU probe so a broken item is rejected even while the
+        GPU is occupied — otherwise it would look retryable indefinitely.
+        Returns (prepared, None) on success or (None, failure result).
+        """
+        resolved = self._resolve_script_path(script)
+        if not resolved:
+            return None, self._start_failure(
+                StartDisposition.REJECT_ITEM,
+                "Script must be a repository-relative .py file",
+            )
+        script = resolved
 
         try:
             manifest = self._parse_frontmatter(script)
-        except (ManifestError, OSError, UnicodeError) as error:
-            return {"success": False, "error": f"Invalid script frontmatter: {error}"}
+        except (ManifestError, UnicodeError) as error:
+            return None, self._start_failure(
+                StartDisposition.REJECT_ITEM,
+                f"Invalid script frontmatter: {error}",
+            )
+        except OSError as error:
+            # The script resolved a moment ago, so an unreadable file points
+            # at the filesystem, not the item.
+            return None, self._start_failure(
+                StartDisposition.RETRY_INFRASTRUCTURE,
+                f"Cannot read script: {error}",
+            )
 
         parent_path = manifest.parent
         kernels_path = manifest.kernels
@@ -806,35 +869,29 @@ class NanorunDaemon:
         if parent_path:
             resolved_parent = self._resolve_script_path(parent_path)
             if not resolved_parent:
-                return {
-                    "success": False,
-                    "error": (
-                        "Frontmatter parent must be an existing "
-                        f"repository-relative .py file: {parent_path}"
-                    ),
-                }
+                return None, self._start_failure(
+                    StartDisposition.REJECT_ITEM,
+                    "Frontmatter parent must be an existing "
+                    f"repository-relative .py file: {parent_path}",
+                )
             parent_path = resolved_parent
         if kernels_path:
             resolved_kernels = self._resolve_script_path(kernels_path)
             if not resolved_kernels:
-                return {
-                    "success": False,
-                    "error": (
-                        "Frontmatter kernels must be an existing "
-                        f"repository-relative .py file: {kernels_path}"
-                    ),
-                }
+                return None, self._start_failure(
+                    StartDisposition.REJECT_ITEM,
+                    "Frontmatter kernels must be an existing "
+                    f"repository-relative .py file: {kernels_path}",
+                )
             kernels_path = resolved_kernels
         for module, dependency_path in manifest.dependencies:
             resolved_dependency = self._resolve_script_path(dependency_path)
             if not resolved_dependency:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Frontmatter dependency {module} must be an existing "
-                        f"repository-relative .py file: {dependency_path}"
-                    ),
-                }
+                return None, self._start_failure(
+                    StartDisposition.REJECT_ITEM,
+                    f"Frontmatter dependency {module} must be an existing "
+                    f"repository-relative .py file: {dependency_path}",
+                )
             dependencies[module] = resolved_dependency
 
         symlink_cmd = self._kernels_symlink_cmd(script, kernels_path) if kernels_path else None
@@ -844,54 +901,111 @@ class NanorunDaemon:
                 experiment_id,
                 dependencies,
             )
-        except (ManifestError, OSError) as error:
-            return {"success": False, "error": str(error)}
+        except ManifestError as error:
+            return None, self._start_failure(StartDisposition.REJECT_ITEM, str(error))
+        except OSError as error:
+            return None, self._start_failure(
+                StartDisposition.RETRY_INFRASTRUCTURE,
+                f"Dependency overlay failed: {error}",
+            )
 
         code_hash = self._compute_code_hash(script, kernels_path, dependencies)
         if not code_hash:
-            return {
-                "success": False,
-                "error": f"Script or declared dependency not found: {script}",
-            }
+            return None, self._start_failure(
+                StartDisposition.REJECT_ITEM,
+                f"Script or declared dependency not found: {script}",
+            )
 
+        return PreparedLaunch(
+            experiment_id=experiment_id, script=script, env_vars=env_vars,
+            gpus=gpus, gpu_type=gpu_type, name=name, track=track,
+            cmd_prefix=cmd_prefix, code_hash=code_hash, parent_path=parent_path,
+            kernels_path=kernels_path, dependencies=dependencies,
+            symlink_cmd=symlink_cmd, dependency_overlay=dependency_overlay,
+        ), None
+
+    def _probe_gpu(self, gpu_type: str) -> Optional[Dict[str, Any]]:
+        """Return a failure result if the GPU cannot accept a launch, else None."""
+        if gpu_type == "MPS":
+            return None  # no nvidia-smi on MPS devices
+        ok, gpu_procs, probe_error = self._query_gpu_processes()
+        if not ok:
+            return self._start_failure(
+                StartDisposition.RETRY_INFRASTRUCTURE,
+                f"GPU probe failed: {probe_error}",
+            )
+        if gpu_procs:
+            pids = [p["pid"] for p in gpu_procs]
+            total_mem = sum(p["memory_mb"] for p in gpu_procs)
+            return self._start_failure(
+                StartDisposition.RETRY_RESOURCE,
+                f"GPU busy: PIDs {pids} ({total_mem}MB)",
+                gpu_processes=gpu_procs,
+            )
+        return None
+
+    def _launch_experiment(self, prepared: PreparedLaunch) -> Dict[str, Any]:
         timestamp = datetime.now(timezone.utc).strftime("%m%d_%H%M%S")
-        base_name = name or Path(script).stem
+        base_name = prepared.name or Path(prepared.script).stem
         window_name = f"{timestamp}_{base_name}"[:TMUX_WINDOW_NAME_MAX]
 
         cmd = self._build_run_command(
-            script,
-            env_vars,
-            gpus,
-            experiment_id,
-            cmd_prefix,
-            symlink_cmd,
-            dependency_overlay,
-            gpu_type,
+            prepared.script,
+            prepared.env_vars,
+            prepared.gpus,
+            prepared.experiment_id,
+            prepared.cmd_prefix,
+            prepared.symlink_cmd,
+            prepared.dependency_overlay,
+            prepared.gpu_type,
         )
         if not self._tmux_create(window_name, cmd):
-            return {"success": False, "error": "Failed to create tmux window"}
+            return self._start_failure(
+                StartDisposition.RETRY_INFRASTRUCTURE,
+                "Failed to create tmux window",
+            )
 
         mapping = ExperimentMapping(
-            experiment_id=experiment_id, run_id=None, script=script,
-            code_hash=code_hash, env_vars=env_vars, gpus=gpus, gpu_type=gpu_type,
+            experiment_id=prepared.experiment_id, run_id=None, script=prepared.script,
+            code_hash=prepared.code_hash, env_vars=prepared.env_vars,
+            gpus=prepared.gpus, gpu_type=prepared.gpu_type,
             tmux_window=window_name, log_file=None,
             started_at=datetime.now(timezone.utc).isoformat(),
-            track=track, name=name, git_commit=self.get_git_commit(),
-            parent_hash=self._compute_file_hash(parent_path) if parent_path else None,
-            kernels_path=kernels_path,
-            dependencies=dependencies,
+            track=prepared.track, name=prepared.name, git_commit=self.get_git_commit(),
+            parent_hash=self._compute_file_hash(prepared.parent_path) if prepared.parent_path else None,
+            kernels_path=prepared.kernels_path,
+            dependencies=prepared.dependencies,
         )
         mapping.save()
 
         self.state.status = "running"
-        self.state.current_experiment_id = experiment_id
+        self.state.current_experiment_id = prepared.experiment_id
         self.state.current_window = window_name
         self.state.current_run_id = None
         self.state.save()
         self._uploaded_weights.clear()
 
         self._emit(Event.EXPERIMENT_STARTED, **asdict(mapping))
-        return {"success": True, "code_hash": code_hash, "window_name": window_name}
+        return {"success": True, "disposition": StartDisposition.STARTED.value,
+                "code_hash": prepared.code_hash, "window_name": window_name}
+
+    def start_experiment(self, experiment_id: int, script: str, env_vars: Dict[str, str],
+                         gpus: int = 1, gpu_type: str = "H100", name: Optional[str] = None,
+                         track: Optional[str] = None, cmd_prefix: Optional[str] = None) -> Dict[str, Any]:
+        if self.state.status == "running":
+            return self._start_failure(
+                StartDisposition.RETRY_RESOURCE,
+                f"Already running experiment {self.state.current_experiment_id}",
+            )
+        prepared, failure = self._prepare_experiment(
+            experiment_id, script, env_vars, gpus, gpu_type, name, track, cmd_prefix,
+        )
+        if failure:
+            return failure
+        gpu_failure = self._probe_gpu(gpu_type)
+        if gpu_failure:
+            return gpu_failure
+        return self._launch_experiment(prepared)
 
     def check_current_experiment(self):
         """Poll experiment status: detect run_id, handle completion."""
@@ -1064,7 +1178,9 @@ class NanorunDaemon:
         self.state.current_run_id = None
         self._uploaded_weights.clear()
         self.state.save()
-        self._process_queue()
+        # Deliberately no _process_queue() here: starting the next item
+        # microseconds after the previous run's window died races GPU memory
+        # release. The monitor loop starts it on a later tick.
 
     def _read_file_tail(self, path: Path, max_bytes: int = LOG_TAIL_BYTES) -> str:
         if not path.exists():
@@ -1077,24 +1193,91 @@ class NanorunDaemon:
             return ""
 
     def _process_queue(self):
+        """Attempt to start the queue head once.
+
+        The monitor loop calls this on every idle tick, so retryable failures
+        need no loop or sleep here: the head stays queued and the next tick
+        retries. Only a REJECT_ITEM pops without starting — after a durable
+        failed mapping is written, because a disconnected observer that misses
+        the event must not see the item silently vanish from the queue.
+        """
         if self.state.status in ("paused", "running"):
             return
         items = self.read_queue()
-        while items:
-            item = items[0]
-            print(f"Starting queued experiment {item.experiment_id}: {item.script}")
-            result = self.start_experiment(
-                experiment_id=item.experiment_id, script=item.script,
-                env_vars=item.env_vars, gpus=item.gpus, gpu_type=item.gpu_type,
-                name=item.name, track=item.track, cmd_prefix=item.cmd_prefix,
-            )
+        if not items:
+            return
+        item = items[0]
+        result = self.start_experiment(
+            experiment_id=item.experiment_id, script=item.script,
+            env_vars=item.env_vars, gpus=item.gpus, gpu_type=item.gpu_type,
+            name=item.name, track=item.track, cmd_prefix=item.cmd_prefix,
+        )
+        if result["success"]:
+            print(f"Started queued experiment {item.experiment_id}: {item.script}")
+            self._clear_start_block()
             items.pop(0)
             self.write_queue(items)
             self._emit_queue_changed()
-            if result["success"]:
-                return
-            print(f"Failed to start: {result.get('error')} — skipping", file=sys.stderr)
-        print("Queue is empty")
+            return
+        disposition = result.get("disposition", StartDisposition.RETRY_INFRASTRUCTURE.value)
+        if disposition == StartDisposition.REJECT_ITEM.value:
+            self._clear_start_block()
+            self._record_launch_failure(item, result.get("error", "Launch failed"))
+            items.pop(0)
+            self.write_queue(items)
+            self._emit_queue_changed()
+        else:
+            self._note_start_block(disposition, result.get("error", ""))
+
+    def _record_launch_failure(self, item: QueuedItem, error: str):
+        """Persist a terminal mapping for an item that never launched.
+
+        Mapping first, then the event, then the caller pops the item and
+        publishes the queue snapshot — the hub-synced mapping stream is the
+        durable authority, the WebSocket event is best-effort.
+        """
+        print(f"Rejecting queued experiment {item.experiment_id}: {error}", file=sys.stderr)
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            # Lands in the normal crash-log path (get_crash_log RPC + backfill)
+            (OUTPUT_DIR / f"{item.experiment_id}.txt").write_text(f"Launch failed: {error}\n")
+        except OSError:
+            pass
+        mapping = ExperimentMapping(
+            experiment_id=item.experiment_id, run_id=None, script=item.script,
+            code_hash="", env_vars=item.env_vars, gpus=item.gpus,
+            gpu_type=item.gpu_type, tmux_window="", log_file=None,
+            started_at=now, finished_at=now, status="failed",
+            track=item.track, name=item.name, git_commit=self.get_git_commit(),
+            failure_phase="launch",
+        )
+        mapping.save()
+        self._emit(Event.EXPERIMENT_FAILED, experiment_id=item.experiment_id,
+                   status="failed", run_id=None, failure_phase="launch",
+                   crash_log=f"Launch failed: {error}")
+
+    def _note_start_block(self, disposition: str, error: str):
+        now = time.monotonic()
+        block = self._start_block
+        if block is None or block["disposition"] != disposition:
+            self._start_block = {"disposition": disposition, "error": error,
+                                 "since": now, "alerted": False}
+            print(f"[daemon] Queue head blocked ({disposition}): {error}", file=sys.stderr)
+            return
+        block["error"] = error
+        threshold = (START_BLOCK_ALERT_RESOURCE_S
+                     if disposition == StartDisposition.RETRY_RESOURCE.value
+                     else START_BLOCK_ALERT_INFRASTRUCTURE_S)
+        if not block["alerted"] and now - block["since"] >= threshold:
+            block["alerted"] = True
+            print(
+                f"[daemon] ALERT: queue blocked for {(now - block['since']) / 60:.0f}m "
+                f"({disposition}): {error}",
+                file=sys.stderr,
+            )
+
+    def _clear_start_block(self):
+        self._start_block = None
 
     def cancel_experiment(self) -> Dict[str, Any]:
         if self.state.status != "running":
@@ -1194,6 +1377,13 @@ class NanorunDaemon:
     def _rpc_status(self, params, rid):
         self.check_current_experiment()
         queue = self.read_queue()
+        start_block = None
+        if self._start_block:
+            start_block = {
+                "disposition": self._start_block["disposition"],
+                "error": self._start_block["error"],
+                "blocked_s": round(time.monotonic() - self._start_block["since"], 1),
+            }
         return Response.ok(rid, status=self.state.status,
             current_experiment_id=self.state.current_experiment_id,
             current_window=self.state.current_window,
@@ -1201,6 +1391,7 @@ class NanorunDaemon:
             queue_length=len(queue), queue=[asdict(item) for item in queue],
             hub_session=self._hub_namespace,
             gpu_processes=self.get_gpu_processes(),
+            start_block=start_block,
             ts=datetime.now(timezone.utc).isoformat())
 
     def _rpc_gpu_processes(self, params, rid):
@@ -1467,9 +1658,16 @@ class NanorunDaemon:
     # --- background tasks ---
 
     async def _experiment_monitor_task(self):
+        # Mutually exclusive branches: when check_current_experiment flips
+        # running → idle, the queue is NOT pumped until the next iteration, so
+        # at least one poll interval separates a completion (tmux kill) from
+        # the next start attempt — the GPU gets time to release memory.
         while self.running:
             try:
-                self.check_current_experiment()
+                if self.state.status == "running":
+                    self.check_current_experiment()
+                elif self.state.status == "idle":
+                    self._process_queue()
                 await self._flush_events()
             except Exception as e:
                 print(f"[daemon] Monitor error: {e}", file=sys.stderr)
@@ -1595,7 +1793,7 @@ class NanorunDaemon:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="nanorun remote daemon")
+    parser = argparse.ArgumentParser(description="nanorun daemon")
     parser.add_argument("--session", default=None)
     parser.add_argument("--hub-session", default=None)
     parser.add_argument("--repo-dir", type=Path, default=None)

@@ -54,6 +54,43 @@ def _git_error(action: str, result: subprocess.CompletedProcess[str]) -> ValueEr
     return ValueError(f"{action}: {detail}")
 
 
+def _push_session_branch(repo: Path, branch: str) -> subprocess.CompletedProcess[str]:
+    """Publish HEAD to the session's own branch on origin, with upstream tracking."""
+    return _git(
+        repo,
+        ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
+    )
+
+
+def publish_local_session_branch(config: SessionConfig, *, quiet: bool = False) -> bool:
+    """Push a local session's owned branch to origin so other devices can see it.
+
+    Best effort by design: a machine without push rights still runs experiments
+    perfectly well, it just cannot be followed from another device, so a failed
+    push degrades to a warning instead of aborting the session.
+    """
+    if not config.git_branch:
+        return False
+
+    repo = Path(config.repo_path).expanduser().resolve()
+    pushed = _push_session_branch(repo, config.git_branch)
+    if pushed.returncode != 0:
+        console.print(
+            "[yellow]"
+            f"{_git_error(f'Could not publish {config.git_branch} to origin', pushed)}"
+            "[/yellow]"
+        )
+        console.print(
+            "[yellow]This machine's code stays local until the branch can be "
+            "pushed; other devices cannot follow it.[/yellow]"
+        )
+        return False
+
+    if not quiet:
+        console.print(f"[dim]Published {config.git_branch} to origin[/dim]")
+    return True
+
+
 def _new_local_workspace_id(config: SessionConfig) -> str:
     """Build a path-safe, globally unique identity for a local session."""
     safe_name = re.sub(r"[^a-z0-9_-]+", "-", config.name.lower()).strip("-")
@@ -66,12 +103,18 @@ def ensure_local_session_branch(
     config: SessionConfig,
     *,
     switch_if_needed: bool,
+    publish: bool = False,
 ) -> str:
     """Create/restore the branch owned by a local session.
 
     Legacy local configs are upgraded in place. Normal sync/job operations do
     not silently move an established worktree between branches; re-running
     ``session start --local`` is the explicit restoration path.
+
+    ``publish`` pushes the branch to origin with upstream tracking, so the code
+    this machine runs is visible to (and survivable by) the device that
+    bootstrapped it. Publishing is best effort — see
+    ``publish_local_session_branch``.
     """
     if config.session_type != "local":
         raise ValueError("A local Git branch can only be assigned to a local session")
@@ -135,10 +178,14 @@ def ensure_local_session_branch(
             )
 
     Config.save_session(config)
+
+    if publish:
+        publish_local_session_branch(config)
+
     return expected_branch
 
 
-def ensure_local_daemon_namespace(
+def ensure_local_session_daemon_namespace(
     config: SessionConfig,
     *,
     restart_for_code: bool = False,
@@ -614,10 +661,7 @@ def push_local_code(
             console.print(f"[green]Committed: {commit_message}[/green]")
 
     console.print(f"[dim]Pushing {branch} to origin...[/dim]")
-    pushed = _git(
-        local_repo,
-        ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{branch}"],
-    )
+    pushed = _push_session_branch(local_repo, branch)
     if pushed.returncode != 0:
         console.print(f"[red]{_git_error(f'Could not push {branch}', pushed)}[/red]")
         raise SystemExit(1)
@@ -632,10 +676,10 @@ def push_local_code(
 
     daemon_code_changed = bool(changed_files) and any(
         path in changed_files
-        for path in ("nanorun/remote_daemon.py", "nanorun/script_manifest.py")
+        for path in ("nanorun/daemon.py", "nanorun/script_manifest.py")
     )
     try:
-        daemon_ready, daemon_restarted = ensure_local_daemon_namespace(
+        daemon_ready, daemon_restarted = ensure_local_session_daemon_namespace(
             config,
             restart_for_code=daemon_code_changed,
         )
@@ -758,18 +802,18 @@ def push_code(remote: RemoteSession, message: str = None, skip_syntax_check: boo
     if diffs_count > 0:
         console.print(f"[dim]Generated {diffs_count} lineage diff(s)[/dim]")
 
-    # Step 5: Restart the remote daemon when it or its shared manifest parser
+    # Step 5: Restart the daemon when it or its shared manifest parser
     # changed.
     daemon_code_changed = changed_files and any(
         path in changed_files
-        for path in ("nanorun/remote_daemon.py", "nanorun/script_manifest.py")
+        for path in ("nanorun/daemon.py", "nanorun/script_manifest.py")
     )
     if daemon_code_changed:
         with DaemonClient(remote) as daemon:
             if daemon.is_daemon_running():
                 try:
                     if daemon.restart_daemon():
-                        console.print("[green]Restarted remote daemon (code changed)[/green]")
+                        console.print("[green]Restarted daemon (code changed)[/green]")
                     else:
                         console.print("[yellow]Failed to restart daemon[/yellow]")
                 except Exception as e:

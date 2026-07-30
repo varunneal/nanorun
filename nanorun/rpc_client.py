@@ -5,7 +5,7 @@ Architecture:
     random local port to localhost:9321 on the remote.
   - Local sessions connect directly to the loopback endpoint published by the
     local execution daemon.
-  - Each consumer (CLI command, local daemon) opens its own WebSocket over the
+  - Each consumer (CLI command, watcher) opens its own WebSocket over the
     shared tunnel.  Multiple WebSocket connections to the same daemon are fine.
   - Tunnel ownership is tracked via a lock file at .nanorun/tunnels/{session}.json.
     The process that starts the tunnel owns it; other processes reuse the port.
@@ -15,7 +15,7 @@ Usage (CLI — short-lived):
         result = client.call(Method.PING)
     # WebSocket closed, tunnel left running for others.
 
-Usage (local daemon — long-lived):
+Usage (watcher — long-lived):
     client = RpcClient(session_config)
     client.connect()
     while running:
@@ -47,7 +47,7 @@ from .rpc_types import (
 
 
 class RpcError(Exception):
-    """Error returned by the remote daemon in an RPC response."""
+    """Error returned by the daemon in an RPC response."""
 
     def __init__(self, code: str, message: str):
         self.code = code

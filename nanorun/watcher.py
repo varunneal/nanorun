@@ -1,11 +1,11 @@
-"""Local metrics daemon - event-driven, multi-session.
+"""nanorun watcher — event-driven, multi-session observation and ingestion.
 
 Two independent connections per session:
   1. Execution daemon (SSH-tunneled or loopback WebSocket) — events and RPC
   2. Artifact source (Hub pull or direct local files) — logs and mappings
 
 These are decoupled: artifact ingestion continues when RPC drops and vice versa.
-One main thread for session discovery and signal handling.
+One main thread handles session discovery and signal handling.
 """
 
 import json
@@ -43,11 +43,27 @@ def safe_json_load(path: Path, default: Any = None) -> Any:
         return default
 
 
+WATCHER_DIR_NAME = "watcher"
+LEGACY_WATCHER_DIR_NAME = "local_daemon"
+
+
+def _watcher_log_path(config_dir: Path) -> Path:
+    """Return the canonical log path, preserving a legacy log when possible."""
+    watcher_dir = config_dir / WATCHER_DIR_NAME
+    watcher_dir.mkdir(exist_ok=True)
+    log_file = watcher_dir / "watcher.log"
+    legacy_log = config_dir / LEGACY_WATCHER_DIR_NAME / "daemon.log"
+    if legacy_log.exists() and not log_file.exists():
+        try:
+            legacy_log.replace(log_file)
+        except OSError:
+            pass
+    return log_file
+
+
 def _setup_logging():
-    config_dir = Config.get_config_dir()
-    log_file = config_dir / "local_daemon" / "daemon.log"
-    log_file.parent.mkdir(exist_ok=True)
-    logger = logging.getLogger("local_daemon")
+    log_file = _watcher_log_path(Config.get_config_dir())
+    logger = logging.getLogger("watcher")
     logger.setLevel(logging.DEBUG)
     handler = logging.FileHandler(log_file, mode='a')
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
@@ -59,12 +75,18 @@ DASHBOARD_HOST = "127.0.0.1"
 
 
 @dataclass
-class DaemonPaths:
+class WatcherPaths:
     _config_dir: Path = field(default_factory=lambda: Config.get_config_dir())
 
     @property
-    def daemon_dir(self) -> Path:
-        d = self._config_dir / "local_daemon"; d.mkdir(exist_ok=True); return d
+    def watcher_dir(self) -> Path:
+        d = self._config_dir / WATCHER_DIR_NAME
+        d.mkdir(exist_ok=True)
+        return d
+
+    @property
+    def legacy_watcher_dir(self) -> Path:
+        return self._config_dir / LEGACY_WATCHER_DIR_NAME
 
     @property
     def logs_dir(self) -> Path:
@@ -72,7 +94,19 @@ class DaemonPaths:
 
     @property
     def pid_file(self) -> Path:
-        return self.daemon_dir / "daemon.pid"
+        return self.watcher_dir / "watcher.pid"
+
+    @property
+    def legacy_pid_file(self) -> Path:
+        return self.legacy_watcher_dir / "daemon.pid"
+
+    @property
+    def log_file(self) -> Path:
+        return self.watcher_dir / "watcher.log"
+
+    @property
+    def legacy_log_file(self) -> Path:
+        return self.legacy_watcher_dir / "daemon.log"
 
     def state_file(self, s: str) -> Path:
         return Config.get_session_state_dir(s) / "state.json"
@@ -86,7 +120,7 @@ class DaemonPaths:
     def events_file(self, s: str) -> Path:
         return Config.get_session_state_dir(s) / "events.log"
 
-PATHS = DaemonPaths()
+PATHS = WatcherPaths()
 
 
 def get_crashes_file(session_name: Optional[str] = None) -> Path:
@@ -210,7 +244,7 @@ def _reconcile_confirmed_queue(
     """Project one accepted, complete remote queue snapshot into SQLite.
 
     A client-side submit request is only intent. The first durable local row is
-    created when the remote daemon reports that exact ID in its queue. A later
+    created when the daemon reports that exact ID in its queue. A later
     complete snapshot can prove the row is no longer queued, but not why, so an
     otherwise unresolved row becomes ``unknown``.
     """
@@ -407,8 +441,8 @@ class HubSyncer:
 
     SYNC_INTERVAL = 10.0
 
-    def __init__(self, daemon: "LocalMetricsDaemon"):
-        self.daemon = daemon
+    def __init__(self, watcher: "Watcher"):
+        self.watcher = watcher
         self.running = True
         self.status: str = "disconnected"  # disconnected, connected
         self.last_error: Optional[str] = None
@@ -420,7 +454,7 @@ class HubSyncer:
         self._sync_processes_lock = threading.Lock()
         self._sync_failures: Dict[str, int] = {}
         self._sync_retry_at: Dict[str, float] = {}
-        # Sessions that have had their one-time full catch-up parse since daemon
+        # Sessions that have had their one-time full catch-up parse since watcher
         # start. First pass per session re-parses everything the hub delivered
         # (restart-to-recover); subsequent passes are delivery-driven. Reset on
         # restart (fresh __init__), which re-triggers catch-up — the intended behavior.
@@ -645,7 +679,7 @@ class HubSyncer:
         """Parse metrics for an SSH or local session, driven by changed files.
 
         Three cases:
-          - **First pass per session** since daemon start (guarded by _first_synced):
+          - **First pass per session** since watcher start (guarded by _first_synced):
             full catch-up — parse every run_id row for the session so a restart
             re-parses everything the hub delivered (offsets are in-memory, so this
             re-establishes them). Preserves "restart to recover a missed experiment".
@@ -980,11 +1014,11 @@ class SessionState:
 
 
 class SessionTracker:
-    """Manages connection and tracking for one remote session.
+    """Manages connection and tracking for one daemon-backed session.
 
     The connection is treated as disposable: a dropped SSH tunnel or WebSocket
-    is reconnected automatically with capped exponential backoff. The local
-    daemon passively mirrors remote state, so losing the connection should never
+    is reconnected automatically with capped exponential backoff. The watcher
+    passively mirrors daemon state, so losing the connection should never
     require manual intervention.
     """
 
@@ -993,10 +1027,10 @@ class SessionTracker:
     SLEEP_GAP_THRESHOLD = 15.0    # wall-clock jump that implies host sleep/suspend
     UNREACHABLE_NOTICE_AFTER = 120.0
 
-    def __init__(self, config: SessionConfig, daemon: "LocalMetricsDaemon"):
+    def __init__(self, config: SessionConfig, watcher: "Watcher"):
         self.config = config
         self.session_name = config.name
-        self.daemon = daemon
+        self.watcher = watcher
         self.running = True
         self.rpc: Optional[RpcClient] = None
         self.state = SessionState.load(self.session_name)
@@ -1059,8 +1093,8 @@ class SessionTracker:
     def _is_paused(self) -> bool:
         """Re-read the session's sync_paused flag from disk (cheap small JSON).
 
-        Read live rather than cached so a `nanorun local pause` / dashboard toggle
-        takes effect without restarting the daemon."""
+        Read live rather than cached so a `nanorun watcher pause` / dashboard toggle
+        takes effect without restarting the watcher."""
         sc = Config.load_session(self.session_name)
         return bool(sc and getattr(sc, "sync_paused", False))
 
@@ -1104,7 +1138,7 @@ class SessionTracker:
                 self._was_connected = True
                 self.state.last_error = None
                 self.state.save(self.session_name)
-                self.event("Connected to remote daemon")
+                self.event("Connected to daemon")
                 self._set_cache_connected(True)
                 self._initial_sync()
                 # Healthy link: clear outage tracking and reset backoff.
@@ -1407,13 +1441,13 @@ class SessionTracker:
         """Handle a dropped connection without destroying state.
 
         Because we reconnect automatically, a drop is usually transient (host
-        sleep, network blip) while the remote daemon keeps running the queue.
+        sleep, network blip) while the daemon keeps running the queue.
         Mutating local experiment/queue status here would be a lie that flickers
         on every reconnect, so we don't: experiment statuses are left alone and
         reconciled on reconnect via _initial_sync -> _reconcile_tracking. We only
         flag the cached queue as stale so `nanorun job queue` can say so.
         """
-        self.event("Connection lost to remote daemon — will auto-reconnect")
+        self.event("Connection lost to daemon — will auto-reconnect")
         self._set_cache_connected(False)
         # Force a clean re-sync of the queue cache on reconnect even if the
         # remote queue is byte-identical to what we last saw.
@@ -1542,7 +1576,7 @@ class SessionTracker:
             log.error(f"[{self.session_name}] Failed to create experiment {exp_id}: {e}")
 
 
-class LocalMetricsDaemon:
+class Watcher:
     def __init__(self, dashboard_port: int = 8080, no_dashboard: bool = False):
         self.running = True
         self.trackers: Dict[str, SessionTracker] = {}
@@ -1600,7 +1634,7 @@ class LocalMetricsDaemon:
         import uvicorn
         from .dashboard.app import app
 
-        app.state.daemon = self
+        app.state.watcher = self
 
         config = uvicorn.Config(
             app, host=DASHBOARD_HOST, port=self.dashboard_port, log_level="warning"
@@ -1687,7 +1721,7 @@ class LocalMetricsDaemon:
 
     def run(self):
         log.info("=" * 50)
-        log.info("Local daemon starting")
+        log.info("Watcher starting")
         self.interactive = sys.stdin.isatty()
 
         def handle_signal(signum, frame):
@@ -1702,7 +1736,7 @@ class LocalMetricsDaemon:
             if not sessions:
                 print("No sessions configured. Run 'nanorun session start' first.", file=sys.stderr)
                 return
-            print(f"Starting daemon with {len(sessions)} session(s): {', '.join(sessions.keys())}")
+            print(f"Starting watcher with {len(sessions)} session(s): {', '.join(sessions.keys())}")
             if not self.no_dashboard:
                 self._start_dashboard()
             self._start_hub_syncer()
@@ -1731,55 +1765,153 @@ class LocalMetricsDaemon:
                 self._stop_tracker(name)
             self._stop_hub_syncer()
             close_db()  # release the main thread's DB connection
-            remove_pid_file()
-            log.info("Daemon stopped")
+            remove_watcher_pid_file()
+            log.info("Watcher stopped")
 
 
-def remove_pid_file():
+def remove_watcher_pid_file():
     if PATHS.pid_file.exists():
         PATHS.pid_file.unlink()
 
-def get_daemon_pid() -> Optional[int]:
-    if PATHS.pid_file.exists():
-        try:
-            pid = int(PATHS.pid_file.read_text().strip())
-            os.kill(pid, 0)
-            return pid
-        except (ValueError, ProcessLookupError):
-            PATHS.pid_file.unlink(missing_ok=True)
-    return None
 
-def is_daemon_running() -> bool:
-    return get_daemon_pid() is not None
+@dataclass(frozen=True)
+class WatcherProcess:
+    pid: int
+    pid_file: Path
+    legacy: bool
+    verified: bool
 
-def stop_daemon() -> bool:
-    pid = get_daemon_pid()
-    if pid:
+
+def _read_live_pid(pid_file: Path) -> Optional[int]:
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return None
+    if pid <= 1:
+        pid_file.unlink(missing_ok=True)
+        return None
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return pid
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        return None
+    except OSError:
+        return None
+    return pid
+
+
+def _process_command(pid: int) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _watcher_processes() -> List[WatcherProcess]:
+    markers = (
+        "nanorun.watcher",
+        "nanorun watcher",
+        "nanorun.local_daemon",
+        "nanorun local",
+    )
+    found: List[WatcherProcess] = []
+    seen: set[int] = set()
+    for pid_file, legacy in (
+        (PATHS.pid_file, False),
+        (PATHS.legacy_pid_file, True),
+    ):
+        pid = _read_live_pid(pid_file)
+        if pid is None or pid in seen:
+            continue
+        seen.add(pid)
+        command = _process_command(pid)
+        verified = command is not None and any(marker in command for marker in markers)
+        if command is not None and not verified:
+            # The PID was reused by another process. Never signal it.
+            pid_file.unlink(missing_ok=True)
+            continue
+        found.append(
+            WatcherProcess(
+                pid=pid,
+                pid_file=pid_file,
+                legacy=legacy,
+                verified=verified,
+            )
+        )
+    return found
+
+
+def get_watcher_pid() -> Optional[int]:
+    processes = _watcher_processes()
+    return processes[0].pid if processes else None
+
+
+def is_watcher_running() -> bool:
+    return bool(_watcher_processes())
+
+
+def is_legacy_watcher_running() -> bool:
+    return any(process.legacy for process in _watcher_processes())
+
+
+def stop_watcher() -> bool:
+    processes = _watcher_processes()
+    if not processes:
+        return False
+    if any(not process.verified for process in processes):
+        # A live PID that cannot be identified is not safe to terminate.
+        return False
+
+    for process in processes:
         try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(10):
-                time.sleep(0.2)
-                if not is_daemon_running():
-                    return True
-            os.kill(pid, signal.SIGKILL)
-            remove_pid_file()
-            return True
+            os.kill(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            remove_pid_file()
-    return False
+            process.pid_file.unlink(missing_ok=True)
 
-def restart_daemon(skip_stop: bool = False) -> Optional[int]:
-    if not skip_stop and is_daemon_running():
-        stop_daemon()
+    for _ in range(10):
+        time.sleep(0.2)
+        if all(_read_live_pid(process.pid_file) is None for process in processes):
+            return True
+
+    for process in processes:
+        if _read_live_pid(process.pid_file) is None:
+            continue
+        try:
+            os.kill(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.pid_file.unlink(missing_ok=True)
+    return True
+
+
+def restart_watcher(skip_stop: bool = False) -> Optional[int]:
+    if not skip_stop and is_watcher_running():
+        if not stop_watcher():
+            return None
         time.sleep(0.5)
+    if is_watcher_running():
+        return None
     subprocess.Popen(
-        [sys.executable, "-m", "nanorun.local_daemon"],
+        [sys.executable, "-m", "nanorun.watcher"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     for _ in range(10):
         time.sleep(0.3)
-        pid = get_daemon_pid()
+        pid = get_watcher_pid()
         if pid:
             return pid
     return None
@@ -1792,12 +1924,10 @@ def main():
     parser.add_argument("--dashboard-port", type=int, default=8080)
     args = parser.parse_args()
 
-    if is_daemon_running():
-        print("Daemon is already running", file=sys.stderr)
+    if is_watcher_running():
+        print("Watcher is already running", file=sys.stderr)
         sys.exit(1)
-    LocalMetricsDaemon(
-        dashboard_port=args.dashboard_port, no_dashboard=args.no_dashboard
-    ).run()
+    Watcher(dashboard_port=args.dashboard_port, no_dashboard=args.no_dashboard).run()
 
 if __name__ == "__main__":
     main()

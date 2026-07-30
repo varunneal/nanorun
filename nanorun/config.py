@@ -21,7 +21,7 @@ class SessionConfig:
     user: str = ""
     port: int = 22
     cuda_version: Optional[str] = None
-    gpu_type: str = "H100"  # Blackwell: B200, RTX_PRO_6000, BLACKWELL, DGX_SPARK | Hopper: H100, H200, GH200 | Ampere: A100, A40, A30, A16, A10G, A10, A6000, A5000, A4000, A2 | Ada: L40S, L40, L4 | Apple: MPS
+    gpu_type: str = "H100"  # See _GPU_MATCH_ORDER in setup.py for the full set; UNKNOWN if unrecognized
     gpu_count: int = 1  # Number of GPUs on the machine
     has_sudo: bool = True
     repo_path: str = "~/nanorun"
@@ -36,7 +36,7 @@ class SessionConfig:
     iris_workspace: Optional[str] = None  # Working directory for iris CLI (marin repo root)
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
-    sync_paused: bool = False  # If True, the local daemon skips background metric/log/status scanning for this session
+    sync_paused: bool = False  # If True, the watcher skips background metric/log/status scanning for this session
     # Set once at `session start` (UTC ISO). session_name is reused across machine
     # incarnations, so it's not unique over time; started_at pins this config to one
     # incarnation. None for pre-upgrade sessions (they fall back to bare name below).
@@ -48,9 +48,9 @@ class SessionConfig:
     workspace_id: Optional[str] = None
     git_branch: Optional[str] = None
     # Bootstrap sessions exist only to provision a machine that will run its own
-    # local session (`session start --local` on the machine itself). The observer
-    # daemon never tracks them, and `session setup` installs the nanorun CLI
-    # instead of starting a remote daemon.
+    # local session (`session start --local` on the machine itself). The watcher
+    # never tracks them, and `session setup` installs the nanorun CLI
+    # instead of starting a daemon.
     bootstrap: bool = False
 
     @property
@@ -257,8 +257,8 @@ class Config:
 
         Writes the raw dict (preserving any keys the current dataclass may not
         know about) and does NOT touch the active-session pointer. The local
-        daemon re-reads session configs every sync cycle, so the change takes
-        effect within one HubSyncer interval without a daemon restart. Returns
+        watcher re-reads session configs every sync cycle, so the change takes
+        effect within one HubSyncer interval without a watcher restart. Returns
         False if the session doesn't exist.
         """
         session_file = cls._get_session_file(name)

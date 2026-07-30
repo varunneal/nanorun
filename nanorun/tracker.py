@@ -165,7 +165,7 @@ def get_db() -> sqlite3.Connection:
 def close_db() -> None:
     """Close and drop the calling thread's cached connection.
 
-    Called from daemon/thread shutdown paths for a clean final WAL checkpoint,
+    Called from watcher/thread shutdown paths for a clean final WAL checkpoint,
     and from tests to reset connection state between temp databases.
     """
     conn = getattr(_local, "conn", None)
@@ -612,7 +612,7 @@ def migrate_crash_logs_out(vacuum: bool = True) -> Dict[str, object]:
 
     HEAVY one-time operation: rewrites the whole experiments table under an
     exclusive write lock, then (optionally) VACUUMs to reclaim file space. Run
-    it only when the daemon is stopped / no experiments are writing. Idempotent
+    it only when the watcher is stopped / no experiments are writing. Idempotent
     and crash-safe: the backfill is INSERT OR IGNORE (never loses data) and the
     DROP is transactional (an interrupt rolls back cleanly), so re-running after
     an interruption finishes the job.
@@ -729,7 +729,7 @@ def create_experiment_from_mapping(
     """Idempotently create an experiment with an explicit remote-assigned ID.
 
     Unlike create_experiment(), this uses a specific ID rather than auto-increment.
-    Used when the remote daemon first confirms a queued or running experiment.
+    Used when the daemon first confirms a queued or running experiment.
     Replayed queue snapshots, mappings, and events are harmless.
 
     Returns the experiment ID.

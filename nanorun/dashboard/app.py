@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import discover_tracks, Config
 from ..queue import get_queue_state
-from ..local_daemon import DASHBOARD_HOST, safe_json_load, get_queue_cache_file
+from ..watcher import DASHBOARD_HOST, safe_json_load, get_queue_cache_file
 from ..tracker import (
     get_experiments,
     get_experiment,
@@ -361,11 +361,11 @@ async def get_queue_status():
 @app.get("/api/sessions")
 async def get_sessions():
     """Get session statuses + hub syncer state, sorted disconnected-first."""
-    from ..local_daemon import SessionState
+    from ..watcher import SessionState
 
     sessions = Config.list_sessions()
-    daemon = getattr(app.state, "daemon", None)
-    hub = daemon.hub_syncer if daemon else None
+    watcher = getattr(app.state, "watcher", None)
+    hub = watcher.hub_syncer if watcher else None
     result = []
     for sc in sessions:
         state = SessionState.load(sc.name)
@@ -415,20 +415,20 @@ async def get_sessions():
 @app.post("/api/sessions/{name}/reconnect")
 async def reconnect_session(name: str):
     """Trigger a reconnect attempt for a disconnected session."""
-    daemon = app.state.daemon
-    if not daemon:
-        return JSONResponse({"error": "Daemon not available"}, status_code=503)
-    ok = daemon.reconnect_session(name)
+    watcher = getattr(app.state, "watcher", None)
+    if not watcher:
+        return JSONResponse({"error": "Watcher not available"}, status_code=503)
+    ok = watcher.reconnect_session(name)
     return {"success": ok, "message": "Reconnecting..." if ok else "Session not found"}
 
 
 @app.post("/api/hub/reconnect")
 async def reconnect_hub():
     """Trigger a reconnect attempt for the hub syncer."""
-    daemon = app.state.daemon
-    if not daemon:
-        return JSONResponse({"error": "Daemon not available"}, status_code=503)
-    ok = daemon.reconnect_hub()
+    watcher = getattr(app.state, "watcher", None)
+    if not watcher:
+        return JSONResponse({"error": "Watcher not available"}, status_code=503)
+    ok = watcher.reconnect_hub()
     return {"success": ok, "message": "Hub reconnecting..." if ok else "Hub syncer already running"}
 
 
@@ -436,7 +436,7 @@ async def reconnect_hub():
 async def delete_session(name: str):
     """Remove a session (only if disconnected)."""
     import shutil
-    from ..local_daemon import SessionState
+    from ..watcher import SessionState
 
     session_config = Config.load_session(name)
     if not session_config:
@@ -464,16 +464,16 @@ async def delete_session(name: str):
     state_dir = Config.get_sessions_dir() / name
     if state_dir.exists():
         shutil.rmtree(state_dir, ignore_errors=True)
-    daemon = getattr(app.state, "daemon", None)
-    if daemon and hasattr(daemon, "remove_session"):
-        daemon.remove_session(name)
+    watcher = getattr(app.state, "watcher", None)
+    if watcher and hasattr(watcher, "remove_session"):
+        watcher.remove_session(name)
     msg = f"Session '{name}' removed"
     return {"success": True, "message": msg}
 
 
 @app.post("/api/sessions/{name}/sync-pause")
 async def set_session_sync_pause(name: str, paused: bool = True):
-    """Pause or resume the local daemon's background scanning for a session.
+    """Pause or resume the watcher's background scanning for a session.
 
     Persists the per-session `sync_paused` flag. The HubSyncer skips paused
     sessions, and SSH SessionTrackers idle (dropping their connection) until
@@ -489,8 +489,8 @@ async def set_session_sync_pause(name: str, paused: bool = True):
 
 
 @app.post("/api/sessions/{name}/daemon-restart")
-async def restart_remote_daemon(name: str):
-    """Restart the remote daemon for a session (stop + start)."""
+async def restart_daemon(name: str):
+    """Restart the daemon for a session (stop + start)."""
     import threading
     from ..remote_control import get_daemon_client, DaemonError
 
@@ -509,7 +509,7 @@ async def restart_remote_daemon(name: str):
 
 @app.get("/api/sessions/{name}/daemon-status")
 async def get_session_daemon_status(name: str):
-    """Get remote daemon status (experiment, queue, GPU) for a connected session."""
+    """Get daemon status (experiment, queue, GPU) for a connected session."""
     from ..queue import get_daemon_status
 
     status = get_daemon_status(session_name=name)

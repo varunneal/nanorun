@@ -34,14 +34,14 @@ def _require_command_session(session_name: str) -> bool:
     return True
 
 
-def _print_local_observer_hint() -> None:
-    """Explain the separate observer daemon when it is not already running."""
-    from .local_daemon import is_daemon_running
+def _print_watcher_hint() -> None:
+    """Explain the separate watcher when it is not already running."""
+    from .watcher import is_watcher_running
 
-    if not is_daemon_running():
+    if not is_watcher_running():
         console.print(
-            "[yellow]The local execution daemon is running, but the observer daemon "
-            "is not. Run 'nanorun local start' to keep SQLite metrics and session "
+            "[yellow]The local-session daemon is running, but the watcher is not. "
+            "Run 'nanorun watcher start' to keep SQLite metrics and session "
             "state updated.[/yellow]"
         )
 
@@ -90,7 +90,7 @@ def _require_daemon_client(session_name):
 
 def _resolve_active_sessions(session_name: str | None) -> list[str]:
     """Resolve session_name to a list of active session names for multi-session commands."""
-    from .local_daemon import SessionState
+    from .watcher import SessionState
 
     if session_name:
         sc = Config.load_session(session_name)
@@ -221,7 +221,9 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
             from .sync import ensure_local_session_branch
 
             try:
-                ensure_local_session_branch(existing, switch_if_needed=True)
+                ensure_local_session_branch(
+                    existing, switch_if_needed=True, publish=True
+                )
             except ValueError as error:
                 console.print(f"[red]{error}[/red]")
                 raise SystemExit(1)
@@ -248,7 +250,7 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
                 f"Branch: {existing.git_branch}. "
                 f"Hub namespace: {existing.hub_namespace}.[/green]"
             )
-            _print_local_observer_hint()
+            _print_watcher_hint()
             return
 
         safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "local"
@@ -286,7 +288,9 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
         from .sync import ensure_local_session_branch
 
         try:
-            ensure_local_session_branch(session_config, switch_if_needed=True)
+            ensure_local_session_branch(
+                session_config, switch_if_needed=True, publish=True
+            )
         except ValueError as error:
             console.print(f"[red]{error}[/red]")
             raise SystemExit(1)
@@ -309,7 +313,7 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
             f"Branch: {session_config.git_branch}. "
             f"Hub namespace: {session_config.hub_namespace}.[/green]"
         )
-        _print_local_observer_hint()
+        _print_watcher_hint()
         return
 
     if not host:
@@ -452,7 +456,7 @@ def session_cleanup():
     the session config and its state directory.
     """
     import shutil
-    from .local_daemon import SessionState
+    from .watcher import SessionState
 
     sessions = Config.list_sessions()
     if not sessions:
@@ -551,7 +555,7 @@ def session_list():
         console.print("Run 'nanorun session start <host>' to create one.")
         return
 
-    from .local_daemon import SessionState
+    from .watcher import SessionState
 
     table = Table(title="Sessions")
     table.add_column("Name", style="cyan")
@@ -1438,22 +1442,22 @@ def job_history(num: int, verbose: bool, session_name):
 
 
 # ============================================================================
-# Local daemon commands
+# Watcher commands
 # ============================================================================
 
-@cli.group("local")
-def local_daemon():
-    """Manage local daemon (metrics sync, experiment tracking)."""
+@cli.group("watcher")
+def watcher():
+    """Manage the watcher (Hub sync, metrics, and session tracking)."""
     pass
 
 
 # -----------------------------------------------------------------------------
-# Crash notification helpers (used by local daemon status/crashes commands)
+# Crash notification helpers (used by watcher status and job crashes)
 # -----------------------------------------------------------------------------
 
 def get_recent_crashes(unseen_only: bool = False, session_name: str = None) -> list:
     """Get recent crash notifications for one or all sessions."""
-    from .local_daemon import safe_json_load, get_crashes_file
+    from .watcher import safe_json_load, get_crashes_file
     if session_name:
         sessions = [session_name]
     else:
@@ -1470,7 +1474,7 @@ def get_recent_crashes(unseen_only: bool = False, session_name: str = None) -> l
 def mark_crashes_seen(session_name: str = None):
     """Mark all crashes as seen for one or all sessions."""
     import json
-    from .local_daemon import safe_json_load, get_crashes_file
+    from .watcher import safe_json_load, get_crashes_file
     if session_name:
         sessions = [session_name]
     else:
@@ -1485,84 +1489,96 @@ def mark_crashes_seen(session_name: str = None):
         crashes_file.write_text(json.dumps(crashes, indent=2))
 
 
-@local_daemon.command("start")
+@watcher.command("start")
 @click.option(
     "--background/--foreground",
     "background",
     default=False,
     help="Run in background or foreground (default)",
 )
-def daemon_start(background: bool):
-    """Start the local daemon.
-
-    The daemon polls the remote for experiment status and syncs metrics
-    to the local database. It automatically detects when experiments
-    start (including from queue) and finish.
-
-    Polling intervals: status/queue=1s, metrics=3s, logs=10s
-    """
-    from .local_daemon import is_daemon_running, LocalMetricsDaemon, get_daemon_pid
+def watcher_start(background: bool):
+    """Start the watcher."""
+    from .watcher import (
+        Watcher,
+        get_watcher_pid,
+        is_legacy_watcher_running,
+        is_watcher_running,
+    )
     import subprocess
 
-    if is_daemon_running():
-        console.print("[yellow]Local daemon is already running[/yellow]")
-        console.print("[dim]Use 'nanorun local status' to check state[/dim]")
+    if is_watcher_running():
+        console.print("[yellow]Watcher is already running[/yellow]")
+        if is_legacy_watcher_running():
+            console.print(
+                "[dim]It uses the legacy entrypoint; run "
+                "'nanorun watcher restart' to upgrade it.[/dim]"
+            )
+        else:
+            console.print("[dim]Use 'nanorun watcher status' to check state[/dim]")
         return
 
     if background:
-        # Run as background process
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "nanorun.local_daemon"],
+        subprocess.Popen(
+            [sys.executable, "-m", "nanorun.watcher"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        # Wait for daemon to start (may take a moment to write PID file)
+        # Wait for the watcher to write its PID file.
         import time
         for _ in range(10):
             time.sleep(0.3)
-            if is_daemon_running():
-                pid = get_daemon_pid()
-                console.print(f"[green]Local daemon started (PID: {pid})[/green]")
+            if is_watcher_running():
+                pid = get_watcher_pid()
+                console.print(f"[green]Watcher started (PID: {pid})[/green]")
                 return
 
-        console.print("[red]Failed to start local daemon[/red]")
+        console.print("[red]Failed to start watcher[/red]")
     else:
-        # Run in foreground (blocking)
-        console.print("[cyan]Starting local daemon in foreground...[/cyan]")
+        console.print("[cyan]Starting watcher in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        daemon_instance = LocalMetricsDaemon()
-        daemon_instance.run()
+        watcher_instance = Watcher()
+        watcher_instance.run()
 
 
-@local_daemon.command("stop")
-def local_daemon_stop():
-    """Stop the local daemon."""
-    from .local_daemon import is_daemon_running, stop_daemon, get_daemon_pid
+@watcher.command("stop")
+def watcher_stop():
+    """Stop the watcher."""
+    from .watcher import get_watcher_pid, is_watcher_running, stop_watcher
 
-    if not is_daemon_running():
-        console.print("[yellow]Local daemon is not running[/yellow]")
+    if not is_watcher_running():
+        console.print("[yellow]Watcher is not running[/yellow]")
         return
 
-    pid = get_daemon_pid()
-    if stop_daemon():
-        console.print(f"[green]Local daemon stopped (was PID: {pid})[/green]")
+    pid = get_watcher_pid()
+    if stop_watcher():
+        console.print(f"[green]Watcher stopped (was PID: {pid})[/green]")
     else:
-        console.print("[red]Failed to stop local daemon[/red]")
+        console.print(
+            "[red]Failed to stop watcher safely; its PID could not be verified[/red]"
+        )
 
 
-@local_daemon.command("status")
-def local_daemon_status():
-    """Show local daemon status."""
-    from .local_daemon import is_daemon_running, get_daemon_pid, SessionState
+@watcher.command("status")
+def watcher_status():
+    """Show watcher and per-session status."""
+    from .watcher import (
+        SessionState,
+        get_watcher_pid,
+        is_legacy_watcher_running,
+        is_watcher_running,
+    )
 
-    running = is_daemon_running()
+    running = is_watcher_running()
 
     if running:
-        pid = get_daemon_pid()
-        console.print(f"[bold green]Local daemon running[/bold green] [dim](PID: {pid})[/dim]")
+        pid = get_watcher_pid()
+        legacy = " [yellow](legacy entrypoint)[/yellow]" if is_legacy_watcher_running() else ""
+        console.print(
+            f"[bold green]Watcher running[/bold green] [dim](PID: {pid})[/dim]{legacy}"
+        )
     else:
-        console.print("[dim]Local daemon not running[/dim]")
+        console.print("[dim]Watcher not running[/dim]")
 
     # Show per-session status
     sessions = Config.list_sessions()
@@ -1590,50 +1606,53 @@ def local_daemon_status():
             exp_id = crash.get("experiment_id")
             timestamp = crash.get("timestamp", "")[:19]
             console.print(f"  [red]Experiment {exp_id}[/red] failed at {timestamp}")
-        console.print(f"\n  [dim]Run 'nanorun local crashes' for full crash logs[/dim]")
+        console.print(f"\n  [dim]Run 'nanorun job crashes' for full crash logs[/dim]")
         mark_crashes_seen()
 
 
-@local_daemon.command("pause")
+@watcher.command("pause")
 @session_option
-def local_daemon_pause(session_name: str):
-    """Pause the local daemon's background scanning for a session.
+def watcher_pause(session_name: str):
+    """Pause the watcher's background scanning for a session.
 
     Stops the periodic metric/log/status sync for this session. For iris/marin
     sessions this halts the persistent W&B + iris job polling entirely. On-demand
     commands ('nanorun job queue', 'nanorun job logs', 'nanorun job status') still
     hit the backend directly and keep working. The flag is persistent (survives
-    daemon restarts) and takes effect within ~10s with no restart needed.
+    watcher restarts) and takes effect within one sync cycle.
     """
     if Config.set_session_paused(session_name, True):
         console.print(f"[yellow]⏸ Paused[/yellow] background sync for [bold]{session_name}[/bold]")
-        console.print(f"[dim]Daemon stops scanning within ~10s. Resume with 'nanorun local resume --session {session_name}'.[/dim]")
+        console.print(
+            f"[dim]The watcher stops scanning within one sync cycle. Resume with "
+            f"'nanorun watcher resume --session {session_name}'.[/dim]"
+        )
     else:
         console.print(f"[red]Session '{session_name}' does not exist[/red]")
 
 
-@local_daemon.command("resume")
+@watcher.command("resume")
 @session_option
-def local_daemon_resume(session_name: str):
-    """Resume the local daemon's background scanning for a paused session."""
+def watcher_resume(session_name: str):
+    """Resume the watcher's background scanning for a paused session."""
     if Config.set_session_paused(session_name, False):
         console.print(f"[green]▶ Resumed[/green] background sync for [bold]{session_name}[/bold]")
-        console.print("[dim]Daemon resumes scanning within ~10s.[/dim]")
+        console.print("[dim]The watcher resumes scanning within one sync cycle.[/dim]")
     else:
         console.print(f"[red]Session '{session_name}' does not exist[/red]")
 
 
-@local_daemon.command("logs")
-@click.option("--tail", "-t", is_flag=True, help="Follow local daemon events log")
+@watcher.command("logs")
+@click.option("--tail", "-t", is_flag=True, help="Follow watcher events")
 @click.option("-n", "num_lines", default=50, show_default=True, help="Number of lines to show")
 @session_option
-def local_daemon_logs(tail: bool, num_lines: int, session_name: str):
-    """Show local daemon operator events (timestamped).
+def watcher_logs(tail: bool, num_lines: int, session_name: str):
+    """Show watcher operator events (timestamped).
 
     Without --session, shows events from all sessions merged by time.
     With --session, shows events for that session only.
     """
-    from .local_daemon import get_events_file
+    from .watcher import get_events_file
     import subprocess
 
     if session_name:
@@ -1663,56 +1682,60 @@ def local_daemon_logs(tail: bool, num_lines: int, session_name: str):
         lines = all_lines
 
         if tail:
-            # For tail across all sessions, show the active session's events or just use daemon.log
-            from .local_daemon import PATHS
-            daemon_log = PATHS.log_file
-            console.print(f"[dim]Tailing daemon log (all sessions). Use --session for single session. (Ctrl+C to stop)[/dim]")
+            # For tail across all sessions, use the watcher process log.
+            from .watcher import PATHS
+            watcher_log = PATHS.log_file
+            console.print(f"[dim]Tailing watcher log (all sessions). Use --session for single session. (Ctrl+C to stop)[/dim]")
             try:
-                subprocess.run(["tail", "-n", str(num_lines), "-f", str(daemon_log)])
+                subprocess.run(["tail", "-n", str(num_lines), "-f", str(watcher_log)])
             except KeyboardInterrupt:
                 pass
             return
 
     if not lines:
-        console.print("[dim]No local daemon events yet[/dim]")
+        console.print("[dim]No watcher events yet[/dim]")
         return
 
     for line in lines[-num_lines:]:
         console.print(line)
 
 
-@local_daemon.command("restart")
+@watcher.command("restart")
 @click.option(
     "--background/--foreground",
     "background",
     default=False,
     help="Run in background or foreground (default)",
 )
-def local_daemon_restart(background: bool):
-    """Restart the local daemon."""
-    from .local_daemon import is_daemon_running, stop_daemon, restart_daemon, LocalMetricsDaemon
+def watcher_restart(background: bool):
+    """Restart the watcher."""
+    from .watcher import Watcher, is_watcher_running, restart_watcher, stop_watcher
 
-    if is_daemon_running():
-        console.print("[dim]Stopping existing daemon...[/dim]")
-        stop_daemon()
+    if is_watcher_running():
+        console.print("[dim]Stopping existing watcher...[/dim]")
+        if not stop_watcher():
+            console.print(
+                "[red]Failed to stop watcher safely; its PID could not be verified[/red]"
+            )
+            return
 
     if background:
-        pid = restart_daemon(skip_stop=True)
+        pid = restart_watcher(skip_stop=True)
         if pid:
-            console.print(f"[green]Local daemon restarted (PID: {pid})[/green]")
+            console.print(f"[green]Watcher restarted (PID: {pid})[/green]")
         else:
-            console.print("[red]Failed to restart local daemon[/red]")
+            console.print("[red]Failed to restart watcher[/red]")
     else:
-        console.print("[cyan]Starting local daemon in foreground...[/cyan]")
+        console.print("[cyan]Starting watcher in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        daemon_instance = LocalMetricsDaemon()
-        daemon_instance.run()
+        watcher_instance = Watcher()
+        watcher_instance.run()
 
 
-@local_daemon.command("crashes")
+@job.command("crashes")
 @click.option("--all", "-a", "show_all", is_flag=True, help="Show all crashes, not just unseen")
 @click.argument("experiment_id", required=False, type=int)
-def local_daemon_crashes(show_all: bool, experiment_id: int):
+def job_crashes(show_all: bool, experiment_id: int):
     """Show crash logs from failed experiments.
 
     If EXPERIMENT_ID is provided, shows full crash log for that experiment.
@@ -1725,7 +1748,7 @@ def local_daemon_crashes(show_all: bool, experiment_id: int):
 
         if not crash:
             console.print(f"[yellow]No crash log found for experiment {experiment_id}[/yellow]")
-            console.print("[dim]Try 'nanorun daemon crash-log {id}' to fetch from remote[/dim]")
+            console.print(f"[dim]Try 'nanorun job logs {experiment_id}' for live or tmux output[/dim]")
             return
 
         console.print(f"\n[bold red]Experiment {experiment_id} Crash Log[/bold red]")
@@ -1760,7 +1783,7 @@ def local_daemon_crashes(show_all: bool, experiment_id: int):
         console.print(f"\n  [bold]Experiment {exp_id}[/bold] {status}")
         console.print(f"    Time: [dim]{timestamp}[/dim]")
 
-    console.print(f"\n[dim]Run 'nanorun local crashes <id>' for full crash log[/dim]")
+    console.print(f"\n[dim]Run 'nanorun job crashes <id>' for full crash log[/dim]")
     mark_crashes_seen()
 
 
@@ -1894,24 +1917,50 @@ def hub():
     pass
 
 
+_HUB_AUTH_HINTS = {
+    "hf": "Run: huggingface-cli login",
+    "s3": "Configure credentials for your S3 endpoint (aws configure / AWS_* env vars)",
+    "local": "Check that the configured [hub] path exists and is readable",
+    "iris": "Check your iris CLI config and login",
+}
+
+
 @hub.command("status")
 def hub_status():
-    """Show hub bucket info."""
+    """Show hub backend and bucket info."""
     from . import hub as hub_mod
+
+    try:
+        desc = hub_mod.describe()
+    except Exception as e:
+        console.print(f"[red]Hub backend unavailable: {e}[/red]")
+        return
+
+    backend = desc.get("backend", "unknown")
+    console.print(f"[green]Backend:[/green] {backend}")
+    console.print(f"[green]{desc.get('label', 'Location')}:[/green] {desc.get('location', '(unknown)')}")
+    for key, value in (desc.get("details") or {}).items():
+        console.print(f"[green]{key}:[/green] {value}")
 
     username = hub_mod.check_auth()
     if not username:
-        console.print("[red]Not authenticated. Run: huggingface-cli login[/red]")
+        hint = _HUB_AUTH_HINTS.get(backend, "Check your hub credentials")
+        console.print(f"[red]Not authenticated. {hint}[/red]")
         return
-
     console.print(f"[green]Authenticated as:[/green] {username}")
+
     try:
         info = hub_mod.get_bucket_info()
-        console.print(f"[green]Bucket:[/green] {hub_mod.BUCKET_ID}")
-        console.print(f"[green]Size:[/green] {info.size:,} bytes")
-        console.print(f"[green]Files:[/green] {info.total_files:,}")
     except Exception as e:
         console.print(f"[yellow]Bucket not found or error: {e}[/yellow]")
+        return
+
+    size = getattr(info, "size", None)
+    total_files = getattr(info, "total_files", None)
+    if size is not None:
+        console.print(f"[green]Size:[/green] {size:,} bytes")
+    if total_files is not None:
+        console.print(f"[green]Files:[/green] {total_files:,}")
 
 
 @hub.command("logs")

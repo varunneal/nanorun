@@ -1,12 +1,12 @@
-"""Remote control for nanorun - SSH transport and daemon communication.
+"""Session transport and nanorun daemon communication.
 
 This module provides:
 - RemoteSession: SSH connection management via Paramiko
-- DaemonClient: Client for communicating with the remote daemon via WebSocket RPC
+- DaemonClient: Client for communicating with a session daemon via WebSocket RPC
 
-The remote daemon (remote_daemon.py) runs on the GPU machine and exposes a
-WebSocket RPC server on localhost:9321.  CLI commands and the local daemon
-use DaemonClient (backed by RpcClient) to talk to it over an SSH tunnel.
+The daemon runs on an SSH-managed GPU machine or in a local session. CLI commands
+and the watcher use DaemonClient (backed by RpcClient) over an SSH tunnel or a
+published loopback endpoint.
 """
 
 import json
@@ -454,7 +454,7 @@ class LocalSession(RemoteSession):
 
 def _find_sole_connected_session() -> Optional[str]:
     """If exactly one session is connected, return its name."""
-    from .local_daemon import SessionState
+    from .watcher import SessionState
     sessions = Config.list_sessions()
     connected = [s.name for s in sessions if SessionState.load(s.name).status == "connected"]
     if len(connected) == 1:
@@ -586,7 +586,7 @@ class DaemonClient:
     # ----- daemon lifecycle -----
 
     def is_daemon_running(self) -> bool:
-        """Check if the remote daemon is responsive (RPC ping)."""
+        """Check if the session daemon is responsive (RPC ping)."""
         try:
             self._ensure_connected()
             result = self._rpc.call(Method.PING, timeout=5)
@@ -603,9 +603,9 @@ class DaemonClient:
             return True
 
         if self.remote.config.session_type == "local":
-            return self._ensure_local_daemon()
+            return self._ensure_local_session_daemon()
 
-        console.print("[dim]Starting remote daemon...[/dim]")
+        console.print("[dim]Starting daemon...[/dim]")
 
         # Ensure tmux session exists
         self.remote.run(
@@ -621,7 +621,7 @@ class DaemonClient:
         repo_path = self.remote.config.repo_path
         daemon_cmd = (
             f"cd {repo_path} && mkdir -p .daemon && source .venv/bin/activate && "
-            f"python -u -m nanorun.remote_daemon --session {session_name} 2>&1 "
+            f"python -u -m nanorun.daemon --session {session_name} 2>&1 "
             f"| tee -a .daemon/daemon.log"
         )
         result = self.remote.run(
@@ -643,7 +643,7 @@ class DaemonClient:
         console.print("[yellow]Daemon may not have started properly[/yellow]")
         return False
 
-    def _ensure_local_daemon(self) -> bool:
+    def _ensure_local_session_daemon(self) -> bool:
         """Start a session-scoped execution daemon on the current machine."""
         config = self.remote.config
         repo_path = Path(config.repo_path).resolve()
@@ -678,7 +678,7 @@ class DaemonClient:
             str(python_bin),
             "-u",
             "-m",
-            "nanorun.remote_daemon",
+            "nanorun.daemon",
             "--session",
             config.name,
             "--hub-session",
@@ -728,7 +728,7 @@ class DaemonClient:
         return False
 
     def stop_daemon(self) -> bool:
-        """Stop the remote daemon by killing its tmux window.
+        """Stop the daemon by killing its tmux window.
 
         Returns True if daemon was stopped, False if not running.
         """
@@ -755,11 +755,11 @@ class DaemonClient:
         return False
 
     def restart_daemon(self) -> bool:
-        """Restart the remote daemon.
+        """Restart the daemon.
 
         Returns True if daemon is running after restart.
         """
-        console.print("[dim]Restarting remote daemon...[/dim]")
+        console.print("[dim]Restarting daemon...[/dim]")
 
         if self.stop_daemon():
             console.print("[dim]Stopped existing daemon[/dim]")
@@ -912,7 +912,7 @@ def get_daemon_client(session_name: Optional[str] = None) -> Optional[DaemonClie
 def local_session_removal_blocker(config: SessionConfig) -> Optional[str]:
     """Explain why a local session cannot be safely removed, if applicable.
 
-    SessionState belongs to the observer daemon and is not execution authority.
+    SessionState belongs to the watcher and is not execution authority.
     Removal is safe only after the execution daemon and its tmux workspace have
     stopped and the persisted executor state has no active or queued work.
     """
