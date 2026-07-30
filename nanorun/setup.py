@@ -331,19 +331,27 @@ def _gather_agent_auth() -> tuple[dict, list[str]]:
 # Sourced from ~/.bashrc; rewritten on every setup so updates propagate.
 # NOTE: plain string, not an f-string — braces here must stay literal.
 AGENT_TMUX_WRAPPERS = r"""# nanorun: run coding agents inside a dedicated tmux session.
+# Root boxes: both agents refuse their permission-skip flag outright when euid is
+# 0, so mark the environment as sandboxed. These are ephemeral, single-tenant
+# rented machines, which is the same premise the flags themselves rest on.
+_nanorun_agent_prefix() {
+    if [ "$(id -u)" -eq 0 ]; then printf 'IS_SANDBOX=1 '; fi
+}
 _nanorun_agent_tmux() {
     local name="$1"; shift
     local bin="$HOME/.local/bin/$name"
     [ -x "$bin" ] || bin="$name"
+    local envpfx
+    envpfx="$(_nanorun_agent_prefix)"
     # Already multiplexed, or not a terminal (scripts, nanorun exec): run direct.
     if [ -n "$TMUX" ] || [ ! -t 1 ]; then
-        command "$bin" "$@"
+        env $envpfx "$bin" "$@"
         return
     fi
     # Headless/one-shot modes print and exit; a tmux session would eat the output.
     case " $* " in
         *" -p "*|*" --print "*|*" exec "*)
-            command "$bin" "$@"
+            env $envpfx "$bin" "$@"
             return
             ;;
     esac
@@ -351,7 +359,13 @@ _nanorun_agent_tmux() {
         tmux attach-session -t "=$name"
         return
     fi
-    tmux new-session -s "$name" "$(printf '%q ' "$bin" "$@")"
+    # Hold the pane open when the agent exits non-zero. Without this a failure at
+    # startup tears the session down before anything renders, and the only thing
+    # left on screen is tmux's bare "[exited]".
+    local cmd
+    cmd="$envpfx$(printf '%q ' "$bin" "$@")"
+    cmd="$cmd; rc=\$?; [ \$rc -eq 0 ] || { printf '\n[nanorun] %s exited with status %s\n' $name \$rc; printf 'Press Enter to close...'; read -r _; }"
+    tmux new-session -s "$name" "$cmd"
 }
 claude() { _nanorun_agent_tmux claude --dangerously-skip-permissions "$@"; }
 codex() { _nanorun_agent_tmux codex --dangerously-bypass-approvals-and-sandbox "$@"; }
