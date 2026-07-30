@@ -1,8 +1,10 @@
-"""WebSocket RPC client for communicating with remote nanorun daemon.
+"""WebSocket RPC client for communicating with a nanorun execution daemon.
 
 Architecture:
-  - One SSH tunnel per session, shared between CLI commands and the local daemon.
-    The tunnel forwards a random local port to localhost:9321 on the remote.
+  - SSH sessions use one shared tunnel per session. The tunnel forwards a
+    random local port to localhost:9321 on the remote.
+  - Local sessions connect directly to the loopback endpoint published by the
+    local execution daemon.
   - Each consumer (CLI command, local daemon) opens its own WebSocket over the
     shared tunnel.  Multiple WebSocket connections to the same daemon are fine.
   - Tunnel ownership is tracked via a lock file at .nanorun/tunnels/{session}.json.
@@ -251,7 +253,7 @@ def kill_tunnel(session_name: str) -> bool:
 
 
 class RpcClient:
-    """Synchronous WebSocket RPC client for the remote nanorun daemon.
+    """Synchronous WebSocket RPC client for a nanorun execution daemon.
 
     Lifecycle: connect() -> call() ... -> close().
 
@@ -263,8 +265,24 @@ class RpcClient:
     def __init__(self, session: SessionConfig):
         self._session = session
         self._tunnel: Optional[SshTunnel] = None
+        self._direct_port: Optional[int] = None
         self._ws = None
         self._event_callbacks: List[Callable[[EventMessage], None]] = []
+
+    def _local_endpoint_port(self) -> int:
+        """Read and validate a local execution daemon's published endpoint."""
+        endpoint_file = Config.get_executor_endpoint_file(self._session.name)
+        try:
+            data = json.loads(endpoint_file.read_text())
+            pid = int(data["pid"])
+            port = int(data["port"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise ConnectionError(
+                f"Local execution daemon endpoint is unavailable: {endpoint_file}"
+            ) from exc
+        if not _pid_is_alive(pid) or not _port_is_open(port):
+            raise ConnectionError("Local execution daemon is not running")
+        return port
 
     # ----- connection management -----
 
@@ -276,12 +294,17 @@ class RpcClient:
         if self._ws is not None:
             return
 
-        # Get or create the shared tunnel.
-        if not self._tunnel or not self._tunnel.alive:
-            if self._tunnel:
-                self._tunnel.stop()
-            self._tunnel = SshTunnel(self._session)
-            self._tunnel.start()
+        if self._session.session_type == "local":
+            self._direct_port = self._local_endpoint_port()
+            websocket_url = f"ws://127.0.0.1:{self._direct_port}"
+        else:
+            # Get or create the shared SSH tunnel.
+            if not self._tunnel or not self._tunnel.alive:
+                if self._tunnel:
+                    self._tunnel.stop()
+                self._tunnel = SshTunnel(self._session)
+                self._tunnel.start()
+            websocket_url = f"ws://localhost:{self._tunnel.local_port}"
 
         # Connect WebSocket with retry (daemon may still be booting).
         deadline = time.time() + timeout
@@ -289,7 +312,7 @@ class RpcClient:
         while time.time() < deadline:
             try:
                 self._ws = ws_connect(
-                    f"ws://localhost:{self._tunnel.local_port}",
+                    websocket_url,
                     open_timeout=min(3, max(0.5, deadline - time.time())),
                     ping_interval=None,
                     max_size=2**24,  # 16MB — LIST_MAPPINGS can be large
@@ -318,6 +341,7 @@ class RpcClient:
         if self._tunnel and stop_tunnel:
             self._tunnel.stop()
             self._tunnel = None
+        self._direct_port = None
 
     @property
     def connected(self) -> bool:

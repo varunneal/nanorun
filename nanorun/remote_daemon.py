@@ -17,7 +17,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -31,6 +31,12 @@ except ImportError:
 from nanorun.rpc_types import (
     RPC_PORT, ErrorCode, Event, EventMessage, Method, Request, Response, parse_message,
 )
+from nanorun.script_manifest import (
+    ManifestError,
+    ScriptManifest,
+    compute_script_hash,
+    parse_script_manifest,
+)
 
 try:
     from nanorun import hub
@@ -42,13 +48,19 @@ REPO_DIR = Path.cwd()
 DAEMON_DIR = REPO_DIR / ".daemon"
 MAPPINGS_DIR = DAEMON_DIR / "mappings"
 OUTPUT_DIR = DAEMON_DIR / "output"
+IMPORTS_DIR = DAEMON_DIR / "imports"
 QUEUE_FILE = DAEMON_DIR / "queue.txt"
 STATE_FILE = DAEMON_DIR / "state.json"
 PID_FILE = DAEMON_DIR / "daemon.pid"
 PENDING_WEIGHTS_FILE = DAEMON_DIR / "pending_weights.json"
 LOGS_DIR = REPO_DIR / "logs"
-MAPPINGS_LOG_DIR = LOGS_DIR / "mappings"
-QUEUE_LOG_DIR = LOGS_DIR / "queue"
+ARTIFACTS_DIR = LOGS_DIR
+MAPPINGS_LOG_DIR = ARTIFACTS_DIR / "mappings"
+QUEUE_LOG_DIR = ARTIFACTS_DIR / "queue"
+RPC_LISTEN_PORT = RPC_PORT
+RPC_LISTEN_HOST = "localhost"
+ENDPOINT_FILE: Optional[Path] = None
+DEVICE_LOCK_FILE: Optional[Path] = None
 
 TMUX_SESSION = "nanorun"
 HUB_SYNC_INTERVAL_S = 15
@@ -65,9 +77,6 @@ QUEUE_SEGMENT_LINES = 500
 RUN_ID_PATTERN = re.compile(
     r"logs/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\.txt"
 )
-FRONTMATTER_PATTERN = re.compile(r"^[\s]*(?:\"\"\"|'{3})(.*?)(?:\"\"\"|'{3})", re.DOTALL)
-PARENT_FIELD_PATTERN = re.compile(r"parent:\s*(.+?)(?:\n|$)")
-KERNELS_FIELD_PATTERN = re.compile(r"kernels:\s*(.+?)(?:\n|$)")
 STEP_PATTERN = re.compile(r"^step:(\d+)/(\d+)", re.MULTILINE)
 METRIC_STEP_PATTERN = re.compile(r"step:(\d+)/(\d+)")
 LOSS_PATTERN = re.compile(
@@ -225,6 +234,55 @@ class _QueueSegmentWriter:
 _queue_writer = _QueueSegmentWriter()
 
 
+def configure_runtime(
+    *,
+    repo_dir: Optional[Path] = None,
+    state_dir: Optional[Path] = None,
+    artifacts_dir: Optional[Path] = None,
+    rpc_host: Optional[str] = None,
+    rpc_port: Optional[int] = None,
+    endpoint_file: Optional[Path] = None,
+    device_lock_file: Optional[Path] = None,
+    tmux_session: Optional[str] = None,
+) -> None:
+    """Configure one execution-daemon process before constructing the daemon."""
+    global REPO_DIR, DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, IMPORTS_DIR
+    global QUEUE_FILE, STATE_FILE, PID_FILE, PENDING_WEIGHTS_FILE
+    global LOGS_DIR, ARTIFACTS_DIR, MAPPINGS_LOG_DIR, QUEUE_LOG_DIR
+    global RPC_LISTEN_HOST, RPC_LISTEN_PORT, ENDPOINT_FILE, DEVICE_LOCK_FILE
+    global TMUX_SESSION
+    global _mappings_writer, _queue_writer
+
+    if repo_dir is not None:
+        REPO_DIR = repo_dir.resolve()
+    DAEMON_DIR = (state_dir.resolve() if state_dir is not None else REPO_DIR / ".daemon")
+    MAPPINGS_DIR = DAEMON_DIR / "mappings"
+    OUTPUT_DIR = DAEMON_DIR / "output"
+    IMPORTS_DIR = DAEMON_DIR / "imports"
+    QUEUE_FILE = DAEMON_DIR / "queue.txt"
+    STATE_FILE = DAEMON_DIR / "state.json"
+    PID_FILE = DAEMON_DIR / "daemon.pid"
+    PENDING_WEIGHTS_FILE = DAEMON_DIR / "pending_weights.json"
+    LOGS_DIR = REPO_DIR / "logs"
+    ARTIFACTS_DIR = (
+        artifacts_dir.resolve() if artifacts_dir is not None else LOGS_DIR
+    )
+    MAPPINGS_LOG_DIR = ARTIFACTS_DIR / "mappings"
+    QUEUE_LOG_DIR = ARTIFACTS_DIR / "queue"
+    if rpc_host is not None:
+        RPC_LISTEN_HOST = rpc_host
+    if rpc_port is not None:
+        RPC_LISTEN_PORT = rpc_port
+    ENDPOINT_FILE = endpoint_file.resolve() if endpoint_file is not None else None
+    DEVICE_LOCK_FILE = (
+        device_lock_file.resolve() if device_lock_file is not None else None
+    )
+    if tmux_session:
+        TMUX_SESSION = tmux_session
+    _mappings_writer = _MappingsSegmentWriter()
+    _queue_writer = _QueueSegmentWriter()
+
+
 @dataclass
 class DaemonState:
     status: str  # "idle", "running", "paused"
@@ -268,6 +326,7 @@ class ExperimentMapping:
     git_commit: Optional[str] = None
     parent_hash: Optional[str] = None
     kernels_path: Optional[str] = None
+    dependencies: Dict[str, str] = field(default_factory=dict)
 
     def save(self):
         (MAPPINGS_DIR / f"{self.experiment_id}.json").write_text(json.dumps(asdict(self), indent=2))
@@ -298,22 +357,38 @@ class QueuedItem:
 
 
 class NanorunDaemon:
-    def __init__(self, session_name: str = "default"):
+    def __init__(
+        self,
+        session_name: str = "default",
+        hub_session: Optional[str] = None,
+    ):
         self.session_name = session_name
+        self.hub_session = hub_session or session_name
         self.state = DaemonState.load()
         self.state.session_name = session_name
         self.running = True
         self._pid_file_handle = None
+        self._device_lock_handle = None
         self._pending_events: List[EventMessage] = []
         self._ws_clients: Set = set()
         self._uploaded_weights: Set[str] = set()
         self._pending_weight_uploads: Dict[str, Dict[str, Any]] = {}
+
         self._startup_time = time.monotonic()
         # Event-driven queue push: _emit_queue_changed sets this, _queue_push_task
         # drains it (debounced) and uploads just the queue segment to the hub.
         self._queue_dirty = asyncio.Event()
         self._queue_push_failures = 0
-        for d in [DAEMON_DIR, MAPPINGS_DIR, OUTPUT_DIR, LOGS_DIR, MAPPINGS_LOG_DIR, QUEUE_LOG_DIR]:
+        for d in [
+            DAEMON_DIR,
+            MAPPINGS_DIR,
+            OUTPUT_DIR,
+            IMPORTS_DIR,
+            LOGS_DIR,
+            ARTIFACTS_DIR,
+            MAPPINGS_LOG_DIR,
+            QUEUE_LOG_DIR,
+        ]:
             d.mkdir(parents=True, exist_ok=True)
         self._load_pending_weight_uploads()
         # Recover from stale "running" state (daemon was killed mid-experiment)
@@ -336,6 +411,11 @@ class NanorunDaemon:
         # Publish current queue snapshot once at startup (so a freshly started
         # daemon's queue lands on the hub even before the first change).
         self._emit_queue_changed()
+
+    @property
+    def _hub_namespace(self) -> str:
+        """Hub key namespace, with compatibility for test/legacy instances."""
+        return getattr(self, "hub_session", self.session_name)
 
     # --- events ---
 
@@ -371,6 +451,36 @@ class NanorunDaemon:
     # --- PID lock ---
 
     def acquire_pid_lock(self) -> bool:
+        if DEVICE_LOCK_FILE is not None:
+            try:
+                DEVICE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+                self._device_lock_handle = open(DEVICE_LOCK_FILE, "a+")
+                fcntl.flock(
+                    self._device_lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                self._device_lock_handle.seek(0)
+                self._device_lock_handle.truncate()
+                self._device_lock_handle.write(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "session": self.session_name,
+                            "state_dir": str(DAEMON_DIR),
+                        }
+                    )
+                )
+                self._device_lock_handle.flush()
+            except (IOError, OSError):
+                if self._device_lock_handle:
+                    self._device_lock_handle.close()
+                    self._device_lock_handle = None
+                print(
+                    "Another local nanorun execution session already owns this device",
+                    file=sys.stderr,
+                )
+                return False
+
         try:
             self._pid_file_handle = open(PID_FILE, "w")
             fcntl.flock(self._pid_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -381,11 +491,22 @@ class NanorunDaemon:
             if self._pid_file_handle:
                 self._pid_file_handle.close()
                 self._pid_file_handle = None
+            self._release_device_lock()
             try:
                 print(f"Another daemon is already running (PID {PID_FILE.read_text().strip()})", file=sys.stderr)
             except Exception:
                 print("Another daemon is already running", file=sys.stderr)
             return False
+
+    def _release_device_lock(self):
+        if not self._device_lock_handle:
+            return
+        try:
+            fcntl.flock(self._device_lock_handle.fileno(), fcntl.LOCK_UN)
+            self._device_lock_handle.close()
+        except Exception:
+            pass
+        self._device_lock_handle = None
 
     def release_pid_lock(self):
         if self._pid_file_handle:
@@ -399,6 +520,7 @@ class NanorunDaemon:
             PID_FILE.unlink()
         except FileNotFoundError:
             pass
+        self._release_device_lock()
 
     # --- GPU ---
 
@@ -464,21 +586,11 @@ class NanorunDaemon:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return None
 
-    def _parse_frontmatter(self, script_path: str) -> tuple[Optional[str], Optional[str]]:
+    def _parse_frontmatter(self, script_path: str) -> ScriptManifest:
         full_path = REPO_DIR / script_path
         if not full_path.exists():
-            return None, None
-        try:
-            content = full_path.read_text()
-            match = FRONTMATTER_PATTERN.match(content)
-            if not match:
-                return None, None
-            docstring = match.group(1)
-            parent = PARENT_FIELD_PATTERN.search(docstring)
-            kernels = KERNELS_FIELD_PATTERN.search(docstring)
-            return (parent.group(1).strip() if parent else None, kernels.group(1).strip() if kernels else None)
-        except Exception:
-            return None, None
+            return ScriptManifest()
+        return parse_script_manifest(full_path.read_text())
 
     def _compute_file_hash(self, rel_path: str) -> Optional[str]:
         full_path = REPO_DIR / rel_path
@@ -486,22 +598,76 @@ class NanorunDaemon:
             return None
         return hashlib.sha256(full_path.read_bytes()).hexdigest()[:CODE_HASH_LENGTH]
 
-    def _compute_code_hash(self, script: str, kernels_path: Optional[str] = None) -> Optional[str]:
-        script_full = REPO_DIR / script
-        if not script_full.exists():
-            return None
-        script_bytes = script_full.read_bytes()
-        if kernels_path:
-            kernels_full = REPO_DIR / kernels_path
-            if kernels_full.exists():
-                return hashlib.sha256(script_bytes + b"\n---KERNELS---\n" + kernels_full.read_bytes()).hexdigest()[:CODE_HASH_LENGTH]
-        return hashlib.sha256(script_bytes).hexdigest()[:CODE_HASH_LENGTH]
+    def _compute_code_hash(
+        self,
+        script: str,
+        kernels_path: Optional[str] = None,
+        dependencies: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        return compute_script_hash(
+            REPO_DIR,
+            script,
+            kernels_path=kernels_path,
+            dependencies=dependencies,
+        )
 
     def _kernels_symlink_cmd(self, script_path: str, kernels_path: str) -> str:
         script_dir = Path(script_path).parent
         kernels_dir = Path(kernels_path).parent
-        target = Path(kernels_path).name if str(kernels_dir) == str(script_dir) else str(Path.cwd() / kernels_path)
-        return f"ln -sf {target} {script_dir}/triton_kernels.py"
+        target = (
+            Path(kernels_path).name
+            if kernels_dir == script_dir
+            else REPO_DIR / kernels_path
+        )
+        destination = script_dir / "triton_kernels.py"
+        return f"ln -sf {shlex.quote(str(target))} {shlex.quote(str(destination))}"
+
+    def _prepare_dependency_overlay(
+        self,
+        script_path: str,
+        experiment_id: int,
+        dependencies: Dict[str, str],
+    ) -> Optional[str]:
+        """Stage dependency aliases outside the repository worktree."""
+
+        if not dependencies:
+            return None
+
+        script_dir = (REPO_DIR / script_path).parent
+        overlay = IMPORTS_DIR / str(experiment_id)
+        staged = False
+        for module, dependency_path in dependencies.items():
+            source = (REPO_DIR / dependency_path).resolve()
+            sibling = script_dir / f"{module}.py"
+            if sibling.exists() or sibling.is_symlink():
+                if sibling.resolve() == source:
+                    continue
+                # Older kernels runs leave this daemon-managed compatibility
+                # symlink in the script directory. Remove it when the script
+                # migrates to a generic triton_kernels dependency so the
+                # dependency overlay can take precedence.
+                if module == "triton_kernels" and sibling.is_symlink():
+                    sibling.unlink()
+                else:
+                    raise ManifestError(
+                        f"Dependency module {module} conflicts with existing file: "
+                        f"{sibling.relative_to(REPO_DIR)}"
+                    )
+
+            overlay.mkdir(parents=True, exist_ok=True)
+            destination = overlay / f"{module}.py"
+            if destination.exists() and not destination.is_symlink():
+                raise ManifestError(
+                    f"Dependency overlay path is not a symlink: {destination}"
+                )
+            if destination.is_symlink():
+                if destination.resolve() == source:
+                    staged = True
+                    continue
+                destination.unlink()
+            destination.symlink_to(source)
+            staged = True
+        return str(overlay) if staged else None
 
     # --- tmux ---
 
@@ -586,18 +752,28 @@ class NanorunDaemon:
 
     def _build_run_command(self, script: str, env_vars: Dict[str, str], gpus: int,
                            exp_id: int, cmd_prefix: Optional[str] = None,
-                           symlink_cmd: Optional[str] = None) -> str:
+                           symlink_cmd: Optional[str] = None,
+                           dependency_overlay: Optional[str] = None,
+                           gpu_type: str = "H100") -> str:
         env_str = " ".join(f"{k}={v}" for k, v in env_vars.items())
         if env_str:
             env_str += " "
-        torchrun = f"torchrun --standalone --nproc_per_node={gpus} {script}"
+        if gpu_type == "MPS":
+            run_cmd = f"python {script}"
+        else:
+            run_cmd = f"torchrun --standalone --nproc_per_node={gpus} {script}"
         if cmd_prefix:
-            torchrun = f"{cmd_prefix} {torchrun}"
+            run_cmd = f"{cmd_prefix} {run_cmd}"
         output_file = OUTPUT_DIR / f"{exp_id}.txt"
         parts = ["source .venv/bin/activate"]
         if symlink_cmd:
             parts.append(symlink_cmd)
-        parts.append(f"{env_str}{torchrun} 2>&1 | tee {output_file}")
+        if dependency_overlay:
+            parts.append(
+                f"export PYTHONPATH={shlex.quote(dependency_overlay)}"
+                "${PYTHONPATH:+:$PYTHONPATH}"
+            )
+        parts.append(f"{env_str}{run_cmd} 2>&1 | tee {output_file}")
         return " && ".join(parts)
 
     def start_experiment(self, experiment_id: int, script: str, env_vars: Dict[str, str],
@@ -619,7 +795,14 @@ class NanorunDaemon:
             total_mem = sum(p["memory_mb"] for p in gpu_procs)
             return {"success": False, "error": f"GPU busy: PIDs {pids} ({total_mem}MB)", "gpu_processes": gpu_procs}
 
-        parent_path, kernels_path = self._parse_frontmatter(script)
+        try:
+            manifest = self._parse_frontmatter(script)
+        except (ManifestError, OSError, UnicodeError) as error:
+            return {"success": False, "error": f"Invalid script frontmatter: {error}"}
+
+        parent_path = manifest.parent
+        kernels_path = manifest.kernels
+        dependencies: Dict[str, str] = {}
         if parent_path:
             resolved_parent = self._resolve_script_path(parent_path)
             if not resolved_parent:
@@ -642,16 +825,49 @@ class NanorunDaemon:
                     ),
                 }
             kernels_path = resolved_kernels
+        for module, dependency_path in manifest.dependencies:
+            resolved_dependency = self._resolve_script_path(dependency_path)
+            if not resolved_dependency:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Frontmatter dependency {module} must be an existing "
+                        f"repository-relative .py file: {dependency_path}"
+                    ),
+                }
+            dependencies[module] = resolved_dependency
+
         symlink_cmd = self._kernels_symlink_cmd(script, kernels_path) if kernels_path else None
-        code_hash = self._compute_code_hash(script, kernels_path)
+        try:
+            dependency_overlay = self._prepare_dependency_overlay(
+                script,
+                experiment_id,
+                dependencies,
+            )
+        except (ManifestError, OSError) as error:
+            return {"success": False, "error": str(error)}
+
+        code_hash = self._compute_code_hash(script, kernels_path, dependencies)
         if not code_hash:
-            return {"success": False, "error": f"Script not found: {script}"}
+            return {
+                "success": False,
+                "error": f"Script or declared dependency not found: {script}",
+            }
 
         timestamp = datetime.now(timezone.utc).strftime("%m%d_%H%M%S")
         base_name = name or Path(script).stem
         window_name = f"{timestamp}_{base_name}"[:TMUX_WINDOW_NAME_MAX]
 
-        cmd = self._build_run_command(script, env_vars, gpus, experiment_id, cmd_prefix, symlink_cmd)
+        cmd = self._build_run_command(
+            script,
+            env_vars,
+            gpus,
+            experiment_id,
+            cmd_prefix,
+            symlink_cmd,
+            dependency_overlay,
+            gpu_type,
+        )
         if not self._tmux_create(window_name, cmd):
             return {"success": False, "error": "Failed to create tmux window"}
 
@@ -663,6 +879,7 @@ class NanorunDaemon:
             track=track, name=name, git_commit=self.get_git_commit(),
             parent_hash=self._compute_file_hash(parent_path) if parent_path else None,
             kernels_path=kernels_path,
+            dependencies=dependencies,
         )
         mapping.save()
 
@@ -725,6 +942,7 @@ class NanorunDaemon:
 
     def _record_run_id(self, run_id: str):
         """Persist and emit a run ID detected from experiment stdout."""
+        self._materialize_log(run_id)
         self.state.current_run_id = run_id
         self.state.save()
         mapping = ExperimentMapping.load(self.state.current_experiment_id)
@@ -737,6 +955,31 @@ class NanorunDaemon:
             experiment_id=self.state.current_experiment_id,
             run_id=run_id,
         )
+
+    def _materialize_log(self, run_id: str) -> Optional[Path]:
+        """Expose a locally-produced run log in the session artifact directory."""
+        source = LOGS_DIR / f"{run_id}.txt"
+        destination = ARTIFACTS_DIR / f"{run_id}.txt"
+        if source == destination or not source.is_file():
+            return source if source.is_file() else None
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            try:
+                os.link(source, destination)
+            except OSError:
+                try:
+                    destination.write_bytes(source.read_bytes())
+                except OSError:
+                    return None
+        elif destination.stat().st_ino != source.stat().st_ino:
+            # Cross-filesystem fallback: append only bytes not yet materialized.
+            destination_size = destination.stat().st_size
+            source_size = source.stat().st_size
+            if source_size > destination_size:
+                with open(source, "rb") as src, open(destination, "ab") as dst:
+                    src.seek(destination_size)
+                    dst.write(src.read())
+        return destination
 
     def _detect_run_id(self) -> Optional[str]:
         """Check tee'd output file for run_id pattern.
@@ -956,6 +1199,7 @@ class NanorunDaemon:
             current_window=self.state.current_window,
             current_run_id=self.state.current_run_id,
             queue_length=len(queue), queue=[asdict(item) for item in queue],
+            hub_session=self._hub_namespace,
             gpu_processes=self.get_gpu_processes(),
             ts=datetime.now(timezone.utc).isoformat())
 
@@ -1126,10 +1370,12 @@ class NanorunDaemon:
         # same reset at ~200ms cost per cycle without taking down the daemon.
         if not HUB_AVAILABLE:
             return
+        if self.state.current_run_id:
+            self._materialize_log(self.state.current_run_id)
         cmd = [
             sys.executable, "-u", "-c",
             "from pathlib import Path; from nanorun import hub; "
-            f"hub.sync_logs_up(Path({str(LOGS_DIR)!r}), {self.session_name!r})",
+            f"hub.sync_logs_up(Path({str(ARTIFACTS_DIR)!r}), {self._hub_namespace!r})",
         ]
         try:
             stdout, stderr, returncode = await _run_supervised_subprocess(
@@ -1163,7 +1409,7 @@ class NanorunDaemon:
                     continue
                 print(f"[hub] Uploading weight: {pt_file.name} for experiment {exp_id}")
                 try:
-                    await asyncio.to_thread(hub.upload_weight, pt_file, exp_id, pt_file.name, self.session_name)
+                    await asyncio.to_thread(hub.upload_weight, pt_file, exp_id, pt_file.name, self._hub_namespace)
                     self._uploaded_weights.add(key)
                     print(f"[hub] Uploaded: {pt_file.name}")
                 except Exception as e:
@@ -1201,7 +1447,7 @@ class NanorunDaemon:
                         pt_file,
                         exp_id,
                         filename,
-                        self.session_name,
+                        self._hub_namespace,
                     )
                     print(f"[hub] Uploaded post-exit weight: {filename}")
                 except Exception as e:
@@ -1255,7 +1501,7 @@ class NanorunDaemon:
         cmd = [
             sys.executable, "-u", "-c",
             "from pathlib import Path; from nanorun import hub; "
-            f"hub.sync_queue_up(Path({str(LOGS_DIR)!r}), {self.session_name!r})",
+            f"hub.sync_queue_up(Path({str(ARTIFACTS_DIR)!r}), {self._hub_namespace!r})",
         ]
         try:
             _, stderr, returncode = await _run_supervised_subprocess(
@@ -1288,7 +1534,11 @@ class NanorunDaemon:
 
     async def run_async(self):
         print(f"nanorun daemon starting")
-        print(f"  Session: {self.session_name}  State: {self.state.status}  RPC: localhost:{RPC_PORT}  Hub: {'yes' if HUB_AVAILABLE else 'no'}")
+        print(
+            f"  Session: {self.session_name}  State: {self.state.status}  "
+            f"RPC: localhost:{RPC_LISTEN_PORT}  "
+            f"Hub: {'yes' if HUB_AVAILABLE else 'no'} ({self._hub_namespace})"
+        )
 
         if not self.acquire_pid_lock():
             sys.exit(1)
@@ -1299,8 +1549,21 @@ class NanorunDaemon:
             loop.add_signal_handler(sig, lambda: setattr(self, 'running', False))
 
         try:
-            server = await websockets.serve(self.ws_handler, "localhost", RPC_PORT, max_size=2**24)
-            print(f"  WebSocket server listening on localhost:{RPC_PORT}")
+            server = await websockets.serve(
+                self.ws_handler,
+                RPC_LISTEN_HOST,
+                RPC_LISTEN_PORT,
+                max_size=2**24,
+            )
+            actual_port = server.sockets[0].getsockname()[1]
+            if ENDPOINT_FILE is not None:
+                ENDPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+                tmp_endpoint = ENDPOINT_FILE.with_suffix(".tmp")
+                tmp_endpoint.write_text(
+                    json.dumps({"pid": os.getpid(), "port": actual_port})
+                )
+                tmp_endpoint.replace(ENDPOINT_FILE)
+            print(f"  WebSocket server listening on {RPC_LISTEN_HOST}:{actual_port}")
 
             # Auto-start queue if idle with pending items
             if self.state.status == "idle" and self.read_queue():
@@ -1320,6 +1583,13 @@ class NanorunDaemon:
             server.close()
             await server.wait_closed()
         finally:
+            if ENDPOINT_FILE is not None:
+                try:
+                    data = json.loads(ENDPOINT_FILE.read_text())
+                    if data.get("pid") == os.getpid():
+                        ENDPOINT_FILE.unlink(missing_ok=True)
+                except (OSError, json.JSONDecodeError):
+                    pass
             self.release_pid_lock()
         print("nanorun daemon stopped")
 
@@ -1327,7 +1597,26 @@ class NanorunDaemon:
 def main():
     parser = argparse.ArgumentParser(description="nanorun remote daemon")
     parser.add_argument("--session", default=None)
+    parser.add_argument("--hub-session", default=None)
+    parser.add_argument("--repo-dir", type=Path, default=None)
+    parser.add_argument("--state-dir", type=Path, default=None)
+    parser.add_argument("--artifacts-dir", type=Path, default=None)
+    parser.add_argument("--listen-host", default=None)
+    parser.add_argument("--endpoint-file", type=Path, default=None)
+    parser.add_argument("--device-lock-file", type=Path, default=None)
+    parser.add_argument("--port", type=int, default=RPC_PORT)
+    parser.add_argument("--tmux-session", default=None)
     args = parser.parse_args()
+    configure_runtime(
+        repo_dir=args.repo_dir,
+        state_dir=args.state_dir,
+        artifacts_dir=args.artifacts_dir,
+        rpc_host=args.listen_host,
+        rpc_port=args.port,
+        endpoint_file=args.endpoint_file,
+        device_lock_file=args.device_lock_file,
+        tmux_session=args.tmux_session,
+    )
     session_name = args.session
     if not session_name:
         state_file = DAEMON_DIR / "state.json"
@@ -1340,7 +1629,12 @@ def main():
     if not session_name:
         print("ERROR: --session is required (no previous session found in .daemon/state.json)")
         sys.exit(1)
-    asyncio.run(NanorunDaemon(session_name=session_name).run_async())
+    asyncio.run(
+        NanorunDaemon(
+            session_name=session_name,
+            hub_session=args.hub_session,
+        ).run_async()
+    )
 
 
 if __name__ == "__main__":

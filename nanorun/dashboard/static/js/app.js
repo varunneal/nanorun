@@ -354,8 +354,12 @@ async function selectExperiment(codeHashOrId, experimentIds) {
     const envVarStrings = new Set(validData.map(d => JSON.stringify(d.env_vars || {})));
     const isSweep = envVarStrings.size > 1;
 
-    // Compute aggregated stats (exclude running from averages)
-    const completedData = validData.filter(d => d.status !== 'running');
+    const chartableData = validData.filter(d => d.status !== 'queued');
+
+    // Final summary statistics include only runs with a confirmed completion.
+    // Failed, cancelled, unknown, and queued runs may have useful partial
+    // metrics, but those are not final results and must not skew the mean.
+    const completedData = validData.filter(d => d.status === 'completed');
     const valLosses = completedData.map(d => d.final_loss ?? d.final_val_loss).filter(v => v != null);
     const trainTimes = completedData.map(d => d.final_train_time_ms).filter(v => v != null);
     // All runs here share a code_hash, so they share a loss series.
@@ -460,7 +464,7 @@ async function selectExperiment(codeHashOrId, experimentIds) {
         const exp = validData.find(d => d.id === currentRunId);
         if (exp) updateMetricsTable(exp.loss_curve, false, currentRunId);
     } else if (isMultiple) {
-        const allCurves = validData.map(d => d.loss_curve);
+        const allCurves = chartableData.map(d => d.loss_curve);
         const averaged = computeAveragedMetrics(allCurves);
         updateMetricsTable(averaged, true, null);
     } else {
@@ -719,6 +723,9 @@ function openSessionPopover(name) {
     popover.id = 'session-popover';
     const gpuLabel = s.gpu_count > 1 ? `${s.gpu_count}× ${s.gpu_type}` : s.gpu_type;
     let body = `<div class="sp-header"><span class="sp-name">${s.name}</span><span class="sp-close" onclick="closeSessionPopover()">✕</span></div><div class="sp-info"><span style="color:var(--text-primary)">${s.host}</span> <span style="color:#888">${gpuLabel}</span></div>`;
+    if (s.session_type === 'local' && s.git_branch) {
+        body += `<div class="sp-info" style="color:#888">${s.git_branch}<br>Hub: ${s.hub_namespace}</div>`;
+    }
     const pauseBtn = `<button class="sp-btn sp-btn-warning" id="sp-sync-${name}" onclick="doToggleSync('${name}', true)">⏸ Pause Sync</button>`;
     const resumeBtn = `<button class="sp-btn sp-btn-primary" id="sp-sync-${name}" onclick="doToggleSync('${name}', false)">▶ Resume Sync</button>`;
     if (s.sync_paused) {

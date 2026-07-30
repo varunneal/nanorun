@@ -1,10 +1,10 @@
 """Local metrics daemon - event-driven, multi-session.
 
 Two independent connections per session:
-  1. Remote daemon (SSH/WebSocket) — experiment events, queue state, RPC
-  2. HuggingFace Hub (HTTPS) — log/mapping sync
+  1. Execution daemon (SSH-tunneled or loopback WebSocket) — events and RPC
+  2. Artifact source (Hub pull or direct local files) — logs and mappings
 
-These are decoupled: hub sync continues when SSH drops and vice versa.
+These are decoupled: artifact ingestion continues when RPC drops and vice versa.
 One main thread for session discovery and signal handling.
 """
 
@@ -331,7 +331,9 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
                     finished_at=mapping.get("finished_at"), env_vars=mapping.get("env_vars"),
                     gpus=mapping.get("gpus", 1), gpu_type=mapping.get("gpu_type", "H100"),
                     git_commit=mapping.get("git_commit"), parent_hash=mapping.get("parent_hash"),
-                    kernels_path=mapping.get("kernels_path"), session_name=session_name,
+                    kernels_path=mapping.get("kernels_path"),
+                    dependencies=mapping.get("dependencies"),
+                    session_name=session_name,
                     session_id=session_id,
                 )
                 log.info(f"[hub] Created experiment {exp_id} ({Path(script).name}) for {session_name}")
@@ -423,6 +425,9 @@ class HubSyncer:
         # (restart-to-recover); subsequent passes are delivery-driven. Reset on
         # restart (fresh __init__), which re-triggers catch-up — the intended behavior.
         self._first_synced: set = set()
+        # Direct local sessions don't download their own artifacts from the Hub.
+        # Track file sizes so growing hard-linked logs still drive incremental parses.
+        self._local_file_sizes: Dict[str, Dict[str, int]] = {}
 
     def start(self):
         self._thread = threading.Thread(
@@ -479,6 +484,27 @@ class HubSyncer:
         self._sync_failures.pop(session_name, None)
         self._sync_retry_at.pop(session_name, None)
 
+    def _scan_local_artifacts(self, session_name: str) -> List[str]:
+        """Return paths whose size changed in a local session artifact directory."""
+        root = Config.get_session_logs_dir(session_name)
+        previous = self._local_file_sizes.setdefault(session_name, {})
+        current: Dict[str, int] = {}
+        changed: List[str] = []
+        if root.exists():
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(root).as_posix()
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                current[relative] = size
+                if previous.get(relative) != size:
+                    changed.append(relative)
+        self._local_file_sizes[session_name] = current
+        return changed
+
     def _log_session_error(self, session_name: str, message: str, *, exc_info: bool = False):
         previous = self._session_errors_logged.get(session_name)
         if previous != message:
@@ -494,7 +520,11 @@ class HubSyncer:
         # sessions this is the whole background footprint (W&B + iris job polling);
         # on-demand CLI commands still hit the backend directly and are unaffected.
         # The flag is re-read every cycle, so pause/resume applies without a restart.
-        all_sessions = Config.list_sessions()
+        # Bootstrap sessions are provision-only (no hub namespace, no queue, no
+        # metrics) — exclude them before any pause bookkeeping so they never sync.
+        all_sessions = [
+            s for s in Config.list_sessions() if not getattr(s, "bootstrap", False)
+        ]
         paused = {s.name for s in all_sessions if getattr(s, "sync_paused", False)}
         prev_paused = getattr(self, "_paused_sessions", set())
         for name in sorted(paused - prev_paused):
@@ -507,11 +537,17 @@ class HubSyncer:
         for name in set(self._sync_failures) - configured:
             self._clear_sync_backoff(name)
         now = time.monotonic()
-        sessions = [
-            s.name for s in all_sessions
+        session_configs = [
+            s for s in all_sessions
             if s.name not in paused
             and self._sync_retry_at.get(s.name, 0) <= now
         ]
+        sessions = [s.name for s in session_configs]
+        local_sessions = {
+            s.name
+            for s in session_configs
+            if getattr(s, "session_type", "ssh") == "local"
+        }
 
         # Sync all sessions in parallel so one slow/hanging session doesn't block others.
         # Each pull returns the files it changed; we thread that into the parse below so
@@ -525,7 +561,14 @@ class HubSyncer:
             except Exception as e:
                 sync_errors[name] = e
 
-        threads = [threading.Thread(target=_sync_one, args=(s,), daemon=True) for s in sessions]
+        for session_name in local_sessions:
+            try:
+                changed_by_session[session_name] = self._scan_local_artifacts(session_name)
+            except Exception as error:
+                sync_errors[session_name] = error
+
+        hub_sessions = [name for name in sessions if name not in local_sessions]
+        threads = [threading.Thread(target=_sync_one, args=(s,), daemon=True) for s in hub_sessions]
         for t in threads:
             t.start()
         for t in threads:
@@ -583,10 +626,10 @@ class HubSyncer:
         self.last_sync_at = datetime.now().strftime("%H:%M:%S")
 
     def _parse_metrics_for_session(self, session_name: str, changed: Optional[List[str]] = None):
-        """Parse metrics from local log files. Dispatches to correct parser by session type.
+        """Parse metrics from materialized log files for the session type.
 
-        The HubSyncer is now the single parse driver for SSH sessions (the tracker's
-        old 3s parse loop is gone), so this always parses — no tracker_connected gate.
+        The HubSyncer is the single parse driver for SSH and local sessions (the
+        tracker's old 3s parse loop is gone), so this always parses.
         ``changed`` is the backend's changed-file list from this pull (paths relative to
         the session log dir), or None if the backend can't report deltas."""
         session_config = Config.load_session(session_name)
@@ -596,7 +639,7 @@ class HubSyncer:
             self._parse_ssh_metrics(session_name, changed)
 
     def _parse_ssh_metrics(self, session_name: str, changed_paths: Optional[List[str]] = None):
-        """Parse metrics for an SSH session, driven by the files a hub pull changed.
+        """Parse metrics for an SSH or local session, driven by changed files.
 
         Three cases:
           - **First pass per session** since daemon start (guarded by _first_synced):
@@ -1448,13 +1491,28 @@ class SessionTracker:
         exp = get_experiment(exp_id)
         if not exp:
             self._create_experiment(exp_id, data)
-        elif exp.session_name != self.session_name:
+            return
+
+        metadata = {
+            key: data[key]
+            for key in (
+                "code_hash",
+                "tmux_window",
+                "git_commit",
+                "parent_hash",
+                "kernels_path",
+                "dependencies",
+            )
+            if data.get(key) is not None
+        }
+        if exp.session_name != self.session_name:
             # Claim for this incarnation: stamp both name and session_id so later
             # reconciliation scopes correctly.
-            update_experiment_metadata(
-                exp_id, session_name=self.session_name, session_id=self.config.session_id,
-            )
+            metadata["session_name"] = self.session_name
+            metadata["session_id"] = self.config.session_id
             log.info(f"[{self.session_name}] Claimed experiment {exp_id} from '{exp.session_name}'")
+        if metadata:
+            update_experiment_metadata(exp_id, **metadata)
 
     def _create_experiment(self, exp_id: int, data: dict):
         if get_experiment(exp_id):
@@ -1471,7 +1529,9 @@ class SessionTracker:
                 finished_at=data.get("finished_at"), env_vars=data.get("env_vars"),
                 gpus=data.get("gpus", 1), gpu_type=data.get("gpu_type", "H100"),
                 git_commit=data.get("git_commit"), parent_hash=data.get("parent_hash"),
-                kernels_path=data.get("kernels_path"), session_name=self.session_name,
+                kernels_path=data.get("kernels_path"),
+                dependencies=data.get("dependencies"),
+                session_name=self.session_name,
                 session_id=self.config.session_id,
             )
             self.event(f"Created experiment {exp_id} ({Path(script).name})")
@@ -1483,6 +1543,7 @@ class LocalMetricsDaemon:
     def __init__(self, dashboard_port: int = 8080, no_dashboard: bool = False):
         self.running = True
         self.trackers: Dict[str, SessionTracker] = {}
+        self.tracker_configs: Dict[str, SessionConfig] = {}
         self.hub_syncer: Optional[HubSyncer] = None
         self.interactive = False
         self.dashboard_port = dashboard_port
@@ -1495,6 +1556,11 @@ class LocalMetricsDaemon:
 
     def _start_tracker(self, config: SessionConfig):
         from .session_connector import get_connector
+        self.tracker_configs[config.name] = config
+        if getattr(config, "bootstrap", False):
+            # Provision-only session: no daemon to track, no hub namespace.
+            self.trackers[config.name] = None  # sentinel: intentionally untracked
+            return
         connector = get_connector(config.name)
         if not connector.needs_session_tracker:
             self.trackers[config.name] = None  # sentinel: served by HubSyncer
@@ -1506,6 +1572,7 @@ class LocalMetricsDaemon:
 
     def _stop_tracker(self, name: str):
         tracker = self.trackers.pop(name, None)
+        self.tracker_configs.pop(name, None)
         if tracker is not None and isinstance(tracker, SessionTracker):
             tracker.stop()
             log.info(f"Stopped tracker for '{name}'")
@@ -1648,6 +1715,10 @@ class LocalMetricsDaemon:
                         self._start_tracker(current[name])
                     for name in set(self.trackers) - set(current):
                         self._stop_tracker(name)
+                    for name in set(current) & set(self.trackers):
+                        if self.tracker_configs.get(name) != current[name]:
+                            self._stop_tracker(name)
+                            self._start_tracker(current[name])
                 if self.interactive and tick % 5 == 0:
                     self._check_reconnect()
         except KeyboardInterrupt:

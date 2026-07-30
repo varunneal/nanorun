@@ -20,7 +20,10 @@ def sync_logs_down(session_name: str) -> Optional[List[str]]:
     if session_config and session_config.session_type == "iris":
         backend = hub._IrisBackend(session_config)
         return backend.sync_logs_down(session_logs_dir, session_name)
-    return hub.sync_logs_down(session_logs_dir, session_name)
+    hub_namespace = (
+        session_config.hub_namespace if session_config else session_name
+    )
+    return hub.sync_logs_down(session_logs_dir, hub_namespace)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

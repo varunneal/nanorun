@@ -15,13 +15,13 @@ TRACK_FILE = ".track.json"
 
 @dataclass
 class SessionConfig:
-    """Configuration for a remote session."""
+    """Configuration for an execution session."""
     name: str  # Session name (e.g. "session-1", "my-h100")
     host: str = ""
     user: str = ""
     port: int = 22
     cuda_version: Optional[str] = None
-    gpu_type: str = "H100"  # H100, H200, GH200, A100, L4, B200, RTX_PRO_6000, BLACKWELL, DGX_SPARK
+    gpu_type: str = "H100"  # Blackwell: B200, RTX_PRO_6000, BLACKWELL, DGX_SPARK | Hopper: H100, H200, GH200 | Ampere: A100, A40, A30, A16, A10G, A10, A6000, A5000, A4000, A2 | Ada: L40S, L40, L4 | Apple: MPS
     gpu_count: int = 1  # Number of GPUs on the machine
     has_sudo: bool = True
     repo_path: str = "~/nanorun"
@@ -29,7 +29,7 @@ class SessionConfig:
     key_file: Optional[str] = None  # Path to SSH private key (-i flag)
     ssh_options: Optional[List[str]] = None  # Extra SSH -o options (e.g. ["IdentitiesOnly=yes"])
     use_pty: bool = False  # Request PTY for exec (needed for RunPod SSH proxy)
-    session_type: str = "ssh"  # "ssh" or "iris"
+    session_type: str = "ssh"  # "ssh", "local", or "iris"
     iris_config: Optional[str] = None  # Path to iris cluster yaml
     iris_binary: Optional[str] = None  # Path to iris CLI binary (default: "iris" on PATH)
     iris_user: Optional[str] = None  # Iris job prefix user
@@ -41,6 +41,17 @@ class SessionConfig:
     # incarnations, so it's not unique over time; started_at pins this config to one
     # incarnation. None for pre-upgrade sessions (they fall back to bare name below).
     started_at: Optional[str] = None
+    # Local sessions own a globally unique Git branch and Hub namespace.  The
+    # path-safe workspace_id is shared by both (`nanorun/local/{workspace_id}`
+    # and `logs/{workspace_id}/...`) so parallel devices never publish into one
+    # another's branch or artifact prefix.
+    workspace_id: Optional[str] = None
+    git_branch: Optional[str] = None
+    # Bootstrap sessions exist only to provision a machine that will run its own
+    # local session (`session start --local` on the machine itself). The observer
+    # daemon never tracks them, and `session setup` installs the nanorun CLI
+    # instead of starting a remote daemon.
+    bootstrap: bool = False
 
     @property
     def session_id(self) -> str:
@@ -54,6 +65,18 @@ class SessionConfig:
         their behavior is exactly as before.
         """
         return f"{self.name}::{self.started_at}" if self.started_at else self.name
+
+    @property
+    def hub_namespace(self) -> str:
+        """Hub path component for this session.
+
+        SSH and Iris sessions retain their historical name-based layout. Local
+        sessions created before workspace IDs were introduced also fall back to
+        their name until they are migrated by session start/sync.
+        """
+        if self.session_type == "local" and self.workspace_id:
+            return self.workspace_id
+        return self.name
 
 
 @dataclass
@@ -269,9 +292,26 @@ class Config:
     def save(self) -> None:
         """Save the current session to disk and set it as active."""
         if self.session:
-            session_file = self._get_session_file(self.session.name)
-            session_file.write_text(json.dumps(asdict(self.session), indent=2))
+            self.save_session(self.session)
             self.set_active_session(self.session.name)
+
+    @classmethod
+    def save_session(cls, session: SessionConfig) -> None:
+        """Persist one session without changing the active-session pointer."""
+        session_file = cls._get_session_file(session.name)
+        session_file.write_text(json.dumps(asdict(session), indent=2))
+
+    @classmethod
+    def hub_namespace_for(
+        cls,
+        name: str,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Resolve the Hub namespace for a currently configured incarnation."""
+        session = cls.load_session(name)
+        if session and (session_id is None or session.session_id == session_id):
+            return session.hub_namespace
+        return name
 
     @classmethod
     def delete_session(cls, name: str) -> Tuple[bool, int]:
@@ -322,6 +362,25 @@ class Config:
     def get_session_state_dir(cls, name: str) -> Path:
         """Get per-session state directory (.nanorun/sessions/{name}/), creating if needed."""
         d = cls.get_sessions_dir() / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @classmethod
+    def get_executor_dir(cls, name: str) -> Path:
+        """Get the local execution-daemon state directory for a session."""
+        d = cls.get_session_state_dir(name) / "executor"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @classmethod
+    def get_executor_endpoint_file(cls, name: str) -> Path:
+        """Get the loopback RPC endpoint file for a local execution daemon."""
+        return cls.get_executor_dir(name) / "endpoint.json"
+
+    @classmethod
+    def get_session_logs_dir(cls, name: str) -> Path:
+        """Get the materialized local artifact directory for a session."""
+        d = cls.get_config_dir() / "logs" / name
         d.mkdir(parents=True, exist_ok=True)
         return d
 

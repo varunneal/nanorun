@@ -372,15 +372,28 @@ async def get_sessions():
         if sc.session_type == "iris":
             host = "iris controller"
             status = "iris"
+        elif sc.session_type == "local":
+            host = "this device"
+            status = state.status
+        elif getattr(sc, "bootstrap", False):
+            # Provision-only: never tracked, so "disconnected" would be noise.
+            host = f"{sc.user}@{sc.host}:{sc.port}"
+            status = "bootstrap"
         else:
             host = f"{sc.user}@{sc.host}:{sc.port}"
             status = state.status
         result.append({
             "name": sc.name,
+            "session_type": sc.session_type,
+            "bootstrap": getattr(sc, "bootstrap", False),
             "host": host,
             "gpu_type": sc.gpu_type,
             "gpu_count": sc.gpu_count,
             "status": status,
+            "git_branch": sc.git_branch if sc.session_type == "local" else None,
+            "hub_namespace": (
+                sc.hub_namespace if sc.session_type == "local" else None
+            ),
             "sync_paused": getattr(sc, "sync_paused", False),
             "last_error": state.last_error,
             "metrics_synced": state.metrics_synced,
@@ -423,6 +436,19 @@ async def delete_session(name: str):
     import shutil
     from ..local_daemon import SessionState
 
+    session_config = Config.load_session(name)
+    if not session_config:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    if session_config.session_type == "local":
+        from ..remote_control import local_session_removal_blocker
+
+        blocker = local_session_removal_blocker(session_config)
+        if blocker:
+            return JSONResponse(
+                {"error": f"Cannot remove local session: {blocker}"},
+                status_code=400,
+            )
+
     state = SessionState.load(name)
     if state.status == "connected":
         return JSONResponse(
@@ -430,8 +456,10 @@ async def delete_session(name: str):
             status_code=400,
         )
     # Removing local connection metadata does not prove remote work stopped.
-    Config.delete_session(name)
-    state_dir = Config.get_session_state_dir(name)
+    removed, _ = Config.delete_session(name)
+    if not removed:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    state_dir = Config.get_sessions_dir() / name
     if state_dir.exists():
         shutil.rmtree(state_dir, ignore_errors=True)
     daemon = getattr(app.state, "daemon", None)
@@ -566,6 +594,9 @@ async def get_experiment_detail(exp_id: int):
         "gpu_type": exp.gpu_type,
         "env_vars": exp.env_vars,
         "git_commit": exp.git_commit,
+        "parent_hash": exp.parent_hash,
+        "kernels_path": exp.kernels_path,
+        "dependencies": exp.dependencies,
         "tmux_window": exp.tmux_window,
         "crash_log": get_crash_log_content(exp.id),
         "session_name": exp.session_name,

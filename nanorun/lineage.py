@@ -2,30 +2,14 @@
 
 import difflib
 import hashlib
-import re
 from pathlib import Path
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Mapping, Optional, Tuple, TYPE_CHECKING
 
 from .config import Config, get_repo_root
+from .script_manifest import compute_script_hash, parse_script_manifest
 
 if TYPE_CHECKING:
     from .remote_control import RemoteSession
-
-
-# Pattern to match parent declaration in script frontmatter
-# Matches: """parent: /path/to/script""" or '''parent: path/to/script'''
-# Also handles multiline docstrings with parent on its own line
-PARENT_PATTERN = re.compile(
-    r'^["\']{3}\s*\n?\s*parent:\s*([^\n"\']+)',
-    re.MULTILINE
-)
-
-# Pattern to match kernels declaration in script frontmatter
-# Matches: """kernels: path/to/kernels.py""" or with parent first
-KERNELS_PATTERN = re.compile(
-    r'kernels:\s*([^\n"\']+)',
-    re.MULTILINE
-)
 
 
 def get_diffs_dir() -> Path:
@@ -48,10 +32,7 @@ def parse_parent_path(script_content: str) -> Optional[str]:
     Returns:
         Parent path if found, None otherwise (root node)
     """
-    match = PARENT_PATTERN.search(script_content)
-    if match:
-        return match.group(1).strip()
-    return None
+    return parse_script_manifest(script_content).parent
 
 
 def parse_kernels_path(script_content: str) -> Optional[str]:
@@ -66,10 +47,13 @@ def parse_kernels_path(script_content: str) -> Optional[str]:
     Returns:
         Kernels path if found, None otherwise
     """
-    match = KERNELS_PATTERN.search(script_content)
-    if match:
-        return match.group(1).strip()
-    return None
+    return parse_script_manifest(script_content).kernels
+
+
+def parse_dependencies(script_content: str) -> dict[str, str]:
+    """Parse module-to-path dependency declarations from frontmatter."""
+
+    return parse_script_manifest(script_content).dependency_map
 
 
 def read_local_file(path: str) -> Optional[str]:
@@ -111,34 +95,30 @@ def compute_file_hash(path: str) -> Optional[str]:
     return compute_content_hash(content)
 
 
-def compute_combined_hash(script_path: str, kernels_path: Optional[str] = None) -> Optional[str]:
-    """Compute combined hash of script + kernels file.
+def compute_combined_hash(
+    script_path: str,
+    kernels_path: Optional[str] = None,
+    dependencies: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Compute the combined hash of a script and its declared code files.
 
-    If kernels_path is None or file not found, falls back to script-only hash.
-    Concatenates: script_bytes + b'\\n---KERNELS---\\n' + kernels_bytes
+    The legacy script-plus-kernels hash format is preserved when no generic
+    dependencies are declared.
 
     Args:
         script_path: Path to the script (relative to repo root)
         kernels_path: Optional path to the kernels file (relative to repo root)
+        dependencies: Optional module-to-path dependency mapping
 
     Returns:
         First 12 chars of SHA256 hash, or None if script not found
     """
-    repo_root = get_repo_root()
-    script_full = repo_root / script_path
-    if not script_full.exists():
-        return None
-
-    script_bytes = script_full.read_bytes()
-
-    if kernels_path:
-        kernels_full = repo_root / kernels_path
-        if kernels_full.exists():
-            kernels_bytes = kernels_full.read_bytes()
-            combined = script_bytes + b'\n---KERNELS---\n' + kernels_bytes
-            return compute_content_hash(combined)
-
-    return compute_content_hash(script_bytes)
+    return compute_script_hash(
+        get_repo_root(),
+        script_path,
+        kernels_path=kernels_path,
+        dependencies=dependencies,
+    )
 
 
 def get_parent_info(script_path: str) -> Tuple[Optional[str], Optional[str]]:
@@ -202,8 +182,10 @@ def generate_combined_diff(
     parent_path: str,
     child_kernels: Optional[str],
     parent_kernels: Optional[str],
+    child_dependencies: Optional[Mapping[str, str]] = None,
+    parent_dependencies: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
-    """Generate unified diff for script + kernels.
+    """Generate a unified diff for an entrypoint and declared dependencies.
 
     Output format:
     --- parent_script
@@ -229,37 +211,42 @@ def generate_combined_diff(
     if script_diff is None:
         return None
 
-    # If neither has kernels, return just the script diff
-    if not child_kernels and not parent_kernels:
+    child_files = dict(child_dependencies or {})
+    parent_files = dict(parent_dependencies or {})
+    if child_kernels:
+        child_files["triton_kernels"] = child_kernels
+    if parent_kernels:
+        parent_files["triton_kernels"] = parent_kernels
+
+    if not child_files and not parent_files:
         return script_diff
 
-    # Generate kernels diff
     parts = [script_diff]
-
-    # Separator between script and kernels diffs
-    parts.append("\n" + "=" * 80 + "\n")
-
-    # Get kernels content (or empty for /dev/null)
-    parent_kernels_content = read_local_file(parent_kernels) if parent_kernels else ""
-    child_kernels_content = read_local_file(child_kernels) if child_kernels else ""
-
-    # Handle None returns from read_local_file
-    if parent_kernels_content is None:
-        parent_kernels_content = ""
-    if child_kernels_content is None:
-        child_kernels_content = ""
-
-    parent_kernels_lines = parent_kernels_content.splitlines(keepends=True) if parent_kernels_content else []
-    child_kernels_lines = child_kernels_content.splitlines(keepends=True) if child_kernels_content else []
-
-    # Generate kernels diff
-    kernels_diff = difflib.unified_diff(
-        parent_kernels_lines,
-        child_kernels_lines,
-        fromfile=parent_kernels or "/dev/null",
-        tofile=child_kernels or "/dev/null",
-    )
-    parts.append("".join(kernels_diff))
+    for module in sorted(set(parent_files) | set(child_files)):
+        parent_dependency = parent_files.get(module)
+        child_dependency = child_files.get(module)
+        parent_content = (
+            read_local_file(parent_dependency) if parent_dependency else ""
+        ) or ""
+        child_content = (
+            read_local_file(child_dependency) if child_dependency else ""
+        ) or ""
+        dependency_diff = "".join(
+            difflib.unified_diff(
+                parent_content.splitlines(keepends=True),
+                child_content.splitlines(keepends=True),
+                fromfile=parent_dependency or "/dev/null",
+                tofile=child_dependency or "/dev/null",
+            )
+        )
+        if not dependency_diff:
+            continue
+        parts.append(
+            "\n"
+            + "=" * 80
+            + f"\ndependency: {module}\n"
+            + dependency_diff
+        )
 
     return "".join(parts)
 
@@ -320,8 +307,22 @@ def process_lineage(
         # Parent declared but not found
         return parent_path, None, None
 
+    child_content = read_local_file(script_path)
+    parent_content = read_local_file(parent_path)
+    if child_content is None or parent_content is None:
+        return parent_path, parent_hash, None
+    child_manifest = parse_script_manifest(child_content)
+    parent_manifest = parse_script_manifest(parent_content)
+
     # Generate and store diff
-    diff_content = generate_diff(script_path, parent_path)
+    diff_content = generate_combined_diff(
+        script_path,
+        parent_path,
+        child_manifest.kernels,
+        parent_manifest.kernels,
+        child_manifest.dependency_map,
+        parent_manifest.dependency_map,
+    )
     if diff_content:
         diff_path = store_diff(child_hash, diff_content)
         return parent_path, parent_hash, diff_path

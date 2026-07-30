@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
@@ -86,6 +86,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "deleted": "INTEGER DEFAULT 0",
         "gpu_type": "TEXT DEFAULT 'H100'",
         "kernels_path": "TEXT",
+        "dependencies": "TEXT",
         "session_name": "TEXT",
         "session_id": "TEXT",
         "queue_command": "TEXT",
@@ -197,6 +198,7 @@ class Experiment:
     started_at: datetime
     finished_at: Optional[datetime]
     kernels_path: Optional[str] = None
+    dependencies: Dict[str, str] = field(default_factory=dict)
     session_name: Optional[str] = None
     session_id: Optional[str] = None  # {name}::{started_at} — per-incarnation scope key
 
@@ -225,6 +227,11 @@ class Experiment:
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
             kernels_path=row["kernels_path"] if "kernels_path" in keys else None,
+            dependencies=(
+                json.loads(row["dependencies"])
+                if "dependencies" in keys and row["dependencies"]
+                else {}
+            ),
             session_name=row["session_name"] if "session_name" in keys else None,
             session_id=row["session_id"] if "session_id" in keys else None,
         )
@@ -287,6 +294,7 @@ def create_experiment(
     gpu_type: str = "H100",
     run_number: Optional[int] = None,
     tmux_window: Optional[str] = None,
+    dependencies: Optional[Dict[str, str]] = None,
     session_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> int:
@@ -294,8 +302,8 @@ def create_experiment(
     conn = get_db()
     cursor = conn.execute(
         """
-        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, session_name, session_id, queue_command)
-        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :session_name, :session_id, :queue_command)
+        INSERT INTO experiments (name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, run_number, tmux_window, dependencies, session_name, session_id, queue_command)
+        VALUES (:name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :run_number, :tmux_window, :dependencies, :session_name, :session_id, :queue_command)
         """,
         {
             "name": name,
@@ -309,6 +317,7 @@ def create_experiment(
             "gpu_type": gpu_type,
             "run_number": run_number,
             "tmux_window": tmux_window,
+            "dependencies": json.dumps(dependencies or {}, sort_keys=True),
             "session_name": session_name,
             "session_id": session_id,
             "queue_command": _build_queue_command(script, env_vars),
@@ -509,6 +518,7 @@ def update_experiment_metadata(
     git_commit: Optional[str] = None,
     parent_hash: Optional[str] = None,
     kernels_path: Optional[str] = None,
+    dependencies: Optional[Dict[str, str]] = None,
     session_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> None:
@@ -542,6 +552,9 @@ def update_experiment_metadata(
     if kernels_path is not None:
         updates.append("kernels_path = ?")
         params.append(kernels_path)
+    if dependencies is not None:
+        updates.append("dependencies = ?")
+        params.append(json.dumps(dependencies, sort_keys=True))
     if session_name is not None:
         updates.append("session_name = ?")
         params.append(session_name)
@@ -709,6 +722,7 @@ def create_experiment_from_mapping(
     git_commit: Optional[str] = None,
     parent_hash: Optional[str] = None,
     kernels_path: Optional[str] = None,
+    dependencies: Optional[Dict[str, str]] = None,
     session_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> int:
@@ -723,8 +737,8 @@ def create_experiment_from_mapping(
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, session_name, session_id, queue_command)
-        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :session_name, :session_id, :queue_command)
+        INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, dependencies, session_name, session_id, queue_command)
+        VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :dependencies, :session_name, :session_id, :queue_command)
         ON CONFLICT(id) DO NOTHING
         """,
         {
@@ -744,6 +758,7 @@ def create_experiment_from_mapping(
             "started_at": started_at,
             "finished_at": finished_at,
             "kernels_path": kernels_path,
+            "dependencies": json.dumps(dependencies or {}, sort_keys=True),
             "session_name": session_name,
             "session_id": session_id,
             "queue_command": _build_queue_command(script, env_vars),

@@ -381,10 +381,10 @@ function selectHeatmapCell(expIds) {
 }
 
 function computeResidualData(validData) {
-    const completedData = validData.filter(d => d.status === 'completed');
-    if (completedData.length < 2) return null;
+    const chartableData = validData.filter(d => d.status !== 'queued');
+    if (chartableData.length < 2) return null;
 
-    const curves = completedData.map(d => ({
+    const curves = chartableData.map(d => ({
         id: d.id,
         name: d.name,
         script: d.script,
@@ -444,21 +444,17 @@ function computeResidualData(validData) {
 
 function getEligibleViews(validData) {
     const views = [];
-    const completedData = validData.filter(d => d.status === 'completed');
-    const runningOrCompleted = validData.filter(d =>
-        d.status === 'running' || d.status === 'completed'
-    );
+    const chartableData = validData.filter(d => d.status !== 'queued');
 
     if (!isBucketKey(State.get('selectedExp'))) {
         const { processed } = getHeatmapData(validData);
         if (computeHeatmapData(processed)) views.push('heatmap');
     }
 
-    // Residual: >=2 completed
-    if (completedData.length >= 2) views.push('residual');
+    // Curve-based views remain useful for failed, cancelled, and unknown runs.
+    if (chartableData.length >= 2) views.push('residual');
 
-    // Line: >=1 running/completed
-    if (runningOrCompleted.length >= 1) views.push('line');
+    if (chartableData.length >= 1) views.push('line');
 
     return views;
 }
@@ -577,7 +573,7 @@ function switchChartView(viewName, updateState = true) {
         case 'line':
             canvas.style.display = 'block';
             heatmapContainer.style.display = 'none';
-            const runs = getVisibleRuns().map(d => ({
+            const runs = getVisibleRuns().filter(d => d.status !== 'queued').map(d => ({
                 name: d.name,
                 script: d.script,
                 data: d.loss_curve,

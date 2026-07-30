@@ -701,6 +701,10 @@ main {
     color: var(--text-secondary);
 }
 
+.status-badge.unknown {
+    color: var(--info);
+}
+
 .exp-progress {
     display: flex;
     align-items: center;
@@ -1233,6 +1237,10 @@ main {
 
 .status-badge-sm.cancelled {
     color: var(--text-secondary);
+}
+
+.status-badge-sm.unknown {
+    color: var(--info);
 }
 
 .log-sep {
@@ -2548,4 +2556,3 @@ main {
         padding: 1rem;
     }
 }
-

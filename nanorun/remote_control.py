@@ -13,9 +13,12 @@ import json
 import os
 import shlex
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 import paramiko
@@ -31,6 +34,13 @@ console = Console()
 
 TMUX_SESSION = "nanorun"
 DAEMON_WINDOW = "daemon"
+LOCAL_RPC_HOST = "127.0.0.1"
+
+
+def get_local_device_lock_file() -> Path:
+    """Return the cross-checkout lock used by a local GPU execution daemon."""
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"nanorun-local-gpu-{uid}.lock"
 
 
 # =============================================================================
@@ -392,6 +402,56 @@ class RemoteSession:
         """Attach to tmux session interactively."""
         return self.run_interactive(f"tmux attach -t {self.config.tmux_session}")
 
+
+class LocalSession(RemoteSession):
+    """Runs the RemoteSession command interface on the current machine."""
+
+    def __init__(self, config: SessionConfig):
+        super().__init__(config)
+
+    def close(self):
+        """Local command execution has no persistent connection to close."""
+        return None
+
+    def run(self, command: str, timeout: Optional[int] = 30) -> CommandResult:
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=self.config.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return CommandResult(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                returncode=result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return CommandResult(
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
+                returncode=-1,
+            )
+        except Exception as exc:
+            return CommandResult(stdout="", stderr=str(exc), returncode=-1)
+
+    def run_with_agent(self, command: str, timeout: Optional[int] = 30) -> CommandResult:
+        return self.run(command, timeout=timeout)
+
+    def run_interactive(self, command: str) -> int:
+        return subprocess.run(
+            ["bash", "-lc", command],
+            cwd=self.config.repo_path,
+        ).returncode
+
+    def test_connection(self) -> Tuple[bool, str]:
+        repo = Path(self.config.repo_path)
+        if repo.is_dir():
+            return True, "Local session ready"
+        return False, f"Repository not found: {repo}"
+
+
 def _find_sole_connected_session() -> Optional[str]:
     """If exactly one session is connected, return its name."""
     from .local_daemon import SessionState
@@ -427,9 +487,11 @@ def resolve_session_config(session_name: Optional[str] = None) -> Optional[Sessi
 
 
 def get_session(session_name: Optional[str] = None) -> Optional[RemoteSession]:
-    """Get a remote session. Uses named session or falls back to active."""
+    """Get a command session. Uses named session or falls back to active."""
     sc = resolve_session_config(session_name)
     if sc:
+        if sc.session_type == "local":
+            return LocalSession(sc)
         return RemoteSession(sc)
     return None
 
@@ -457,10 +519,10 @@ class DaemonError(Exception):
 
 
 class DaemonClient:
-    """Client for communicating with the remote nanorun daemon via WebSocket RPC.
+    """Client for communicating with a nanorun execution daemon via WebSocket RPC.
 
-    Manages an SSH tunnel and WebSocket connection.  Provides the same public API
-    as the previous file-based IPC client so existing callers continue to work.
+    SSH sessions use a tunnel; local sessions use the daemon's published
+    loopback endpoint. Provides one common public API to callers.
     """
 
     def __init__(self, remote: RemoteSession):
@@ -540,6 +602,9 @@ class DaemonClient:
         if self.is_daemon_running():
             return True
 
+        if self.remote.config.session_type == "local":
+            return self._ensure_local_daemon()
+
         console.print("[dim]Starting remote daemon...[/dim]")
 
         # Ensure tmux session exists
@@ -578,13 +643,98 @@ class DaemonClient:
         console.print("[yellow]Daemon may not have started properly[/yellow]")
         return False
 
+    def _ensure_local_daemon(self) -> bool:
+        """Start a session-scoped execution daemon on the current machine."""
+        config = self.remote.config
+        repo_path = Path(config.repo_path).resolve()
+        executor_dir = Config.get_executor_dir(config.name).resolve()
+        artifacts_dir = Config.get_session_logs_dir(config.name).resolve()
+        endpoint_file = Config.get_executor_endpoint_file(config.name).resolve()
+        daemon_log = executor_dir / "daemon.log"
+        python_bin = repo_path / ".venv" / "bin" / "python"
+        if not python_bin.is_file():
+            python_bin = Path(sys.executable)
+
+        try:
+            endpoint_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        tmux_session = config.tmux_session
+        self.remote.run(
+            f"tmux has-session -t {shlex.quote(tmux_session)} 2>/dev/null || "
+            f"tmux new-session -d -s {shlex.quote(tmux_session)} "
+            f"-c {shlex.quote(str(repo_path))}",
+            timeout=10,
+        )
+        # Remove only a stale daemon window. Experiment windows remain alive.
+        self.remote.run(
+            f"tmux kill-window -t "
+            f"{shlex.quote(f'{tmux_session}:{DAEMON_WINDOW}')} 2>/dev/null || true",
+            timeout=10,
+        )
+
+        daemon_args = [
+            str(python_bin),
+            "-u",
+            "-m",
+            "nanorun.remote_daemon",
+            "--session",
+            config.name,
+            "--hub-session",
+            config.hub_namespace,
+            "--repo-dir",
+            str(repo_path),
+            "--state-dir",
+            str(executor_dir),
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--endpoint-file",
+            str(endpoint_file),
+            "--device-lock-file",
+            str(get_local_device_lock_file()),
+            "--listen-host",
+            LOCAL_RPC_HOST,
+            "--port",
+            "0",
+            "--tmux-session",
+            tmux_session,
+        ]
+        daemon_cmd = (
+            f"cd {shlex.quote(str(repo_path))} && "
+            + " ".join(shlex.quote(arg) for arg in daemon_args)
+            + f" 2>&1 | tee -a {shlex.quote(str(daemon_log))}"
+        )
+        result = self.remote.run(
+            f"tmux new-window -t {shlex.quote(tmux_session)} "
+            f"-n {shlex.quote(DAEMON_WINDOW)} {shlex.quote(daemon_cmd)}",
+            timeout=10,
+        )
+        if not result.success:
+            console.print(
+                f"[red]Failed to start local execution daemon: {result.stderr}[/red]"
+            )
+            return False
+
+        for _ in range(30):
+            time.sleep(0.25)
+            if self.is_daemon_running():
+                console.print("[green]Local execution daemon started[/green]")
+                return True
+        console.print(
+            f"[yellow]Local execution daemon did not become responsive. "
+            f"See {daemon_log}[/yellow]"
+        )
+        return False
+
     def stop_daemon(self) -> bool:
         """Stop the remote daemon by killing its tmux window.
 
         Returns True if daemon was stopped, False if not running.
         """
+        tmux_session = self.remote.config.tmux_session
         result = self.remote.run(
-            f"tmux list-windows -t {TMUX_SESSION} -F '#W' 2>/dev/null "
+            f"tmux list-windows -t {shlex.quote(tmux_session)} -F '#W' 2>/dev/null "
             f"| grep -q '^{DAEMON_WINDOW}$'",
             timeout=10,
         )
@@ -592,7 +742,8 @@ class DaemonClient:
             return False  # Not running
 
         result = self.remote.run(
-            f"tmux kill-window -t {TMUX_SESSION}:{DAEMON_WINDOW}",
+            f"tmux kill-window -t "
+            f"{shlex.quote(f'{tmux_session}:{DAEMON_WINDOW}')}",
             timeout=10,
         )
 
@@ -756,3 +907,84 @@ def get_daemon_client(session_name: Optional[str] = None) -> Optional[DaemonClie
     if not remote:
         return None
     return DaemonClient(remote)
+
+
+def local_session_removal_blocker(config: SessionConfig) -> Optional[str]:
+    """Explain why a local session cannot be safely removed, if applicable.
+
+    SessionState belongs to the observer daemon and is not execution authority.
+    Removal is safe only after the execution daemon and its tmux workspace have
+    stopped and the persisted executor state has no active or queued work.
+    """
+    if config.session_type != "local":
+        return None
+
+    local = LocalSession(config)
+    client = DaemonClient(local)
+    try:
+        if client.is_daemon_running():
+            try:
+                status = client.get_status()
+            except DaemonError as error:
+                return f"local execution daemon status is unavailable: {error}"
+            current = status.get("current_experiment_id")
+            queue_length = int(status.get("queue_length") or 0)
+            if current:
+                return f"local experiment {current} is still running"
+            if queue_length:
+                return f"local execution queue still has {queue_length} job(s)"
+            return (
+                "local execution daemon is still running; "
+                "run 'nanorun session stop' first"
+            )
+    finally:
+        client.close()
+
+    executor_dir = Config.get_sessions_dir() / config.name / "executor"
+    endpoint_file = executor_dir / "endpoint.json"
+    try:
+        endpoint = json.loads(endpoint_file.read_text())
+        endpoint_pid = int(endpoint["pid"])
+        try:
+            os.kill(endpoint_pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return f"local execution daemon PID {endpoint_pid} may still be running"
+        else:
+            return f"local execution daemon PID {endpoint_pid} is still running"
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+
+    state_file = executor_dir / "state.json"
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, TypeError, json.JSONDecodeError):
+        state = {}
+    current = state.get("current_experiment_id")
+    if current or state.get("status") == "running":
+        suffix = f" {current}" if current else ""
+        return (
+            f"persisted executor state says experiment{suffix} may still be running; "
+            "restart the execution daemon to reconcile it"
+        )
+
+    queue_file = executor_dir / "queue.txt"
+    try:
+        queued_lines = [
+            line
+            for line in queue_file.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except OSError:
+        queued_lines = []
+    if queued_lines:
+        return f"persisted local execution queue still has {len(queued_lines)} job(s)"
+
+    if local.tmux_session_exists():
+        return (
+            "local tmux workspace still exists; "
+            "run 'nanorun session stop' first"
+        )
+
+    return None

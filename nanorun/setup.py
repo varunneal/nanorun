@@ -66,29 +66,30 @@ def resolve_repo_path(remote: RemoteSession, configured_path: str) -> str:
     return configured_path
 
 
+_GPU_MATCH_ORDER = [
+    # (substring_to_match, returned_type) — order matters: longer/more-specific first
+    ("GB10", "DGX_SPARK"), ("DGX SPARK", "DGX_SPARK"),
+    ("B200", "B200"), ("RTX PRO 6000", "RTX_PRO_6000"),
+    ("BLACKWELL", "BLACKWELL"), ("B100", "BLACKWELL"),
+    ("GH200", "GH200"), ("H200", "H200"), ("H100", "H100"),
+    ("A100", "A100"), ("A40", "A40"), ("A30", "A30"), ("A16", "A16"),
+    ("A10G", "A10G"), ("A10", "A10"),
+    ("A6000", "A6000"), ("A5000", "A5000"), ("A4000", "A4000"), ("A2", "A2"),
+    ("L40S", "L40S"), ("L40", "L40"), ("L4", "L4"),
+]
+
+
 def detect_gpu_type(remote: RemoteSession) -> str:
-    """Detect GPU type from nvidia-smi output."""
+    """Detect GPU type from nvidia-smi output, falling back to MPS on macOS."""
     result = remote.run("nvidia-smi --query-gpu=name --format=csv,noheader | head -1")
     if result.success:
         name = result.stdout.strip().upper()
-        if "GB10" in name or "DGX SPARK" in name:
-            return "DGX_SPARK"
-        elif "B200" in name:
-            return "B200"
-        elif "RTX PRO 6000" in name and "BLACKWELL" in name:
-            return "RTX_PRO_6000"
-        elif "BLACKWELL" in name or "B100" in name:
-            return "BLACKWELL"
-        elif "GH200" in name:
-            return "GH200"
-        elif "H200" in name:
-            return "H200"
-        elif "H100" in name:
-            return "H100"
-        elif "A100" in name:
-            return "A100"
-        elif "L4" in name:
-            return "L4"
+        for substr, gpu_type in _GPU_MATCH_ORDER:
+            if substr in name:
+                return gpu_type
+    mps_check = remote.run("python3 -c \"import torch; print(torch.backends.mps.is_available())\"")
+    if mps_check.success and mps_check.stdout.strip() == "True":
+        return "MPS"
     return "H100"
 
 
@@ -138,6 +139,113 @@ def get_flash_attn_install_cmd(cuda_version: str) -> str:
     )
 
 
+# ─── Bootstrap git auth ──────────────────────────────────────────────────────
+
+
+def _gather_bootstrap_git_auth() -> tuple[Optional[dict], list[str]]:
+    """Collect this machine's GitHub SSH key + git identity for bootstrapping.
+
+    The machine's own local session must push its nanorun/local/* branch, so it
+    needs standing GitHub auth (agent forwarding only lives as long as our SSH
+    connection). Same trust model as the HF token setup already ships.
+
+    Returns (git_auth dict or None, warnings). Keys: key_name, key_b64, pub_b64,
+    user_name, user_email.
+    """
+    import base64
+    import subprocess
+    from pathlib import Path
+
+    warnings: list[str] = []
+
+    def _git_config(key: str) -> str:
+        r = subprocess.run(
+            ["git", "config", "--get", key], capture_output=True, text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    user_name = _git_config("user.name")
+    user_email = _git_config("user.email")
+    if not user_name or not user_email:
+        warnings.append("local git user.name/user.email not set; commit identity not provisioned")
+
+    # The key ssh would actually offer to github.com
+    key_path = None
+    r = subprocess.run(
+        ["ssh", "-G", "github.com"], capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            if line.startswith("identityfile "):
+                candidate = Path(line.split(None, 1)[1]).expanduser()
+                if candidate.is_file():
+                    key_path = candidate
+                    break
+    if not key_path:
+        warnings.append("no SSH key for github.com found on this machine; git auth not provisioned")
+        return None, warnings
+
+    pub_path = key_path.with_suffix(key_path.suffix + ".pub")
+    git_auth = {
+        "key_name": key_path.name,
+        "key_b64": base64.b64encode(key_path.read_bytes()).decode(),
+        "pub_b64": (
+            base64.b64encode(pub_path.read_bytes()).decode()
+            if pub_path.is_file() else None
+        ),
+        "user_name": user_name,
+        "user_email": user_email,
+    }
+    return git_auth, warnings
+
+
+def _gather_agent_auth() -> tuple[dict, list[str]]:
+    """Collect Claude Code + Codex credentials from this machine (best effort).
+
+    Claude Code keeps OAuth credentials in the macOS keychain (service
+    "Claude Code-credentials") or in ~/.claude/.credentials.json on Linux.
+    Codex keeps them in ~/.codex/auth.json. Missing credentials downgrade to a
+    warning — the tools are still installed, just not signed in.
+    """
+    import base64
+    import subprocess
+    from pathlib import Path
+
+    warnings: list[str] = []
+    auth: dict = {}
+
+    creds = None
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            creds = r.stdout.strip()
+    except OSError:
+        pass  # not macOS
+    if not creds:
+        creds_file = Path.home() / ".claude" / ".credentials.json"
+        if creds_file.is_file():
+            creds = creds_file.read_text()
+    if creds:
+        auth["claude_creds_b64"] = base64.b64encode(creds.encode()).decode()
+    else:
+        warnings.append(
+            "Claude Code credentials not found locally; run 'claude login' on the machine"
+        )
+
+    codex_auth = Path.home() / ".codex" / "auth.json"
+    if codex_auth.is_file():
+        auth["codex_auth_b64"] = base64.b64encode(codex_auth.read_bytes()).decode()
+    else:
+        warnings.append(
+            "Codex auth.json not found locally; run 'codex login' on the machine"
+        )
+
+    return auth, warnings
+
+
 # ─── Setup script generation ─────────────────────────────────────────────────
 
 
@@ -147,6 +255,9 @@ def _generate_setup_script(
     cuda_version: str,
     sudo_prefix: str,
     hf_token: Optional[str],
+    install_cli: bool = False,
+    git_auth: Optional[dict] = None,
+    agent_auth: Optional[dict] = None,
 ) -> str:
     """Generate a bash script that runs the entire setup in one shot on the remote.
 
@@ -181,6 +292,125 @@ PID_HF=$!
         hf_block = """
 echo "STATUS:hf_auth:FAIL:no local HF token"
 PID_HF=""
+"""
+
+    # nanorun CLI block (bootstrap sessions only). Installed as a uv tool into an
+    # isolated venv (~/.local/bin/nanorun) so it never touches the training .venv.
+    # Editable install: later git pulls update the CLI code automatically.
+    if install_cli:
+        cli_block = """
+# ── nanorun CLI (parallel; needs uv + cloned repo, independent of .venv) ──
+(
+  OUT=$(uv tool install -e "$REPO" --force 2>&1)
+  if [ $? -eq 0 ]; then
+    uv tool update-shell >/dev/null 2>&1 || true
+    echo "STATUS:nanorun_cli:OK:installed to ~/.local/bin/nanorun"
+  else
+    echo "STATUS:nanorun_cli:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"
+  fi
+) &
+PID_CLI=$!
+"""
+    else:
+        cli_block = """
+PID_CLI=""
+"""
+
+    # Git auth block (bootstrap sessions only): standing GitHub access so the
+    # machine's own local session can push its nanorun/local/* branch.
+    if git_auth:
+        key_name = git_auth["key_name"]
+        name_sh = git_auth["user_name"].replace("'", "'\\''")
+        email_sh = git_auth["user_email"].replace("'", "'\\''")
+        pub_write = ""
+        if git_auth.get("pub_b64"):
+            pub_write = (
+                f"echo '{git_auth['pub_b64']}' | base64 -d > "
+                f"$HOME_DIR/.ssh/{key_name}.pub && chmod 644 $HOME_DIR/.ssh/{key_name}.pub"
+            )
+        identity_cmds = ""
+        if git_auth["user_name"] and git_auth["user_email"]:
+            identity_cmds = (
+                f"  git config --global user.name '{name_sh}'\n"
+                f"  git config --global user.email '{email_sh}'\n"
+            )
+        git_block = f"""
+# ── git auth (parallel; SSH key + identity for the machine's own sessions) ──
+(
+  mkdir -p $HOME_DIR/.ssh && chmod 700 $HOME_DIR/.ssh
+  if [ ! -f "$HOME_DIR/.ssh/{key_name}" ]; then
+    echo '{git_auth['key_b64']}' | base64 -d > $HOME_DIR/.ssh/{key_name}
+    chmod 600 $HOME_DIR/.ssh/{key_name}
+  fi
+  {pub_write}
+  if ! grep -qs "IdentityFile ~/.ssh/{key_name}" $HOME_DIR/.ssh/config; then
+    printf "Host github.com\\n    IdentityFile ~/.ssh/{key_name}\\n    IdentitiesOnly yes\\n    StrictHostKeyChecking accept-new\\n" >> $HOME_DIR/.ssh/config
+  fi
+{identity_cmds}  echo "STATUS:git_auth:OK:{key_name} installed"
+) &
+PID_GIT=$!
+"""
+    else:
+        git_block = """
+PID_GIT=""
+"""
+
+    # Coding agents block (bootstrap sessions only, best effort): install Claude
+    # Code and Codex into ~/.local/bin and drop in this machine's credentials so
+    # both are signed in. agent_auth is a (possibly empty) dict in bootstrap mode.
+    if agent_auth is not None:
+        claude_cred_write = ""
+        if agent_auth.get("claude_creds_b64"):
+            claude_cred_write = f"""mkdir -p $HOME_DIR/.claude
+  echo '{agent_auth["claude_creds_b64"]}' | base64 -d > $HOME_DIR/.claude/.credentials.json
+  chmod 600 $HOME_DIR/.claude/.credentials.json
+  [ -f $HOME_DIR/.claude.json ] || echo '{{"hasCompletedOnboarding": true}}' > $HOME_DIR/.claude.json"""
+        codex_cred_write = ""
+        if agent_auth.get("codex_auth_b64"):
+            codex_cred_write = f"""mkdir -p $HOME_DIR/.codex
+  echo '{agent_auth["codex_auth_b64"]}' | base64 -d > $HOME_DIR/.codex/auth.json
+  chmod 600 $HOME_DIR/.codex/auth.json"""
+        agents_block = f"""
+# ── Claude Code (parallel; native installer, no sudo) ──
+(
+  {claude_cred_write}
+  if [ -x $HOME_DIR/.local/bin/claude ]; then
+    echo "STATUS:claude_code:OK:already installed"
+  else
+    OUT=$(curl -fsSL https://claude.ai/install.sh | bash 2>&1)
+    if [ -x $HOME_DIR/.local/bin/claude ]; then
+      echo "STATUS:claude_code:OK:installed"
+    else
+      echo "STATUS:claude_code:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"
+    fi
+  fi
+) &
+PID_CLAUDE=$!
+
+# ── Codex CLI (parallel; release binary, arch-aware, no node needed) ──
+(
+  {codex_cred_write}
+  mkdir -p $HOME_DIR/.local/bin
+  if [ -x $HOME_DIR/.local/bin/codex ]; then
+    echo "STATUS:codex:OK:already installed"
+  else
+    ARCH=$(uname -m)
+    OUT=$(curl -fsSL https://github.com/openai/codex/releases/latest/download/codex-$ARCH-unknown-linux-musl.tar.gz | tar -xz -C $HOME_DIR/.local/bin 2>&1)
+    [ -f $HOME_DIR/.local/bin/codex-$ARCH-unknown-linux-musl ] && mv $HOME_DIR/.local/bin/codex-$ARCH-unknown-linux-musl $HOME_DIR/.local/bin/codex
+    if [ -e $HOME_DIR/.local/bin/codex ]; then
+      chmod +x $HOME_DIR/.local/bin/codex
+      echo "STATUS:codex:OK:installed"
+    else
+      echo "STATUS:codex:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"
+    fi
+  fi
+) &
+PID_CODEX=$!
+"""
+    else:
+        agents_block = """
+PID_CLAUDE=""
+PID_CODEX=""
 """
 
     script = f"""#!/bin/bash
@@ -267,6 +497,9 @@ PID_TORCH=$!
 PID_DEPS=$!
 
 {hf_block}
+{cli_block}
+{git_block}
+{agents_block}
 
 # Wait for deps (data needs huggingface-hub; hf login needs huggingface-hub)
 wait $PID_DEPS
@@ -312,6 +545,10 @@ PID_FLASH=$!
 wait $PID_FLASH
 wait $PID_DATA
 [ -n "$PID_HF" ] && wait $PID_HF
+[ -n "$PID_CLI" ] && wait $PID_CLI
+[ -n "$PID_GIT" ] && wait $PID_GIT
+[ -n "$PID_CLAUDE" ] && wait $PID_CLAUDE
+[ -n "$PID_CODEX" ] && wait $PID_CODEX
 
 echo "STATUS:DONE"
 """
@@ -328,19 +565,23 @@ class SetupFailure:
         self.detail = detail
 
 
-def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
+def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = False) -> None:
     """Run fast, non-interactive setup on remote machine.
 
     Ships a single bash script to the remote that handles all parallelism natively.
     Only 3 SSH round-trips: detect environment, run setup script, start daemon.
+
+    In bootstrap mode the nanorun CLI is also installed on the machine and no
+    daemon is started — the machine will run its own local session instead.
     """
     t0 = time.time()
-    config = Config.load()
+    session = remote.config
     failures: list[SetupFailure] = []
 
     console.print(Panel.fit(
         "[bold cyan]nanorun setup[/bold cyan]\n"
-        "Single-script fast provisioning.",
+        + ("Bootstrap provisioning (no daemon, installs nanorun CLI)."
+           if bootstrap else "Single-script fast provisioning."),
         title="Setup"
     ))
 
@@ -377,22 +618,22 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     sudo_prefix = "sudo " if needs_sudo else ""
     console.print(f"  sudo: {'needed' if needs_sudo else 'not needed (root)'}")
 
-    config.session.cuda_version = cuda_version
-    config.session.has_sudo = needs_sudo
-    config.save()
+    session.cuda_version = cuda_version
+    session.has_sudo = needs_sudo
+    Config.save_session(session)
 
     # Resolve repo path from detected HOME
-    repo_path = config.session.repo_path
+    repo_path = session.repo_path
     if repo_path.startswith("~"):
         detected_home = detect_info.get("HOME", "").strip()
         if detected_home and detected_home != "/":
             repo_path = repo_path.replace("~", detected_home, 1)
         elif detect_info.get("UID") == "0":
             repo_path = repo_path.replace("~", "/root", 1)
-    if repo_path != config.session.repo_path:
+    if repo_path != session.repo_path:
         console.print(f"  [yellow]HOME misconfigured, using: {repo_path}[/yellow]")
-        config.session.repo_path = repo_path
-        config.save()
+        session.repo_path = repo_path
+        Config.save_session(session)
 
     home_dir = str(PurePosixPath(repo_path).parent)
 
@@ -403,6 +644,18 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     # Get HF token
     from .hub import get_local_token
     hf_token = get_local_token()
+
+    # Bootstrap machines run their own sessions, so they need standing git auth
+    # and get signed-in coding agents (Claude Code + Codex, best effort)
+    git_auth = None
+    agent_auth = None
+    if bootstrap:
+        git_auth, git_warnings = _gather_bootstrap_git_auth()
+        for warning in git_warnings:
+            failures.append(SetupFailure("git_auth", warning))
+        agent_auth, agent_warnings = _gather_agent_auth()
+        for warning in agent_warnings:
+            failures.append(SetupFailure("agents", warning))
 
     # ── Git clone/pull (needs agent forwarding, separate SSH call) ───────────
     console.print("\n[bold]Syncing repository...[/bold]")
@@ -435,6 +688,9 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
         cuda_version=cuda_version,
         sudo_prefix=sudo_prefix,
         hf_token=hf_token,
+        install_cli=bootstrap,
+        git_auth=git_auth,
+        agent_auth=agent_auth,
     )
 
     # Ship script via stdin and execute
@@ -482,17 +738,20 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
         failures.append(SetupFailure("setup script", f"Script failed: {result.stderr[:200]}"))
         console.print(f"  [red]Setup script failed to run[/red]")
 
-    # ── Start daemon (1 SSH call) ─────────────────────────────────────────────
-    console.print("\n[bold]Starting daemon...[/bold]")
-    with DaemonClient(remote) as daemon:
-        if daemon.is_daemon_running():
-            console.print("  [green]daemon: already running[/green]")
-        else:
-            if daemon.restart_daemon():
-                console.print("  [green]daemon: started[/green]")
+    # ── Start daemon (1 SSH call) — skipped for bootstrap sessions ────────────
+    if bootstrap:
+        console.print("\n[dim]Bootstrap session — not starting a daemon.[/dim]")
+    else:
+        console.print("\n[bold]Starting daemon...[/bold]")
+        with DaemonClient(remote) as daemon:
+            if daemon.is_daemon_running():
+                console.print("  [green]daemon: already running[/green]")
             else:
-                failures.append(SetupFailure("daemon", "Failed to start remote daemon"))
-                console.print("  [red]daemon: FAILED to start[/red]")
+                if daemon.restart_daemon():
+                    console.print("  [green]daemon: started[/green]")
+                else:
+                    failures.append(SetupFailure("daemon", "Failed to start remote daemon"))
+                    console.print("  [red]daemon: FAILED to start[/red]")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -507,11 +766,22 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False) -> None:
     else:
         console.print("[bold green]Setup complete — no failures.[/bold green]")
 
+    if bootstrap:
+        console.print(Panel.fit(
+            f"ssh {session.user}@{session.host}\n"
+            f"cd {repo_path}\n"
+            "nanorun session start --local\n"
+            "nanorun local start\n\n"
+            "[dim]Use a fresh login shell so ~/.local/bin is on PATH.[/dim]",
+            title="Next steps (on the machine itself)",
+            border_style="cyan",
+        ))
+
 
 def verify_setup(remote: RemoteSession) -> bool:
     """Verify that the remote machine is properly set up."""
-    config = Config.load()
-    configured_path = config.session.repo_path if config.session else "~/nanorun"
+    session = remote.config
+    configured_path = session.repo_path if session else "~/nanorun"
     repo_path = resolve_repo_path(remote, configured_path)
 
     console.print(Panel.fit(
@@ -533,6 +803,29 @@ def verify_setup(remote: RemoteSession) -> bool:
         ("GolfSP8192", f"test -f {repo_path}/experiments/parameter-golf/datasets/fineweb10B_sp8192/fineweb_val_000000.bin && echo 'exists'", "param golf sp8192"),
         ("HFAuth", f"cd {repo_path} && source .venv/bin/activate 2>/dev/null && hf auth whoami 2>/dev/null | head -1", "HuggingFace auth"),
     ]
+
+    if getattr(session, "bootstrap", False):
+        checks.append((
+            "CLI",
+            "test -x $HOME/.local/bin/nanorun && echo 'installed'",
+            "nanorun CLI",
+        ))
+        checks.append((
+            "GitSSH",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com 2>&1 "
+            "| grep -o 'successfully authenticated'",
+            "GitHub SSH auth",
+        ))
+        checks.append((
+            "ClaudeCode",
+            "test -x $HOME/.local/bin/claude && echo 'installed'",
+            "Claude Code",
+        ))
+        checks.append((
+            "Codex",
+            "test -x $HOME/.local/bin/codex && echo 'installed'",
+            "Codex CLI",
+        ))
 
     for name, cmd, desc in checks:
         result = remote.run(cmd, timeout=30)

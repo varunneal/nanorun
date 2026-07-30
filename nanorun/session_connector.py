@@ -2,6 +2,7 @@
 
 Two implementations:
   - SshConnector: wraps DaemonClient RPC + queue.py + runner.py
+  - LocalConnector: same daemon protocol over loopback, using the local worktree
   - IrisConnector: shells out to iris CLI
 """
 
@@ -278,14 +279,168 @@ class SshConnector(SessionConnector):
         return p if p.is_file() and p.suffix == ".py" else None
 
     def check_unsynced(self, script: str) -> bool:
-        from .sync import has_unsynced_changes
-        return has_unsynced_changes(files=[script], session_name=self.session_name)
+        from .sync import expand_declared_files, has_unsynced_changes
+        files = expand_declared_files([script])
+        return has_unsynced_changes(files=files, session_name=self.session_name)
 
     def sync_file(self, script: str) -> None:
         from .remote_control import require_session
-        from .sync import push_code
+        from .sync import expand_declared_files, push_code
         remote = require_session(self.session_name)
-        push_code(remote, message=None, files=[script])
+        files = expand_declared_files([script])
+        push_code(remote, message=None, files=files)
+
+
+# =============================================================================
+# Local GPU Connector
+# =============================================================================
+
+
+class LocalConnector(SshConnector):
+    """Daemon-backed job operations on the current machine."""
+
+    def check_unsynced(self, script: str) -> bool:
+        from .sync import (
+            ensure_local_daemon_namespace,
+            ensure_local_session_branch,
+            expand_declared_files,
+            has_unsynced_changes,
+        )
+
+        config = Config.load_session(self.session_name)
+        if not config:
+            raise ValueError(f"Local session '{self.session_name}' no longer exists")
+        ensure_local_session_branch(config, switch_if_needed=False)
+        daemon_ready, _restarted = ensure_local_daemon_namespace(config)
+        if not daemon_ready:
+            raise ValueError(
+                "The local execution daemon could not reload its unique Hub namespace"
+            )
+        files = expand_declared_files([script])
+        return has_unsynced_changes(
+            files=files,
+            session_name=self.session_name,
+            expected_upstream=f"origin/{config.git_branch}",
+        )
+
+    def sync_file(self, script: str) -> None:
+        from .sync import expand_declared_files, push_local_code
+
+        config = Config.load_session(self.session_name)
+        if not config:
+            raise ValueError(f"Local session '{self.session_name}' no longer exists")
+        files = expand_declared_files([script])
+        push_local_code(config, message=None, files=files)
+
+    def logs(
+        self,
+        job_id: Optional[str] = None,
+        tail: bool = False,
+        lines: int = 50,
+    ) -> ConnectorResult:
+        import time
+        from .remote_control import require_session
+        from .tracker import get_experiment, get_running_experiments
+
+        target_window = None
+        if job_id:
+            try:
+                experiment = get_experiment(int(job_id))
+            except (TypeError, ValueError):
+                experiment = None
+            target_window = (
+                experiment.tmux_window if experiment and experiment.tmux_window else job_id
+            )
+        if target_window is None:
+            running = get_running_experiments(
+                session_name=self.session_name,
+                session_id=Config.session_id_for(self.session_name),
+            )
+            if running:
+                target_window = running[0].tmux_window
+        if not target_window:
+            return ConnectorResult(
+                success=False,
+                message="No running experiment found",
+            )
+
+        local = require_session(self.session_name)
+        if tail:
+            try:
+                while True:
+                    output = local.get_tmux_output(target_window, lines=lines)
+                    print("\033[2J\033[H", end="")
+                    print(output)
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        else:
+            print(local.get_tmux_output(target_window, lines=lines))
+        return ConnectorResult(success=True)
+
+
+# =============================================================================
+# Bootstrap Connector
+# =============================================================================
+
+
+class BootstrapConnector(SshConnector):
+    """Provision-only sessions: job operations are intentionally unavailable.
+
+    Inherits SshConnector only for resolve_script (repo-root path resolution);
+    everything that would touch a daemon is refused with a pointer to the
+    machine's own local session.
+    """
+
+    needs_session_tracker = False
+
+    _MESSAGE = (
+        "This is a bootstrap (provision-only) session. Run jobs from the machine "
+        "itself: ssh in and use 'nanorun session start --local'."
+    )
+
+    def _unsupported(self) -> ConnectorResult:
+        return ConnectorResult(success=False, unsupported=True, message=self._MESSAGE)
+
+    def submit(self, script, env_vars, name, track, gpus=1, gpu_type="H100",
+               prefix=None, first=False, **kwargs) -> SubmitResult:
+        return SubmitResult(error=self._MESSAGE)
+
+    def sweep(self, script, configs, name, track, gpus=1, gpu_type="H100",
+              prefix=None, **kwargs) -> List[SubmitResult]:
+        return [SubmitResult(error=self._MESSAGE)]
+
+    def queue(self) -> List[QueueItem]:
+        return []
+
+    def queue_meta(self) -> QueueMeta:
+        return QueueMeta(live=True)
+
+    def status(self) -> List[QueueItem]:
+        return []
+
+    def cancel(self, job_id=None) -> ConnectorResult:
+        return self._unsupported()
+
+    def logs(self, job_id=None, tail=False, lines=50) -> ConnectorResult:
+        # Not "unsupported": job_logs treats unsupported as "fall back to tmux",
+        # which would end in a misleading "no running experiment" message.
+        return ConnectorResult(success=False, message=self._MESSAGE)
+
+    def resume(self) -> ConnectorResult:
+        return self._unsupported()
+
+    def clear(self) -> ConnectorResult:
+        return self._unsupported()
+
+    def remove(self, index: int) -> ConnectorResult:
+        return self._unsupported()
+
+    def check_unsynced(self, script: str) -> bool:
+        return False
+
+    def sync_file(self, script: str) -> None:
+        pass
 
 
 # =============================================================================
@@ -565,6 +720,10 @@ class IrisConnector(SessionConnector):
 def get_connector(session_name: str) -> SessionConnector:
     """Get the appropriate connector for a session."""
     sc = Config.load_session(session_name)
+    if sc and getattr(sc, "bootstrap", False):
+        return BootstrapConnector(session_name)
     if sc and sc.session_type == "iris":
         return IrisConnector(sc)
+    if sc and sc.session_type == "local":
+        return LocalConnector(session_name)
     return SshConnector(session_name)

@@ -1,5 +1,7 @@
 """CLI entry point for nanorun."""
 
+import getpass
+import re
 import sys
 from pathlib import Path
 
@@ -9,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import Config, SessionConfig, Track, discover_tracks, get_track, get_repo_root, infer_track_from_path
-from .remote_control import RemoteSession, get_session, require_session, resolve_session_config
+from .remote_control import LocalSession, RemoteSession, get_session, require_session, resolve_session_config
 
 console = Console()
 
@@ -23,13 +25,25 @@ def _resolve_script_path(script: str) -> str:
         return script
 
 
-def _require_ssh_session(session_name: str) -> bool:
-    """Check that session is SSH type. Prints error and returns False for iris."""
+def _require_command_session(session_name: str) -> bool:
+    """Check that a session supports the shared command/tmux interface."""
     sc = resolve_session_config(session_name)
     if sc and sc.session_type == "iris":
         console.print(f"[yellow]This command is not available for iris sessions.[/yellow]")
         return False
     return True
+
+
+def _print_local_observer_hint() -> None:
+    """Explain the separate observer daemon when it is not already running."""
+    from .local_daemon import is_daemon_running
+
+    if not is_daemon_running():
+        console.print(
+            "[yellow]The local execution daemon is running, but the observer daemon "
+            "is not. Run 'nanorun local start' to keep SQLite metrics and session "
+            "state updated.[/yellow]"
+        )
 
 
 def _resolve_session(ctx, param, value):
@@ -147,23 +161,159 @@ def cli():
 
 @cli.group()
 def session():
-    """Manage remote SSH sessions."""
+    """Manage execution sessions."""
     pass
 
 
 @session.command("start")
-@click.argument("host")
+@click.argument("host", required=False)
+@click.option("--local", "local_session", is_flag=True, help="Use this machine as the GPU session")
+@click.option("--bootstrap", "bootstrap_session", is_flag=True, help="Provision-only session: set the machine up to run its own local session (never tracked, no daemon)")
 @click.option("--port", "-p", default=22, help="SSH port")
 @click.option("--gpu-type", default=None, help="Override GPU type (H100, H200, GH200, DGX_SPARK)")
 @click.option("--key-file", "-i", default=None, help="Path to SSH private key file")
 @click.option("--ssh-option", "-o", multiple=True, help="Extra SSH -o options (e.g. -o IdentitiesOnly=yes)")
 @click.option("--name", "-n", default=None, help="Session name (auto-generated if not specified)")
-def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str):
-    """Connect to a remote machine.
+def session_start(host: str | None, local_session: bool, bootstrap_session: bool, port: int, gpu_type: str, key_file: str, ssh_option: tuple, name: str):
+    """Connect to a GPU machine or use this machine.
 
     HOST should be in format user@hostname or just hostname (defaults to root@).
     """
     from .setup import detect_gpu_type, detect_gpu_count
+
+    if local_session:
+        if host:
+            raise click.UsageError("HOST cannot be used together with --local")
+        if bootstrap_session:
+            raise click.UsageError("--bootstrap cannot be used together with --local")
+        if key_file or ssh_option or port != 22:
+            raise click.UsageError("SSH options cannot be used together with --local")
+
+        name = name or "local"
+        repo_root = get_repo_root().resolve()
+        other_local_sessions = [
+            session
+            for session in Config.list_sessions()
+            if session.session_type == "local" and session.name != name
+        ]
+        if other_local_sessions:
+            existing_names = ", ".join(s.name for s in other_local_sessions)
+            raise click.UsageError(
+                "This device already has a local execution session "
+                f"({existing_names}). Switch to it or remove it safely before "
+                "creating another."
+            )
+
+        existing = Config.load_session(name)
+        if existing:
+            if existing.session_type != "local":
+                raise click.UsageError(
+                    f"Session name '{name}' is already used by a "
+                    f"{existing.session_type} session"
+                )
+            if Path(existing.repo_path).resolve() != repo_root:
+                raise click.UsageError(
+                    f"Local session '{name}' points at {existing.repo_path}, "
+                    f"not this repository ({repo_root})"
+                )
+            if gpu_type:
+                existing.gpu_type = gpu_type
+            from .sync import ensure_local_session_branch
+
+            try:
+                ensure_local_session_branch(existing, switch_if_needed=True)
+            except ValueError as error:
+                console.print(f"[red]{error}[/red]")
+                raise SystemExit(1)
+            Config(session=existing).save()
+            from .remote_control import get_daemon_client
+            daemon_client = get_daemon_client(name)
+            daemon_ready = False
+            if daemon_client:
+                if daemon_client.is_daemon_running():
+                    status = daemon_client.get_status()
+                    if status.get("hub_session") != existing.hub_namespace:
+                        daemon_ready = daemon_client.restart_daemon()
+                    else:
+                        daemon_ready = True
+                else:
+                    daemon_ready = daemon_client.ensure_running()
+            if not daemon_ready:
+                console.print(
+                    f"[red]Could not reactivate local session '{name}'.[/red]"
+                )
+                raise SystemExit(1)
+            console.print(
+                f"[green]Local session '{name}' reactivated. "
+                f"Branch: {existing.git_branch}. "
+                f"Hub namespace: {existing.hub_namespace}.[/green]"
+            )
+            _print_local_observer_hint()
+            return
+
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "local"
+        session_config = SessionConfig(
+            name=name,
+            host="localhost",
+            user=getpass.getuser(),
+            port=0,
+            repo_path=str(repo_root),
+            tmux_session=f"nanorun-{safe_name}",
+            session_type="local",
+        )
+        execution_session = LocalSession(session_config)
+        success, msg = execution_session.test_connection()
+        if not success:
+            console.print(f"[red]Local session failed: {msg}[/red]")
+            raise SystemExit(1)
+
+        console.print(f"[cyan]Using this machine as session '{name}'[/cyan]")
+        if gpu_type:
+            session_config.gpu_type = gpu_type
+            console.print(f"[dim]GPU type: {gpu_type} (override)[/dim]")
+        else:
+            session_config.gpu_type = detect_gpu_type(execution_session)
+            console.print(f"[dim]GPU type: {session_config.gpu_type} (detected)[/dim]")
+        session_config.gpu_count = detect_gpu_count(execution_session)
+        console.print(f"[dim]GPU count: {session_config.gpu_count} (detected)[/dim]")
+
+        if not execution_session.check_tmux():
+            console.print("[red]tmux is required for local execution but was not found.[/red]")
+            raise SystemExit(1)
+
+        from datetime import datetime, timezone
+        session_config.started_at = datetime.now(timezone.utc).isoformat()
+        from .sync import ensure_local_session_branch
+
+        try:
+            ensure_local_session_branch(session_config, switch_if_needed=True)
+        except ValueError as error:
+            console.print(f"[red]{error}[/red]")
+            raise SystemExit(1)
+
+        if not execution_session.create_tmux_session():
+            console.print("[red]Could not create the local tmux session.[/red]")
+            raise SystemExit(1)
+        Config(session=session_config).save()
+
+        from .remote_control import get_daemon_client
+        daemon_client = get_daemon_client(name)
+        if not daemon_client or not daemon_client.ensure_running():
+            console.print(
+                "[red]Local session was saved, but its execution daemon did not start.[/red]"
+            )
+            raise SystemExit(1)
+
+        console.print(
+            f"[green]Local session '{name}' started. "
+            f"Branch: {session_config.git_branch}. "
+            f"Hub namespace: {session_config.hub_namespace}.[/green]"
+        )
+        _print_local_observer_hint()
+        return
+
+    if not host:
+        raise click.UsageError("HOST is required unless --local is used")
 
     if "@" in host:
         user, hostname = host.split("@", 1)
@@ -192,6 +342,7 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
         port=port,
         key_file=key_file,
         ssh_options=list(ssh_option) if ssh_option else None,
+        bootstrap=bootstrap_session,
     )
 
     remote = RemoteSession(session_config)
@@ -220,8 +371,11 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
     session_config.gpu_count = gpu_count
     console.print(f"[dim]GPU count: {gpu_count} (detected)[/dim]")
 
-    # Check for tmux
-    if not remote.check_tmux():
+    # Check for tmux. Bootstrap sessions skip this: setup installs tmux, and the
+    # machine's own local session creates its own tmux workspace later.
+    if bootstrap_session:
+        pass
+    elif not remote.check_tmux():
         console.print("[yellow]Warning: tmux not found on remote. Some features may not work.[/yellow]")
     else:
         console.print("[dim]tmux available[/dim]")
@@ -240,19 +394,39 @@ def session_start(host: str, port: int, gpu_type: str, key_file: str, ssh_option
     config = Config(session=session_config)
     config.save()
 
-    console.print(f"[green]Session '{name}' started! Config saved to .nanorun/sessions/{name}.json[/green]")
+    if bootstrap_session:
+        console.print(f"[green]Bootstrap session '{name}' created.[/green]")
+        console.print("Run [cyan]nanorun session setup[/cyan] to provision the machine.")
+    else:
+        console.print(f"[green]Session '{name}' started! Config saved to .nanorun/sessions/{name}.json[/green]")
 
 
 @session.command("stop")
 def session_stop():
-    """Disconnect from remote machine and cleanup."""
+    """Disconnect from the active execution session."""
     config = Config.load()
     if not config.session:
         console.print("[yellow]No active session.[/yellow]")
         return
 
-    remote = RemoteSession(config.session)
-    host = f"{config.session.user}@{config.session.host}"
+    remote = get_session(config.session.name)
+    if not remote:
+        return
+    is_local = config.session.session_type == "local"
+    host = "this device" if is_local else f"{config.session.user}@{config.session.host}"
+
+    if is_local:
+        from .remote_control import get_daemon_client
+        daemon_client = get_daemon_client(config.session.name)
+        if daemon_client and daemon_client.is_daemon_running():
+            status = daemon_client.get_status()
+            if status.get("current_experiment_id"):
+                console.print(
+                    "[red]A local experiment is still running. Cancel it explicitly "
+                    "before stopping the session.[/red]"
+                )
+                raise SystemExit(1)
+            daemon_client.stop_daemon()
 
     # Kill tmux session
     if remote.tmux_session_exists():
@@ -282,11 +456,20 @@ def session_cleanup():
     for sc in sessions:
         state = SessionState.load(sc.name)
         if state.status == "disconnected":
+            if sc.session_type == "local":
+                from .remote_control import local_session_removal_blocker
+
+                blocker = local_session_removal_blocker(sc)
+                if blocker:
+                    console.print(
+                        f"  Skipped [bold]{sc.name}[/bold]: {blocker}"
+                    )
+                    continue
             # Connectivity is not execution authority: removing local connection
             # metadata preserves every experiment's last-known state.
             Config.delete_session(sc.name)
             # Remove per-session state dir
-            state_dir = Config.get_session_state_dir(sc.name)
+            state_dir = Config.get_sessions_dir() / sc.name
             if state_dir.exists():
                 shutil.rmtree(state_dir, ignore_errors=True)
             console.print(f"  Removed [bold]{sc.name}[/bold] ({sc.user}@{sc.host})")
@@ -310,19 +493,28 @@ def session_status(session_name):
         return
 
     s = config.session
-    remote = RemoteSession(s)
+    remote = get_session(s.name)
+    if not remote:
+        return
 
     table = Table(title="Session Status")
     table.add_column("Property", style="cyan")
     table.add_column("Value")
 
     table.add_row("Session", s.name)
-    table.add_row("Host", f"{s.user}@{s.host}:{s.port}")
+    table.add_row("Type", f"{s.session_type} (bootstrap)" if s.bootstrap else s.session_type)
+    table.add_row(
+        "Host",
+        "this device" if s.session_type == "local" else f"{s.user}@{s.host}:{s.port}",
+    )
     table.add_row("GPU Type", s.gpu_type)
     table.add_row("GPU Count", str(getattr(s, 'gpu_count', 1)))
     table.add_row("CUDA Version", s.cuda_version or "[dim]not detected[/dim]")
     table.add_row("Has sudo", "yes" if s.has_sudo else "no")
     table.add_row("Repo path", s.repo_path)
+    if s.session_type == "local":
+        table.add_row("Git branch", s.git_branch or "[dim]not initialized[/dim]")
+        table.add_row("Hub namespace", s.hub_namespace)
 
     # Check connection
     success, _ = remote.test_connection()
@@ -367,6 +559,16 @@ def session_list():
             gpu_str = "TPU"
             status_color = "green"
             status_str = f"[{status_color}]iris[/{status_color}]"
+        elif s.session_type == "local":
+            host_str = "[dim]this device[/dim]"
+            gpu_str = f"{s.gpu_count}x {s.gpu_type}"
+            status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
+            status_str = f"[{status_color}]{state.status}[/{status_color}]"
+        elif s.bootstrap:
+            # Provision-only: never tracked, so a "disconnected" status would be noise.
+            host_str = f"{s.user}@{s.host}:{s.port}"
+            gpu_str = f"{s.gpu_count}x {s.gpu_type}"
+            status_str = "[cyan]bootstrap[/cyan]"
         else:
             host_str = f"{s.user}@{s.host}:{s.port}"
             gpu_str = f"{s.gpu_count}x {s.gpu_type}"
@@ -393,7 +595,8 @@ def session_switch(name: str):
     try:
         Config.set_active_session(name)
         session = Config.load_session(name)
-        console.print(f"[green]Switched to session '{name}' ({session.user}@{session.host})[/green]")
+        target = "this device" if session.session_type == "local" else f"{session.user}@{session.host}"
+        console.print(f"[green]Switched to session '{name}' ({target})[/green]")
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         sessions = Config.list_sessions()
@@ -406,8 +609,8 @@ def session_switch(name: str):
 @session.command("attach")
 @session_option
 def session_attach(session_name):
-    """Attach to the remote tmux session."""
-    if not _require_ssh_session(session_name):
+    """Attach to the session's tmux workspace."""
+    if not _require_command_session(session_name):
         return
     remote = require_session(session_name)
     if not remote.tmux_session_exists():
@@ -421,17 +624,20 @@ def session_attach(session_name):
 @click.option("--interactive", "-i", is_flag=True, help="Prompt for confirmation at each step")
 @session_option
 def session_setup(verify: bool, interactive: bool, session_name):
-    """Set up the remote machine for training."""
-    if not _require_ssh_session(session_name):
+    """Set up or verify an execution machine for training."""
+    if not _require_command_session(session_name):
         return
     from .setup import run_setup, verify_setup
 
     remote = require_session(session_name)
 
-    if verify:
+    sc = resolve_session_config(session_name)
+    if verify or (sc and sc.session_type == "local"):
+        if sc and sc.session_type == "local" and not verify:
+            console.print("[dim]Local sessions use the existing environment; verifying it.[/dim]")
         verify_setup(remote)
     else:
-        run_setup(remote, auto_yes=not interactive)
+        run_setup(remote, auto_yes=not interactive, bootstrap=bool(sc and sc.bootstrap))
 
 
 # ============================================================================
@@ -553,7 +759,7 @@ def track_info(name: str):
 @click.option("--no-verify", is_flag=True, help="Skip Python syntax check")
 @session_option
 def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_name):
-    """Push local code changes to remote (git commit + push + pull).
+    """Publish code for a session (and pull it onto SSH sessions).
 
     By default, syncs only the specified file(s). Use --all to sync everything.
 
@@ -562,9 +768,21 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
         nanorun sync experiments/muon/train.py experiments/muon/utils.py
         nanorun sync --all -m "big refactor"
     """
-    if not _require_ssh_session(session_name):
+    sc = resolve_session_config(session_name)
+    if not _require_command_session(session_name):
         return
-    from .sync import push_code
+    if sc and sc.bootstrap:
+        console.print(
+            "[yellow]Bootstrap sessions do not take code syncs — once the machine "
+            "runs its own local session, that session owns the worktree.[/yellow]"
+        )
+        console.print(
+            "[dim]To update its clone beforehand, re-run 'nanorun session setup' "
+            "or: nanorun exec 'cd ~/nanorun && git pull'[/dim]"
+        )
+        raise SystemExit(1)
+    from .sync import expand_declared_files, push_code, push_local_code
+    from .script_manifest import ManifestError
     from pathlib import Path
 
     if not files and not sync_all:
@@ -573,11 +791,8 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
         console.print("[dim]  nanorun sync --all[/dim]")
         raise SystemExit(1)
 
-    remote = require_session(session_name)
-
-    if sync_all:
-        push_code(remote, message, skip_syntax_check=no_verify)
-    else:
+    rel_files = None
+    if not sync_all:
         repo_root = get_repo_root()
         rel_files = []
         for f in files:
@@ -587,6 +802,29 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
                 console.print(f"[red]File {f} is not inside the repo[/red]")
                 raise SystemExit(1)
             rel_files.append(rel)
+        try:
+            rel_files = expand_declared_files(rel_files)
+        except ManifestError as error:
+            console.print(f"[red]{error}[/red]")
+            raise SystemExit(1)
+
+    if sc and sc.session_type == "local":
+        try:
+            push_local_code(
+                sc,
+                message,
+                skip_syntax_check=no_verify,
+                files=rel_files,
+            )
+        except ValueError as error:
+            console.print(f"[red]{error}[/red]")
+            raise SystemExit(1)
+        return
+
+    remote = require_session(session_name)
+    if sync_all:
+        push_code(remote, message, skip_syntax_check=no_verify)
+    else:
         push_code(remote, message, skip_syntax_check=no_verify, files=rel_files)
 
 
@@ -599,7 +837,7 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
 @click.option("-t", "--timeout", "timeout", default=30, type=int, help="Timeout in seconds (0 for none)")
 @session_option
 def remote_exec(command: tuple, timeout: int, session_name):
-    """Run a command on the remote machine.
+    """Run a command on the session machine.
 
     Examples:
         nanorun exec nvidia-smi
@@ -609,7 +847,7 @@ def remote_exec(command: tuple, timeout: int, session_name):
     """
     import sys as _sys
 
-    if not _require_ssh_session(session_name):
+    if not _require_command_session(session_name):
         raise SystemExit(1)
 
     # Read command from stdin if no arguments given
@@ -699,7 +937,7 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
     if not track:
         # For iris sessions, derive track from script path (e.g. experiments/grug/moe/launch.py → moe)
         track = connector.infer_track(script_rel)
-    if not track and (not sc or sc.session_type == "ssh"):
+    if not track and (not sc or sc.session_type in ("ssh", "local")):
         console.print(
             f"[red]No track found for {script_rel}.[/red]\n"
             "[dim]Create one in the script directory or an ancestor with: "
@@ -710,12 +948,19 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
         console.print(f"[dim]Track: {track}[/dim]")
 
     # Sync check (connector returns False if not applicable)
-    if connector.check_unsynced(script_rel):
-        console.print(f"[yellow]{script_rel} not synced with remote.[/yellow]")
-        if click.confirm("Sync before adding?", default=True):
-            connector.sync_file(script_rel)
-        else:
-            console.print("[dim]Proceeding without sync...[/dim]")
+    try:
+        if connector.check_unsynced(script_rel):
+            console.print(
+                f"[yellow]{script_rel} or a declared dependency is not synced "
+                "with remote.[/yellow]"
+            )
+            if click.confirm("Sync before adding?", default=True):
+                connector.sync_file(script_rel)
+            else:
+                console.print("[dim]Proceeding without sync...[/dim]")
+    except ValueError as error:
+        console.print(f"[red]{error}[/red]")
+        raise SystemExit(1)
 
     result = connector.submit(
         script_rel, env_dict, exp_name, track, gpus=gpus, gpu_type=gpu_type,
@@ -778,7 +1023,7 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
     track = infer_track_from_path(script_rel)
     if not track:
         track = connector.infer_track(script_rel)
-    if not track and (not sc or sc.session_type == "ssh"):
+    if not track and (not sc or sc.session_type in ("ssh", "local")):
         console.print(
             f"[red]No track found for {script_rel}.[/red]\n"
             "[dim]Create one in the script directory or an ancestor with: "
@@ -788,12 +1033,19 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
     if track:
         console.print(f"[dim]Track: {track}[/dim]")
 
-    if connector.check_unsynced(script_rel):
-        console.print(f"[yellow]{script_rel} not synced with remote.[/yellow]")
-        if click.confirm("Sync before sweeping?", default=True):
-            connector.sync_file(script_rel)
-        else:
-            console.print("[dim]Proceeding without sync...[/dim]")
+    try:
+        if connector.check_unsynced(script_rel):
+            console.print(
+                f"[yellow]{script_rel} or a declared dependency is not synced "
+                "with remote.[/yellow]"
+            )
+            if click.confirm("Sync before sweeping?", default=True):
+                connector.sync_file(script_rel)
+            else:
+                console.print("[dim]Proceeding without sync...[/dim]")
+    except ValueError as error:
+        console.print(f"[red]{error}[/red]")
+        raise SystemExit(1)
 
     configs = generate_sweep_configs(parse_sweep_env(env))
     console.print(f"[cyan]Adding {len(configs)} configurations to queue[/cyan]")
@@ -1504,33 +1756,26 @@ def local_daemon_crashes(show_all: bool, experiment_id: int):
 
 
 # ============================================================================
-# Remote daemon commands
+# Execution daemon commands
 # ============================================================================
 
 @cli.group()
 def daemon():
-    """Manage the remote nanorun daemon."""
+    """Manage the session execution daemon."""
     pass
 
 
 @daemon.command("status")
 @session_option
 def daemon_status(session_name):
-    """Show remote daemon status."""
+    """Show execution daemon status."""
     from .remote_control import DaemonError
 
     client = _require_daemon_client(session_name)
     if not client:
         return
 
-    # Check if daemon window exists
-    result = client.remote.run(
-        "tmux list-windows -t nanorun -F '#W' 2>/dev/null | grep -q '^daemon$'",
-        timeout=10,
-    )
-    window_exists = result.success
-
-    if not window_exists:
+    if not client.is_daemon_running() and "daemon" not in client.remote.get_tmux_windows():
         console.print("[bold red]Daemon not running[/bold red]")
         console.print("[dim]Start with: nanorun daemon restart[/dim]")
         return
@@ -1571,7 +1816,7 @@ def daemon_status(session_name):
 @daemon.command("stop")
 @session_option
 def daemon_stop(session_name):
-    """Stop the remote daemon."""
+    """Stop the execution daemon."""
     client = _require_daemon_client(session_name)
     if not client:
         return
@@ -1585,7 +1830,7 @@ def daemon_stop(session_name):
 @daemon.command("restart")
 @session_option
 def daemon_restart(session_name):
-    """Restart the remote daemon (picks up new code)."""
+    """Restart the execution daemon (picks up new code)."""
     from .remote_control import DaemonError
 
     client = _require_daemon_client(session_name)
@@ -1606,7 +1851,7 @@ def daemon_restart(session_name):
 @click.option("--tail", "-f", is_flag=True, help="Continuously watch logs")
 @session_option
 def daemon_logs(lines: int, tail: bool, session_name):
-    """View remote daemon logs from tmux."""
+    """View execution daemon logs from tmux."""
     import time
 
     client = _require_daemon_client(session_name)
@@ -1617,22 +1862,15 @@ def daemon_logs(lines: int, tail: bool, session_name):
         console.print("[dim]Press Ctrl+C to stop watching[/dim]")
         try:
             while True:
-                result = client.remote.run(
-                    f"tmux capture-pane -t nanorun:daemon -p -S -{lines}",
-                    timeout=10,
-                )
                 print("\033[2J\033[H", end="")  # Clear screen
-                print(result.stdout if result.success else "[No output]")
+                print(client.remote.get_tmux_output("daemon", lines=lines) or "[No output]")
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
     else:
-        result = client.remote.run(
-            f"tmux capture-pane -t nanorun:daemon -p -S -{lines}",
-            timeout=10,
-        )
-        if result.success:
-            print(result.stdout)
+        output = client.remote.get_tmux_output("daemon", lines=lines)
+        if output:
+            print(output)
         else:
             console.print("[yellow]Could not capture daemon output[/yellow]")
 
@@ -1687,8 +1925,12 @@ def hub_logs(experiment_id: int):
         return
 
     local_path = Config.get_config_dir() / "logs" / f"{exp.remote_run_id}.txt"
+    hub_namespace = Config.hub_namespace_for(
+        exp.session_name,
+        exp.session_id,
+    )
     try:
-        hub_mod.download_log(exp.remote_run_id, local_path, exp.session_name)
+        hub_mod.download_log(exp.remote_run_id, local_path, hub_namespace)
         print(local_path.read_text())
     except Exception as e:
         console.print(f"[red]Failed to fetch log: {e}[/red]")
@@ -1712,8 +1954,12 @@ def hub_weights(experiment_id: int, download: bool, output: str):
         console.print(f"[red]Experiment {experiment_id} has no session_name[/red]")
         return
 
+    hub_namespace = Config.hub_namespace_for(
+        exp.session_name,
+        exp.session_id,
+    )
     try:
-        filenames = hub_mod.list_weights(experiment_id, exp.session_name)
+        filenames = hub_mod.list_weights(experiment_id, hub_namespace)
     except Exception as e:
         console.print(f"[red]Failed to list weights: {e}[/red]")
         return
@@ -1733,7 +1979,7 @@ def hub_weights(experiment_id: int, download: bool, output: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     for f in sorted(filenames):
         console.print(f"  Downloading {f}...")
-        hub_mod.download_weight(experiment_id, f, out_dir / f, exp.session_name)
+        hub_mod.download_weight(experiment_id, f, out_dir / f, hub_namespace)
     console.print(f"[green]Downloaded {len(filenames)} files to {out_dir}[/green]")
 
 
