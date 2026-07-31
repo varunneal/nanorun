@@ -347,39 +347,134 @@ def replace_machine_local_identity(
     session,
     repo_path: str,
     old_workspace_id: str,
+    repo_url: Optional[str] = None,
 ) -> bool:
-    """Overwrite the machine's local-session identity with `session`'s fresh one.
+    """Rebuild the machine around `session`'s fresh local-session identity.
 
-    All tmux sessions on the machine are killed first (daemon, experiment
-    windows, coding agents) — otherwise the old daemon keeps publishing under
-    the retired namespace and recreates the dirs being archived. Then the old
-    session's state dir (executor, queue) and artifact dir move aside to
-    `...@{old_workspace_id}` so a restarted daemon cannot re-publish the
-    previous workspace's logs into the new namespace. The old branch and the
-    machine's experiment DB are left untouched.
+    A retired identity leaves far more than a stale seed behind: the worktree
+    sits on `nanorun/local/{old}` with that workspace's commits (and whatever a
+    coding agent left uncommitted), `.nanorun/` holds its queue, state and logs,
+    and `~/.local/bin/nanorun` is an editable install bound to that tree. So the
+    machine is rebuilt rather than patched:
+
+      1. kill every tmux session (daemon, experiments, coding agents) and the
+         detached watcher — anything left alive keeps publishing under the
+         retired namespace and recreates the directories being moved;
+      2. move the whole repository aside to `{repo_path}@{old_workspace_id}` —
+         nothing is deleted, and its committed work is already on the old branch;
+      3. clone fresh at the original path, carrying the venv and downloaded
+         dataset directories over from the archive so the follow-up
+         `session setup` stays a fast no-op instead of a multi-GB re-download;
+      4. write the new seed, so the machine's `session start --local` adopts it;
+      5. reinstall the nanorun CLI, whose editable install still points at the
+         tree that was just replaced.
+
+    Steps 1-4 are required; a failure there returns False with the archive left
+    intact for recovery. The CLI reinstall is best effort — `session setup`
+    installs it again.
     """
     import base64
     import json
 
-    seed = _bootstrap_seed_session(session, repo_path)
-    seed_b64 = base64.b64encode(json.dumps(seed, indent=2).encode()).decode()
     suffix = old_workspace_id or "previous"
-    cmd = "\n".join([
+
+    # ── 1-2. Stop everything, move the old worktree aside ──────────────────
+    # The watcher runs detached (`python -m nanorun.watcher`, start_new_session),
+    # so tmux kill-server does not reach it. Left alive it keeps following the
+    # retired hub namespace, and its PID file rides into the archive — the
+    # machine would then report "no watcher" and happily start a second one.
+    archive_cmd = "\n".join([
         "set -e",
         "tmux kill-server 2>/dev/null || true",
-        "sleep 1",  # let HUP'd daemon/experiment processes finish dying
-        f"cd {repo_path}/.nanorun",
-        "for d in logs/local sessions/local; do",
-        '  [ -e "$d" ] || continue',
-        f'  DEST="$d@{suffix}"; i=1',
-        f'  while [ -e "$DEST" ]; do DEST="$d@{suffix}.$i"; i=$((i+1)); done',
-        '  mv "$d" "$DEST"',
-        "done",
-        "mkdir -p sessions",
-        f"echo '{seed_b64}' | base64 -d > sessions/local.json",
+        f'pid=$(cat "{repo_path}/.nanorun/watcher/watcher.pid" 2>/dev/null) '
+        '&& [ -n "$pid" ] && kill "$pid" 2>/dev/null || true',
+        # `[.]` keeps the pattern from matching the shell running this script.
+        'pkill -f "nanorun[.]watcher" 2>/dev/null || true',
+        "sleep 1",  # let HUP'd daemon/experiment/watcher processes finish dying
+        f'ARCHIVE="{repo_path}@{suffix}"; i=1',
+        f'while [ -e "$ARCHIVE" ]; do ARCHIVE="{repo_path}@{suffix}.$i"; i=$((i+1)); done',
+        f'if [ -e "{repo_path}" ]; then mv "{repo_path}" "$ARCHIVE"; fi',
+        'echo "NANORUN_ARCHIVE:$ARCHIVE"',
     ])
-    result = remote.run(cmd, timeout=30)
-    return bool(result.success)
+    result = remote.run(archive_cmd, timeout=60)
+    archive = ""
+    for line in result.stdout.splitlines() if result.success else []:
+        if line.startswith("NANORUN_ARCHIVE:"):
+            archive = line.split(":", 1)[1].strip()
+    if not result.success or not archive:
+        console.print("  [red]could not archive the machine's old repository[/red]")
+        if result.stderr:
+            console.print(f"  [dim]{result.stderr.strip()[:200]}[/dim]")
+        return False
+    console.print(f"  [dim]old worktree archived to {archive}[/dim]")
+
+    # ── 3. Fresh clone at the original path ────────────────────────────────
+    if not repo_url:
+        from .project_config import get_repo_url
+        repo_url = get_repo_url() or "git@github.com:varunneal/nanorun-private.git"
+    clone_cmd = (
+        f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
+        f"git clone {repo_url} {repo_path}"
+    )
+    result = remote.run_with_agent(clone_cmd, timeout=180)
+    if not result.success:
+        console.print("  [red]fresh clone FAILED[/red]")
+        if result.stderr:
+            console.print(f"  [dim]{result.stderr.strip()[:200]}[/dim]")
+        console.print(
+            f"  [yellow]the machine's previous worktree is intact at {archive} — "
+            f"move it back to {repo_path} to undo.[/yellow]"
+        )
+        return False
+    console.print("  [green]repository re-cloned[/green]")
+
+    # ── 3b-4. Carry the expensive artifacts over, then seed the identity ───
+    # Only untracked directories move: the venv, and dataset downloads under
+    # data/ (the tracked contents of data/ are all .py files).
+    seed = _bootstrap_seed_session(session, repo_path)
+    seed_b64 = base64.b64encode(json.dumps(seed, indent=2).encode()).decode()
+    carry_cmd = "\n".join([
+        "set -e",
+        f'ARCHIVE="{archive}"',
+        f'if [ -d "$ARCHIVE/.venv" ] && [ ! -e "{repo_path}/.venv" ]; then',
+        f'  mv "$ARCHIVE/.venv" "{repo_path}/.venv"',
+        "fi",
+        f'if [ -d "$ARCHIVE/data" ]; then mkdir -p "{repo_path}/data"; fi',
+        'for d in "$ARCHIVE"/data/*/; do',
+        '  [ -d "$d" ] || continue',
+        '  name=$(basename "$d")',
+        f'  [ -e "{repo_path}/data/$name" ] || mv "$d" "{repo_path}/data/$name"',
+        "done",
+        f"mkdir -p {repo_path}/.nanorun/sessions",
+        f"echo '{seed_b64}' | base64 -d > {repo_path}/.nanorun/sessions/local.json",
+    ])
+    result = remote.run(carry_cmd, timeout=120)
+    if not result.success:
+        console.print("  [red]could not seed the machine's new local session[/red]")
+        if result.stderr:
+            console.print(f"  [dim]{result.stderr.strip()[:200]}[/dim]")
+        return False
+    console.print("  [green]venv + datasets carried over, new identity seeded[/green]")
+
+    # The fresh clone has no .git/info/exclude, and the machine commits from
+    # this worktree. Re-apply now rather than waiting for `session setup`, so a
+    # run started before setup can't drag logs/ into the new branch.
+    remote.run(_local_excludes_cmd(repo_path), timeout=30)
+
+    # ── 5. Rebind the CLI to the new tree (best effort) ────────────────────
+    cli_cmd = (
+        'UV=$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv"); '
+        f'"$UV" tool install -e {repo_path} --force && '
+        '{ "$UV" tool update-shell >/dev/null 2>&1 || true; }'
+    )
+    result = remote.run(cli_cmd, timeout=300)
+    if result.success:
+        console.print("  [green]nanorun CLI reinstalled[/green]")
+    else:
+        console.print(
+            "  [yellow]nanorun CLI reinstall FAILED — session setup will retry[/yellow]"
+        )
+    return True
 
 
 def _gather_agent_auth() -> tuple[dict, list[str]]:
@@ -1092,7 +1187,9 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
             next_steps.append("nanorun watcher start --background")
         console.print(Panel.fit(
             "\n".join(next_steps)
-            + "\n\n[dim]Use a fresh login shell so ~/.local/bin is on PATH.[/dim]",
+            + "\n\n[dim]`nanorun` was installed to ~/.local/bin, which the machine's\n"
+              "shell only picks up on login. A shell you already had open there\n"
+              "will say 'command not found' — reconnect, or `source ~/.bashrc`.[/dim]",
             title="Next steps (on the machine itself)",
             border_style="cyan",
         ))

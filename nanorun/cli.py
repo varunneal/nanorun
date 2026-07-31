@@ -378,9 +378,25 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
         stderr=subprocess.DEVNULL,
     )
 
-    # Generate session name if not provided
+    # Generate session name if not provided. Re-bootstrapping a machine reuses
+    # its existing config: minting a second name would leave the old bootstrap
+    # session on this device following the namespace the machine just retired.
     if not name:
-        name = Config.next_session_name()
+        if bootstrap_session:
+            previous = next(
+                (
+                    s for s in Config.list_sessions()
+                    if s.bootstrap and s.host == hostname and s.user == user
+                ),
+                None,
+            )
+            if previous:
+                name = previous.name
+                console.print(
+                    f"[dim]Reusing bootstrap session '{name}' for {user}@{hostname} "
+                    f"(pass --name to keep a separate one)[/dim]"
+                )
+        name = name or Config.next_session_name()
 
     console.print(f"[cyan]Connecting to {user}@{hostname}:{port}...[/cyan]")
 
@@ -452,16 +468,20 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
         # that identity with the fresh one — confirmed, never silent.
         machine_repo, seed = probe_machine_local_identity(remote, session_config.repo_path)
         if seed is not None:
-            old_ws = seed.get("workspace_id") or "unknown"
+            old_ws = seed.get("workspace_id") or "previous"
             console.print(
                 f"[yellow]This machine already owns a local session "
-                f"(workspace {old_ws}, branch {seed.get('git_branch') or '?'}).[/yellow]"
+                f"(workspace {seed.get('workspace_id') or 'unreadable'}, "
+                f"branch {seed.get('git_branch') or '?'}).[/yellow]"
             )
             console.print(
-                "[yellow]Re-bootstrapping retires it: fresh branch, hub "
-                "namespace, and empty queue, and ALL tmux sessions on the "
-                "machine are killed (daemon, experiments, coding agents). The "
-                "old branch, logs, and hub artifacts stay put.[/yellow]"
+                "[yellow]Re-bootstrapping rebuilds the machine: its tmux sessions "
+                "and watcher are killed (daemon, experiments, coding agents), the "
+                f"repository is moved aside to {machine_repo}@{old_ws} and "
+                "re-cloned fresh, the nanorun CLI is reinstalled, and it gets a "
+                "new branch, hub namespace, and empty queue. The venv and "
+                "downloaded datasets carry over; nothing is deleted — the old "
+                "branch, worktree, logs, and hub artifacts stay put.[/yellow]"
             )
             if not click.confirm("Replace the machine's local session?", default=False):
                 console.print(
@@ -469,17 +489,18 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
                 )
                 raise SystemExit(1)
             if not replace_machine_local_identity(
-                remote, session_config, machine_repo, seed.get("workspace_id") or "previous",
+                remote, session_config, machine_repo, old_ws,
             ):
                 console.print(
                     "[red]Could not replace the machine's local session identity.[/red]"
                 )
                 raise SystemExit(1)
             console.print(
-                f"[green]Machine identity replaced.[/green] New workspace: "
-                f"{session_config.workspace_id}. Run "
+                f"[green]Machine rebuilt.[/green] New workspace: "
+                f"{session_config.workspace_id}. Provision it with "
+                f"[cyan]nanorun session setup --session {name}[/cyan], then run "
                 "[cyan]nanorun session start --local[/cyan] on the machine to adopt "
-                "it and start its daemon on the new namespace."
+                "the new identity and start its daemon."
             )
 
     # Save session
@@ -845,6 +866,103 @@ def track_info(name: str):
 # ============================================================================
 # Sync commands
 # ============================================================================
+
+def _age(moment) -> str:
+    """Compact age of a UTC timestamp: 3h, 12d, 5w."""
+    from datetime import datetime, timezone
+
+    seconds = (datetime.now(timezone.utc) - moment).total_seconds()
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return "just now"
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Report what would merge; change nothing")
+def pull(dry_run: bool):
+    """Merge machines' branches into the branch you are on.
+
+    The inbound half of sync: machines publish their own `nanorun/local/*`
+    branch and never merge it back, so their work accumulates on origin until
+    something pulls it home. Branches that would conflict are reported and
+    skipped — nothing is left half-merged.
+    """
+    from .sync import (
+        find_incoming_branches,
+        get_local_repo_path,
+        merge_incoming_branch,
+        worktree_is_clean,
+        _current_branch,
+    )
+
+    repo = get_local_repo_path()
+    base = _current_branch(repo)
+    if not dry_run and not worktree_is_clean(repo):
+        console.print(
+            f"[red]Working tree has uncommitted changes — commit or stash before "
+            f"merging into {base}.[/red]"
+        )
+        console.print("[dim]Or run 'nanorun pull --dry-run' to just see what's waiting.[/dim]")
+        raise SystemExit(1)
+
+    with console.status(f"[cyan]Fetching machine branches...[/cyan]"):
+        try:
+            incoming = find_incoming_branches(repo, base)
+        except ValueError as error:
+            console.print(f"[red]{error}[/red]")
+            raise SystemExit(1)
+
+    if not incoming:
+        console.print(f"[green]Nothing to pull — {base} already has every machine's work.[/green]")
+        return
+
+    table = Table(title=f"Machine branches not in {base}")
+    table.add_column("Workspace", style="cyan")
+    table.add_column("Session")
+    table.add_column("Last commit", justify="right")
+    table.add_column("Ahead", justify="right")
+    table.add_column("Merge")
+    for b in incoming:
+        table.add_row(
+            b.workspace_id,
+            b.session_name or "[dim]retired[/dim]",
+            _age(b.last_commit),
+            str(b.ahead),
+            "[green]clean[/green]" if b.clean
+            else f"[yellow]{len(b.conflicts)} conflict{'s' if len(b.conflicts) > 1 else ''}[/yellow]",
+        )
+    console.print(table)
+
+    if dry_run:
+        console.print(f"[dim]Dry run — nothing merged.[/dim]")
+        return
+
+    merged, skipped = 0, []
+    for b in incoming:
+        if not b.clean:
+            skipped.append(b)
+            continue
+        ok, error = merge_incoming_branch(repo, b)
+        if ok:
+            merged += 1
+            console.print(f"  [green]merged[/green] {b.workspace_id} ([dim]{b.ahead} commits[/dim])")
+        else:
+            skipped.append(b)
+            console.print(f"  [red]failed[/red] {b.workspace_id}: {error.splitlines()[0]}")
+
+    for b in skipped:
+        if b.conflicts:
+            paths = ", ".join(b.conflicts[:4])
+            more = f" (+{len(b.conflicts) - 4} more)" if len(b.conflicts) > 4 else ""
+            console.print(f"  [yellow]skipped[/yellow] {b.workspace_id}: {paths}{more}")
+            console.print(f"    [dim]resolve by hand: git merge {b.branch}[/dim]")
+
+    console.print(
+        f"\n[bold]{merged} merged[/bold], {len(skipped)} skipped."
+        + (f" Push with: [cyan]git push origin {base}[/cyan]" if merged else "")
+    )
+
 
 @cli.command()
 @click.argument("files", nargs=-1, type=click.Path(exists=True))

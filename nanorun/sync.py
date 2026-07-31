@@ -91,6 +91,127 @@ def publish_local_session_branch(config: SessionConfig, *, quiet: bool = False) 
     return True
 
 
+class IncomingBranch:
+    """A machine's line of work on origin, measured against the main branch."""
+
+    def __init__(
+        self,
+        branch: str,
+        workspace_id: str,
+        session_name: str | None,
+        ahead: int,
+        last_commit: datetime,
+        conflicts: list[str],
+    ):
+        self.branch = branch                # nanorun/local/{workspace_id}
+        self.workspace_id = workspace_id
+        self.session_name = session_name    # None once the workspace is retired
+        self.ahead = ahead
+        self.last_commit = last_commit
+        self.conflicts = conflicts
+
+    @property
+    def clean(self) -> bool:
+        return not self.conflicts
+
+
+def _test_merge(repo: Path, base: str, branch: str) -> list[str]:
+    """Conflicting paths from merging `branch` into `base`, without merging.
+
+    `merge-tree --write-tree` resolves the merge in memory and writes only
+    objects, so this never touches the worktree, the index, or HEAD — it is safe
+    to run against a branch you are mid-way through something else on. Output is
+    the merged tree oid, then (on conflict, exit 1) the conflicted paths, then a
+    blank line and human-readable messages.
+    """
+    result = _git(repo, ["merge-tree", "--write-tree", "--name-only", base, branch])
+    if result.returncode == 0:
+        return []
+    lines = result.stdout.splitlines()[1:]  # drop the tree oid
+    return [line for line in lines[: _index_of_blank(lines)] if line.strip()]
+
+
+def _index_of_blank(lines: list[str]) -> int:
+    for i, line in enumerate(lines):
+        if not line.strip():
+            return i
+    return len(lines)
+
+
+def find_incoming_branches(
+    repo: Path, base: str = "main", *, fetch: bool = True
+) -> list[IncomingBranch]:
+    """Every `nanorun/local/*` branch on origin holding work `base` does not have.
+
+    Machines publish their own branch and never merge it back themselves, so
+    this is the inbound half of sync: what each machine has produced that this
+    repository has not absorbed. Branches are sorted oldest-commit first, so the
+    work most at risk of being forgotten reads at the top.
+    """
+    if fetch:
+        _git(repo, ["fetch", "origin"])
+
+    listed = _git(repo, [
+        "for-each-ref",
+        "--format=%(refname:short)%09%(committerdate:unix)",
+        f"refs/remotes/origin/{LOCAL_BRANCH_PREFIX}*",
+    ])
+    if listed.returncode != 0:
+        raise _git_error("Could not list machine branches", listed)
+
+    sessions = {
+        s.workspace_id: s.name for s in Config.list_sessions() if s.workspace_id
+    }
+
+    branches: list[IncomingBranch] = []
+    for line in listed.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        ref, timestamp = line.split("\t", 1)
+        counted = _git(repo, ["rev-list", "--count", f"{base}..{ref}"])
+        ahead = int(counted.stdout.strip() or 0) if counted.returncode == 0 else 0
+        if ahead == 0:
+            continue  # already absorbed, or never diverged
+        workspace_id = ref.split(LOCAL_BRANCH_PREFIX, 1)[-1]
+        branches.append(IncomingBranch(
+            branch=ref,
+            workspace_id=workspace_id,
+            session_name=sessions.get(workspace_id),
+            ahead=ahead,
+            last_commit=datetime.fromtimestamp(int(timestamp), tz=timezone.utc),
+            conflicts=_test_merge(repo, base, ref),
+        ))
+    branches.sort(key=lambda b: b.last_commit)
+    return branches
+
+
+def merge_incoming_branch(repo: Path, incoming: IncomingBranch) -> tuple[bool, str]:
+    """Merge one machine's branch into the current branch as a merge commit.
+
+    `--no-ff` keeps each machine's line of work legible as its own merge, and
+    `--no-edit` keeps the command non-interactive. A merge that fails despite a
+    clean dry run (a racing push, say) is aborted rather than left half-applied.
+    """
+    result = _git(repo, [
+        "merge", "--no-ff", "--no-edit",
+        "-m", f"Merge {incoming.workspace_id} into {_current_branch(repo)}",
+        incoming.branch,
+    ])
+    if result.returncode == 0:
+        return True, ""
+    _git(repo, ["merge", "--abort"])
+    return False, (result.stderr.strip() or result.stdout.strip() or "merge failed")
+
+
+def _current_branch(repo: Path) -> str:
+    return _git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+
+
+def worktree_is_clean(repo: Path) -> bool:
+    result = _git(repo, ["status", "--porcelain"])
+    return result.returncode == 0 and not result.stdout.strip()
+
+
 def _new_local_workspace_id(config: SessionConfig) -> str:
     """Build a path-safe, globally unique identity for a local session."""
     safe_name = re.sub(r"[^a-z0-9_-]+", "-", config.name.lower()).strip("-")
