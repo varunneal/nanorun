@@ -459,8 +459,9 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
             )
             console.print(
                 "[yellow]Re-bootstrapping retires it: fresh branch, hub "
-                "namespace, and empty queue. The old branch, logs, and hub "
-                "artifacts stay put.[/yellow]"
+                "namespace, and empty queue, and ALL tmux sessions on the "
+                "machine are killed (daemon, experiments, coding agents). The "
+                "old branch, logs, and hub artifacts stay put.[/yellow]"
             )
             if not click.confirm("Replace the machine's local session?", default=False):
                 console.print(
@@ -478,7 +479,7 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
                 f"[green]Machine identity replaced.[/green] New workspace: "
                 f"{session_config.workspace_id}. Run "
                 "[cyan]nanorun session start --local[/cyan] on the machine to adopt "
-                "it (this restarts its daemon on the new namespace)."
+                "it and start its daemon on the new namespace."
             )
 
     # Save session

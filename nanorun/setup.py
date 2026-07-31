@@ -350,8 +350,11 @@ def replace_machine_local_identity(
 ) -> bool:
     """Overwrite the machine's local-session identity with `session`'s fresh one.
 
-    The old session's state dir (executor, queue) and artifact dir move aside to
-    `...@{old_workspace_id}` so the restarted daemon cannot re-publish the
+    All tmux sessions on the machine are killed first (daemon, experiment
+    windows, coding agents) — otherwise the old daemon keeps publishing under
+    the retired namespace and recreates the dirs being archived. Then the old
+    session's state dir (executor, queue) and artifact dir move aside to
+    `...@{old_workspace_id}` so a restarted daemon cannot re-publish the
     previous workspace's logs into the new namespace. The old branch and the
     machine's experiment DB are left untouched.
     """
@@ -363,6 +366,8 @@ def replace_machine_local_identity(
     suffix = old_workspace_id or "previous"
     cmd = "\n".join([
         "set -e",
+        "tmux kill-server 2>/dev/null || true",
+        "sleep 1",  # let HUP'd daemon/experiment processes finish dying
         f"cd {repo_path}/.nanorun",
         "for d in logs/local sessions/local; do",
         '  [ -e "$d" ] || continue',
