@@ -255,6 +255,30 @@ def _gather_bootstrap_git_auth() -> tuple[Optional[dict], list[str]]:
     return git_auth, warnings
 
 
+# Run artifacts a machine that executes its own sessions must never commit.
+# Training scripts write logs/{run_id}.txt into the repo root, and the machine
+# commits from that same worktree (`nanorun sync --all` runs `git add -A`
+# there), so without this the logs ride along into its branch.
+LOCAL_GIT_EXCLUDES = ("/logs/",)
+
+
+def _local_excludes_cmd(repo_path: str) -> str:
+    """Idempotent shell adding LOCAL_GIT_EXCLUDES to a repo's .git/info/exclude.
+
+    Kept out of the tracked .gitignore: this is a property of a machine that
+    runs experiments, not of the repository everyone shares.
+    """
+    prepare = (
+        f'cd "{repo_path}" && GIT_DIR=$(git rev-parse --git-dir) && '
+        f'mkdir -p "$GIT_DIR/info" && EX="$GIT_DIR/info/exclude" && touch "$EX"'
+    )
+    checks = [
+        f"grep -qxF '{pattern}' \"$EX\" || echo '{pattern}' >> \"$EX\""
+        for pattern in LOCAL_GIT_EXCLUDES
+    ]
+    return "\n".join(["set -e", prepare, *checks])
+
+
 def _bootstrap_seed_session(session, repo_path: str) -> dict:
     """The machine-side local session identity pre-assigned by this device.
 
@@ -276,6 +300,81 @@ def _bootstrap_seed_session(session, repo_path: str) -> dict:
         "workspace_id": session.workspace_id,
         "git_branch": f"nanorun/local/{session.workspace_id}",
     }
+
+
+def probe_machine_local_identity(
+    remote: RemoteSession, repo_path: str
+) -> tuple[str, Optional[dict]]:
+    """Read the machine's local-session identity, if it owns one.
+
+    Returns (home-expanded repo_path, seed dict | None). The seed is whatever
+    {repo}/.nanorun/sessions/local.json holds — a previous bootstrap's seed or
+    the live config of a local session the machine already ran. A file that
+    exists but does not parse reports as an empty dict, so callers treat the
+    machine as occupied rather than silently clobbering state they can't read.
+    """
+    import json
+
+    probe = (
+        'H=$(getent passwd $(whoami) 2>/dev/null | cut -d: -f6); '
+        '{ [ -n "$H" ] && [ "$H" != "/" ]; } || H="$HOME"; '
+        'echo "NANORUN_HOME:$H"; '
+        f"cat {repo_path}/.nanorun/sessions/local.json 2>/dev/null"
+    )
+    result = remote.run(probe, timeout=15)
+    home = ""
+    seed_text = ""
+    lines = result.stdout.splitlines() if result.success else []
+    for i, line in enumerate(lines):
+        if line.startswith("NANORUN_HOME:"):
+            home = line.split(":", 1)[1].strip()
+            seed_text = "\n".join(lines[i + 1:]).strip()
+            break
+    expanded = repo_path
+    if repo_path.startswith("~") and home and home != "/":
+        expanded = repo_path.replace("~", home, 1)
+    if not seed_text:
+        return expanded, None
+    try:
+        seed = json.loads(seed_text)
+    except ValueError:
+        return expanded, {}
+    return expanded, seed if isinstance(seed, dict) else {}
+
+
+def replace_machine_local_identity(
+    remote: RemoteSession,
+    session,
+    repo_path: str,
+    old_workspace_id: str,
+) -> bool:
+    """Overwrite the machine's local-session identity with `session`'s fresh one.
+
+    The old session's state dir (executor, queue) and artifact dir move aside to
+    `...@{old_workspace_id}` so the restarted daemon cannot re-publish the
+    previous workspace's logs into the new namespace. The old branch and the
+    machine's experiment DB are left untouched.
+    """
+    import base64
+    import json
+
+    seed = _bootstrap_seed_session(session, repo_path)
+    seed_b64 = base64.b64encode(json.dumps(seed, indent=2).encode()).decode()
+    suffix = old_workspace_id or "previous"
+    cmd = "\n".join([
+        "set -e",
+        f"cd {repo_path}/.nanorun",
+        "for d in logs/local sessions/local; do",
+        '  [ -e "$d" ] || continue',
+        f'  DEST="$d@{suffix}"; i=1',
+        f'  while [ -e "$DEST" ]; do DEST="$d@{suffix}.$i"; i=$((i+1)); done',
+        '  mv "$d" "$DEST"',
+        "done",
+        "mkdir -p sessions",
+        f"echo '{seed_b64}' | base64 -d > sessions/local.json",
+    ])
+    result = remote.run(cmd, timeout=30)
+    return bool(result.success)
 
 
 def _gather_agent_auth() -> tuple[dict, list[str]]:
@@ -699,6 +798,20 @@ echo "STATUS:DONE"
 # ─── Setup implementation ─────────────────────────────────────────────────────
 
 
+def _remote_watcher_running(remote: RemoteSession, repo_path: str) -> bool:
+    """Whether the machine already has a live watcher (its PID file names a live process)."""
+    pid_files = (
+        f"{repo_path}/.nanorun/watcher/watcher.pid",
+        f"{repo_path}/.nanorun/local_daemon/daemon.pid",  # pre-rename watchers
+    )
+    check = " || ".join(
+        f'{{ pid=$(cat {p} 2>/dev/null) && kill -0 "$pid" 2>/dev/null; }}'
+        for p in pid_files
+    )
+    r = remote.run(f"( {check} ) && echo RUNNING", timeout=15)
+    return r.success and "RUNNING" in r.stdout
+
+
 class SetupFailure:
     """A non-fatal failure that gets reported at the end."""
     def __init__(self, step: str, detail: str):
@@ -819,6 +932,17 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
         else:
             failures.append(SetupFailure("repo", r.stderr[:200]))
             console.print(f"  [red]repo: clone FAILED[/red]")
+
+    # ── Machine-local git excludes (bootstrap only) ───────────────────────────
+    # The machine commits from its own worktree, so keep its run logs out of the
+    # index. Non-fatal: a machine without the exclude still runs experiments.
+    if bootstrap:
+        r = remote.run(_local_excludes_cmd(repo_path), timeout=15)
+        if r.success:
+            console.print("  [green]git excludes: logs/ ignored on the machine[/green]")
+        else:
+            failures.append(SetupFailure("git_excludes", r.stderr[:200]))
+            console.print("  [yellow]git excludes: FAILED[/yellow]")
 
     # ── Seed the machine's local session identity (bootstrap only) ────────────
     # Pre-assign the workspace_id so the machine's `session start --local`
@@ -954,12 +1078,16 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
         console.print("[bold green]Setup complete — no failures.[/bold green]")
 
     if bootstrap:
+        next_steps = [
+            f"ssh -A {session.user}@{session.host}",
+            f"cd {repo_path}",
+            "nanorun session start --local",
+        ]
+        if not _remote_watcher_running(remote, repo_path):
+            next_steps.append("nanorun watcher start --background")
         console.print(Panel.fit(
-            f"ssh {session.user}@{session.host}\n"
-            f"cd {repo_path}\n"
-            "nanorun session start --local\n"
-            "nanorun watcher start\n\n"
-            "[dim]Use a fresh login shell so ~/.local/bin is on PATH.[/dim]",
+            "\n".join(next_steps)
+            + "\n\n[dim]Use a fresh login shell so ~/.local/bin is on PATH.[/dim]",
             title="Next steps (on the machine itself)",
             border_style="cyan",
         ))

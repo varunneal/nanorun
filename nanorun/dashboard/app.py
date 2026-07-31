@@ -488,11 +488,29 @@ async def set_session_sync_pause(name: str, paused: bool = True):
     }
 
 
+_BOOTSTRAP_DAEMON_MESSAGE = (
+    "This is a bootstrap (provision-only) session: its execution daemon is "
+    "owned by the machine's own local session and is followed via the hub."
+)
+
+
+def _bootstrap_daemon_block(name: str) -> Optional[JSONResponse]:
+    """Refuse daemon operations on bootstrap sessions (provision-only)."""
+    sc = Config.load_session(name)
+    if sc and getattr(sc, "bootstrap", False):
+        return JSONResponse({"error": _BOOTSTRAP_DAEMON_MESSAGE}, status_code=400)
+    return None
+
+
 @app.post("/api/sessions/{name}/daemon-restart")
 async def restart_daemon(name: str):
     """Restart the daemon for a session (stop + start)."""
     import threading
     from ..remote_control import get_daemon_client, DaemonError
+
+    blocked = _bootstrap_daemon_block(name)
+    if blocked:
+        return blocked
 
     def _do_restart():
         client = get_daemon_client(name)
@@ -512,6 +530,9 @@ async def get_session_daemon_status(name: str):
     """Get daemon status (experiment, queue, GPU) for a connected session."""
     from ..queue import get_daemon_status
 
+    blocked = _bootstrap_daemon_block(name)
+    if blocked:
+        return blocked
     status = get_daemon_status(session_name=name)
     if not status:
         return JSONResponse({"error": "Could not reach daemon"}, status_code=503)

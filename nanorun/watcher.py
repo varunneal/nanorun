@@ -351,6 +351,8 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
         exp_id = mapping.get("experiment_id")
         if not exp_id:
             continue
+        remote_status = mapping.get("status")
+        crash_log = mapping.get("crash_log")
         existing = get_experiment(exp_id)
         if not existing:
             script = mapping.get("script", "unknown")
@@ -359,7 +361,7 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
             try:
                 create_experiment_from_mapping(
                     experiment_id=exp_id, name=name, script=script,
-                    status=mapping.get("status", "running"), track=track,
+                    status=remote_status or "running", track=track,
                     code_hash=mapping.get("code_hash"), remote_run_id=mapping.get("run_id"),
                     tmux_window=mapping.get("tmux_window"), started_at=mapping.get("started_at"),
                     finished_at=mapping.get("finished_at"), env_vars=mapping.get("env_vars"),
@@ -373,12 +375,20 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
                 log.info(f"[hub] Created experiment {exp_id} ({Path(script).name}) for {session_name}")
             except Exception as e:
                 log.error(f"[hub] Failed to create experiment {exp_id}: {e}")
+                continue
         else:
-            remote_status = mapping.get("status")
             if remote_status and remote_status != existing.status:
-                apply_authoritative_experiment_status(exp_id, remote_status)
+                if (apply_authoritative_experiment_status(exp_id, remote_status)
+                        and remote_status == "failed"):
+                    # Live failure transition observed via the hub (no tracker on
+                    # bootstrap sessions) — notify, matching the RPC event path.
+                    record_crash(session_name, exp_id, crash_log)
             if mapping.get("run_id") and not existing.remote_run_id:
                 update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
+        # Terminal failed mappings carry the crash tail; store it if we don't
+        # already have one (the tracker's RPC backfill fetches a fuller log).
+        if remote_status == "failed" and crash_log and get_crash_log(exp_id) is None:
+            set_crash_log(exp_id, crash_log)
 
 
 def _ingest_queue_for_session(session_name: str):

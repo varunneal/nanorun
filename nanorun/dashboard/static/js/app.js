@@ -649,7 +649,7 @@ async function refreshSessionChips() {
         _sessionData = data.sessions || data;
         _hubData = data.hub || {};
         _sessionData.sort((a, b) => {
-            const order = { disconnected: 0, connecting: 1, iris: 2, connected: 3 };
+            const order = { disconnected: 0, connecting: 1, iris: 2, bootstrap: 2, connected: 3 };
             return (order[a.status] ?? 1) - (order[b.status] ?? 1);
         });
         if (_sessionPopoverOpen) return;
@@ -733,6 +733,11 @@ function openSessionPopover(name) {
         body += `<div class="sp-info" style="color:var(--warning)">⏸ Sync paused — not scanning</div>`;
         body += `<div class="sp-actions">${resumeBtn}</div>`;
     } else if (s.status === 'iris') {
+        body += `<div class="sp-actions">${pauseBtn}<button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
+    } else if (s.status === 'bootstrap') {
+        // Provision-only: no daemon to reach or restart from here — the machine
+        // runs its own local session and is followed via the hub.
+        body += `<div class="sp-info" style="color:#888">Provision-only — runs its own local session${s.hub_namespace ? `<br>Hub: ${s.hub_namespace}` : ''}</div>`;
         body += `<div class="sp-actions">${pauseBtn}<button class="sp-btn sp-btn-danger" onclick="doRemoveSession('${name}')">Remove</button></div>`;
     } else if (s.status === 'connected') {
         body += `<div class="sp-status-detail" id="sp-detail-${name}">Loading...</div>`;

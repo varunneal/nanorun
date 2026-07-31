@@ -399,7 +399,42 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
     # device follows that namespace via the hub from day one.
     if bootstrap_session:
         from .sync import _new_local_workspace_id
+        from .setup import probe_machine_local_identity, replace_machine_local_identity
+
         session_config.workspace_id = _new_local_workspace_id(session_config)
+
+        # Re-bootstrapping a machine that already owns a local session replaces
+        # that identity with the fresh one — confirmed, never silent.
+        machine_repo, seed = probe_machine_local_identity(remote, session_config.repo_path)
+        if seed is not None:
+            old_ws = seed.get("workspace_id") or "unknown"
+            console.print(
+                f"[yellow]This machine already owns a local session "
+                f"(workspace {old_ws}, branch {seed.get('git_branch') or '?'}).[/yellow]"
+            )
+            console.print(
+                "[yellow]Re-bootstrapping retires it: fresh branch, hub "
+                "namespace, and empty queue. The old branch, logs, and hub "
+                "artifacts stay put.[/yellow]"
+            )
+            if not click.confirm("Replace the machine's local session?", default=False):
+                console.print(
+                    "[yellow]Aborted — the machine keeps its current local session.[/yellow]"
+                )
+                raise SystemExit(1)
+            if not replace_machine_local_identity(
+                remote, session_config, machine_repo, seed.get("workspace_id") or "previous",
+            ):
+                console.print(
+                    "[red]Could not replace the machine's local session identity.[/red]"
+                )
+                raise SystemExit(1)
+            console.print(
+                f"[green]Machine identity replaced.[/green] New workspace: "
+                f"{session_config.workspace_id}. Run "
+                "[cyan]nanorun session start --local[/cyan] on the machine to adopt "
+                "it (this restarts its daemon on the new namespace)."
+            )
 
     # Save session
     config = Config(session=session_config)
@@ -1586,8 +1621,12 @@ def watcher_status():
         console.print()
         for sc in sessions:
             state = SessionState.load(sc.name)
-            status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
             paused_tag = "  [yellow]⏸ sync paused[/yellow]" if getattr(sc, "sync_paused", False) else ""
+            if getattr(sc, "bootstrap", False):
+                # Never tracked over RPC, so SessionState would read "disconnected".
+                console.print(f"  [bold]{sc.name}[/bold] [cyan]bootstrap[/cyan] [dim](followed via hub)[/dim]{paused_tag}")
+                continue
+            status_color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}.get(state.status, "dim")
             console.print(f"  [bold]{sc.name}[/bold] [{status_color}]{state.status}[/{status_color}]{paused_tag}")
             if state.tracking_experiment_id:
                 console.print(f"    Tracking: [cyan]experiment #{state.tracking_experiment_id}[/cyan]")

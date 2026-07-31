@@ -906,6 +906,11 @@ def get_daemon_client(session_name: Optional[str] = None) -> Optional[DaemonClie
     remote = get_session(session_name)
     if not remote:
         return None
+    if getattr(remote.config, "bootstrap", False):
+        # Provision-only session: execution is owned by the machine's own local
+        # daemon. A DaemonClient here would reach (or worse, ensure_running would
+        # start) a second SSH-style daemon competing for the same GPU.
+        return None
     return DaemonClient(remote)
 
 

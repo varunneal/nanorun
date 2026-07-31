@@ -74,6 +74,7 @@ CODE_HASH_LENGTH = 12
 GIT_HASH_LENGTH = 12
 TMUX_WINDOW_NAME_MAX = 40
 LOG_TAIL_BYTES = 50_000
+MAPPING_CRASH_TAIL_CHARS = 8_000  # crash tail embedded in terminal failed mappings
 MAPPINGS_SEGMENT_LINES = 500
 QUEUE_SEGMENT_LINES = 500
 
@@ -348,6 +349,11 @@ class ExperimentMapping:
     kernels_path: Optional[str] = None
     dependencies: Dict[str, str] = field(default_factory=dict)
     failure_phase: Optional[str] = None
+    # Tail of the tmux output, set on terminal failed mappings only. Hub-followed
+    # controllers (bootstrap sessions) have no RPC path to fetch crash logs, so
+    # the mapping stream carries it. Capped well below LOG_TAIL_BYTES to keep
+    # mapping segments small.
+    crash_log: Optional[str] = None
 
     def save(self):
         (MAPPINGS_DIR / f"{self.experiment_id}.json").write_text(json.dumps(asdict(self), indent=2))
@@ -1162,6 +1168,10 @@ class NanorunDaemon:
                     if last and last[0] >= last[1]:
                         status = "completed"
                 mapping.status = status
+                crash_log = None
+                if status != "completed":
+                    crash_log = self._read_file_tail(OUTPUT_DIR / f"{exp_id}.txt")
+                    mapping.crash_log = crash_log[-MAPPING_CRASH_TAIL_CHARS:] or None
                 mapping.save()
                 print(f"[daemon] Experiment {exp_id} {status}")
                 if status == "completed":
@@ -1169,7 +1179,6 @@ class NanorunDaemon:
                     self._emit(Event.EXPERIMENT_FINISHED, experiment_id=exp_id,
                                status="completed", run_id=run_id, code_hash=mapping.code_hash)
                 else:
-                    crash_log = self._read_file_tail(OUTPUT_DIR / f"{exp_id}.txt")
                     self._emit(Event.EXPERIMENT_FAILED, experiment_id=exp_id,
                                status=status, run_id=run_id, crash_log=crash_log)
         self.state.status = "idle"
@@ -1249,7 +1258,7 @@ class NanorunDaemon:
             gpu_type=item.gpu_type, tmux_window="", log_file=None,
             started_at=now, finished_at=now, status="failed",
             track=item.track, name=item.name, git_commit=self.get_git_commit(),
-            failure_phase="launch",
+            failure_phase="launch", crash_log=f"Launch failed: {error}",
         )
         mapping.save()
         self._emit(Event.EXPERIMENT_FAILED, experiment_id=item.experiment_id,
