@@ -34,6 +34,51 @@ def _require_command_session(session_name: str) -> bool:
     return True
 
 
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort copy to the system clipboard. Returns True on success."""
+    import shutil
+    import subprocess
+
+    for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(tool[0]):
+            try:
+                subprocess.run(tool, input=text.encode(), check=True)
+                return True
+            except (OSError, subprocess.CalledProcessError):
+                return False
+    return False
+
+
+def _offer_copy(command: str, purpose: str, timeout: float = 10.0) -> None:
+    """Print a follow-up command and let the user copy it with a single key.
+
+    TTY-only and time-limited, so scripts, pipes, and tests never block on the
+    keypress; any key other than `c` (or the timeout) just returns.
+    """
+    console.print(f"Run [cyan]{command}[/cyan] to {purpose}. [dim]Press c to copy[/dim]")
+    if not sys.stdin.isatty():
+        return
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:  # non-POSIX platform: the printed command is still there
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        key = sys.stdin.read(1) if ready else ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    if key.lower() == "c":
+        if _copy_to_clipboard(command):
+            console.print("[dim]Copied to clipboard.[/dim]")
+        else:
+            console.print("[yellow]No clipboard tool found (pbcopy/wl-copy/xclip).[/yellow]")
+
+
 def _print_watcher_hint() -> None:
     """Explain the separate watcher when it is not already running."""
     from .watcher import is_watcher_running
@@ -442,7 +487,7 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
 
     if bootstrap_session:
         console.print(f"[green]Bootstrap session '{name}' created.[/green]")
-        console.print("Run [cyan]nanorun session setup[/cyan] to provision the machine.")
+        _offer_copy(f"nanorun session setup --session {name}", "provision the machine")
     else:
         console.print(f"[green]Session '{name}' started! Config saved to .nanorun/sessions/{name}.json[/green]")
 
