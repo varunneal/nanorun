@@ -567,7 +567,7 @@ _nanorun_agent_tmux() {
     tmux new-session -s "$name" "$cmd"
 }
 claude() { _nanorun_agent_tmux claude --dangerously-skip-permissions "$@"; }
-codex() { _nanorun_agent_tmux codex --dangerously-bypass-approvals-and-sandbox "$@"; }
+codex() { _nanorun_agent_tmux codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen "$@"; }
 """
 
 
