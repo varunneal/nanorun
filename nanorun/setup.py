@@ -524,6 +524,64 @@ def _gather_agent_auth() -> tuple[dict, list[str]]:
     return auth, warnings
 
 
+def push_agent_credentials(remote: RemoteSession) -> bool:
+    """Re-push this device's current Claude Code + Codex credentials to a machine.
+
+    The bootstrap snapshot goes stale by design: Codex rotates its refresh token
+    on every refresh, so once this device's codex refreshes, the machine's copy
+    holds a dead refresh token and can never renew itself — every request 401s
+    with token_expired. Claude Code ages the same way, just more slowly. This is
+    the cheap remedy: overwrite the machine's credential files with whatever is
+    currently valid here, touching nothing else.
+    """
+    import base64
+    import json
+
+    auth, warnings = _gather_agent_auth()
+    for warning in warnings:
+        console.print(f"  [yellow]{warning}[/yellow]")
+    if not auth:
+        console.print("[red]No agent credentials found on this device — nothing to push.[/red]")
+        return False
+
+    # Same home-dir probe as setup: $HOME is sometimes '/' on cloud images.
+    cmds = [
+        "set -e",
+        'H=$(getent passwd $(whoami) 2>/dev/null | cut -d: -f6); '
+        '{ [ -n "$H" ] && [ "$H" != "/" ]; } || H="$HOME"',
+    ]
+    pushed = []
+    if auth.get("claude_creds_b64"):
+        onboarded = base64.b64encode(
+            json.dumps({"hasCompletedOnboarding": True}).encode()
+        ).decode()
+        cmds += [
+            'mkdir -p "$H/.claude"',
+            f"echo '{auth['claude_creds_b64']}' | base64 -d > \"$H/.claude/.credentials.json\"",
+            'chmod 600 "$H/.claude/.credentials.json"',
+            f"[ -f \"$H/.claude.json\" ] || echo '{onboarded}' | base64 -d > \"$H/.claude.json\"",
+        ]
+        pushed.append("claude")
+    if auth.get("codex_auth_b64"):
+        cmds += [
+            'mkdir -p "$H/.codex"',
+            f"echo '{auth['codex_auth_b64']}' | base64 -d > \"$H/.codex/auth.json\"",
+            'chmod 600 "$H/.codex/auth.json"',
+        ]
+        pushed.append("codex")
+
+    result = remote.run("\n".join(cmds), timeout=30)
+    if not result.success:
+        console.print(f"[red]Credential push failed:[/red] {result.stderr.strip()[:200]}")
+        return False
+    console.print(f"[green]Pushed fresh credentials:[/green] {', '.join(pushed)}")
+    console.print(
+        "[dim]A running agent keeps its old token in memory — restart it "
+        "(exit the tmux session or kill its window) to pick these up.[/dim]"
+    )
+    return True
+
+
 # Shell wrappers dropped on bootstrapped machines. `claude` / `codex` launch
 # inside their own persistent tmux session (so an SSH drop doesn't kill the
 # agent) and skip permission prompts — these are ephemeral rented boxes.
