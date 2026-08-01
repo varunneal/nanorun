@@ -755,31 +755,6 @@ def session_setup(verify: bool, interactive: bool, session_name):
         run_setup(remote, auto_yes=not interactive, bootstrap=bool(sc and sc.bootstrap))
 
 
-@session.command("auth")
-@session_option
-def session_auth(session_name):
-    """Re-push Claude Code + Codex credentials to the machine.
-
-    Bootstrap copies this device's tokens once; Codex rotates its refresh token
-    on every refresh, so the machine's copy eventually 401s with token_expired.
-    Run this whenever a machine's agent starts failing auth.
-    """
-    from .setup import push_agent_credentials
-
-    if not _require_command_session(session_name):
-        return
-    sc = resolve_session_config(session_name)
-    if sc and sc.session_type == "local":
-        console.print("[yellow]This is a local session — agents here already use this device's credentials.[/yellow]")
-        return
-    if sc and sc.session_type == "iris":
-        console.print("[yellow]Iris sessions do not run coding agents.[/yellow]")
-        return
-    remote = require_session(session_name)
-    if not push_agent_credentials(remote):
-        raise SystemExit(1)
-
-
 # ============================================================================
 # Track commands
 # ============================================================================
