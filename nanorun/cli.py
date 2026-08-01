@@ -867,6 +867,12 @@ def track_info(name: str):
 # Sync commands
 # ============================================================================
 
+def _paths(paths: list[str], limit: int = 4) -> str:
+    """A few paths, with a count of the rest — enough to judge, short enough to read."""
+    shown = ", ".join(paths[:limit])
+    return shown + (f" (+{len(paths) - limit} more)" if len(paths) > limit else "")
+
+
 def _age(moment) -> str:
     """Compact age of a UTC timestamp: 3h, 12d, 5w."""
     from datetime import datetime, timezone
@@ -880,15 +886,22 @@ def _age(moment) -> str:
 
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Report what would merge; change nothing")
-def pull(dry_run: bool):
+@click.option(
+    "--any-path",
+    is_flag=True,
+    help="Also merge branches that change platform code, not just experiments/",
+)
+def pull(dry_run: bool, any_path: bool):
     """Merge machines' branches into the branch you are on.
 
     The inbound half of sync: machines publish their own `nanorun/local/*`
     branch and never merge it back, so their work accumulates on origin until
-    something pulls it home. Branches that would conflict are reported and
-    skipped — nothing is left half-merged.
+    something pulls it home. Branches that would conflict, or that change
+    anything outside experiments/, are reported and skipped — nothing is left
+    half-merged, and nothing is silently dropped.
     """
     from .sync import (
+        MERGEABLE_PATH_PREFIXES,
         find_incoming_branches,
         get_local_repo_path,
         merge_incoming_branch,
@@ -924,13 +937,22 @@ def pull(dry_run: bool):
     table.add_column("Ahead", justify="right")
     table.add_column("Merge")
     for b in incoming:
+        if b.mergeable(any_path=any_path):
+            verdict = "[green]clean[/green]"
+        else:
+            reasons = []
+            if b.platform_paths and not any_path:
+                reasons.append(f"[magenta]platform ({len(b.platform_paths)})[/magenta]")
+            if b.conflicts:
+                plural = "s" if len(b.conflicts) > 1 else ""
+                reasons.append(f"[yellow]{len(b.conflicts)} conflict{plural}[/yellow]")
+            verdict = " + ".join(reasons)
         table.add_row(
             b.workspace_id,
             b.session_name or "[dim]retired[/dim]",
             _age(b.last_commit),
             str(b.ahead),
-            "[green]clean[/green]" if b.clean
-            else f"[yellow]{len(b.conflicts)} conflict{'s' if len(b.conflicts) > 1 else ''}[/yellow]",
+            verdict,
         )
     console.print(table)
 
@@ -940,7 +962,7 @@ def pull(dry_run: bool):
 
     merged, skipped = 0, []
     for b in incoming:
-        if not b.clean:
+        if not b.mergeable(any_path=any_path):
             skipped.append(b)
             continue
         ok, error = merge_incoming_branch(repo, b)
@@ -952,11 +974,15 @@ def pull(dry_run: bool):
             console.print(f"  [red]failed[/red] {b.workspace_id}: {error.splitlines()[0]}")
 
     for b in skipped:
-        if b.conflicts:
-            paths = ", ".join(b.conflicts[:4])
-            more = f" (+{len(b.conflicts) - 4} more)" if len(b.conflicts) > 4 else ""
-            console.print(f"  [yellow]skipped[/yellow] {b.workspace_id}: {paths}{more}")
-            console.print(f"    [dim]resolve by hand: git merge {b.branch}[/dim]")
+        detail = None
+        if b.platform_paths and not any_path:
+            allowed = " or ".join(MERGEABLE_PATH_PREFIXES)
+            detail = f"changes outside {allowed}: {_paths(b.platform_paths)}"
+        elif b.conflicts:
+            detail = f"conflicts in {_paths(b.conflicts)}"
+        if detail:
+            console.print(f"  [yellow]skipped[/yellow] {b.workspace_id}: {detail}")
+            console.print(f"    [dim]take it deliberately: git merge {b.branch}[/dim]")
 
     console.print(
         f"\n[bold]{merged} merged[/bold], {len(skipped)} skipped."

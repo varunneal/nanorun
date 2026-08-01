@@ -91,6 +91,13 @@ def publish_local_session_branch(config: SessionConfig, *, quiet: bool = False) 
     return True
 
 
+# What a machine's branch may carry home unattended. Machines run coding agents
+# with permission prompts skipped, so a branch that edits the platform itself
+# (or the docs, or the test suite) is not something to absorb without looking —
+# experiment code is additive and self-contained, platform code is not.
+MERGEABLE_PATH_PREFIXES = ("experiments/",)
+
+
 class IncomingBranch:
     """A machine's line of work on origin, measured against the main branch."""
 
@@ -102,6 +109,7 @@ class IncomingBranch:
         ahead: int,
         last_commit: datetime,
         conflicts: list[str],
+        platform_paths: list[str],
     ):
         self.branch = branch                # nanorun/local/{workspace_id}
         self.workspace_id = workspace_id
@@ -109,10 +117,19 @@ class IncomingBranch:
         self.ahead = ahead
         self.last_commit = last_commit
         self.conflicts = conflicts
+        # Paths the branch changed outside MERGEABLE_PATH_PREFIXES.
+        self.platform_paths = platform_paths
 
     @property
     def clean(self) -> bool:
         return not self.conflicts
+
+    @property
+    def experiments_only(self) -> bool:
+        return not self.platform_paths
+
+    def mergeable(self, *, any_path: bool = False) -> bool:
+        return self.clean and (any_path or self.experiments_only)
 
 
 def _test_merge(repo: Path, base: str, branch: str) -> list[str]:
@@ -129,6 +146,21 @@ def _test_merge(repo: Path, base: str, branch: str) -> list[str]:
         return []
     lines = result.stdout.splitlines()[1:]  # drop the tree oid
     return [line for line in lines[: _index_of_blank(lines)] if line.strip()]
+
+
+def _platform_paths(repo: Path, base: str, branch: str) -> list[str]:
+    """Paths `branch` changed outside MERGEABLE_PATH_PREFIXES.
+
+    Three-dot diff: measured from the merge base, so this is what the branch
+    itself introduced, not what `base` has moved on to since.
+    """
+    result = _git(repo, ["diff", "--name-only", f"{base}...{branch}"])
+    if result.returncode != 0:
+        return []
+    return [
+        path for path in result.stdout.splitlines()
+        if path.strip() and not path.startswith(MERGEABLE_PATH_PREFIXES)
+    ]
 
 
 def _index_of_blank(lines: list[str]) -> int:
@@ -180,6 +212,7 @@ def find_incoming_branches(
             ahead=ahead,
             last_commit=datetime.fromtimestamp(int(timestamp), tz=timezone.utc),
             conflicts=_test_merge(repo, base, ref),
+            platform_paths=_platform_paths(repo, base, ref),
         ))
     branches.sort(key=lambda b: b.last_commit)
     return branches
