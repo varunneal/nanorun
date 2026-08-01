@@ -1226,11 +1226,12 @@ def job_add(script: str, env: tuple, name: str, gpus: int | None, prefix: str, f
 @click.option("--name", "-n", default=None, help="Sweep name prefix")
 @click.option("--gpus", "-g", default=None, type=int, help="Number of GPUs (defaults to session gpu_count)")
 @click.option("--prefix", "-p", default=None, help="Command prefix (e.g., 'nsys profile --trace=cuda,nvtx -o trace')")
+@click.option("--first", "-f", is_flag=True, help="Add sweep to front of queue, in sweep order")
 @click.option("--reserve", "-r", default=None, help="TPU reservation name (iris only)")
 @click.option("--module", "-m", "module", default=None, help="Python module to run (iris only)")
 @click.option("--region", default=None, multiple=True, help="GCP region (iris only, can repeat)")
 @session_option
-def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, reserve: str, module: str, region: tuple, session_name):
+def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str, first: bool, reserve: str, module: str, region: tuple, session_name):
     """Add a parameter sweep to the queue.
 
     Track is auto-inferred from script path (if directory has .track.json).
@@ -1291,7 +1292,7 @@ def job_sweep(script: str, env: tuple, name: str, gpus: int | None, prefix: str,
     exp_name = name or Path(script).stem
     results = connector.sweep(
         script_rel, configs, exp_name, track, gpus=gpus, gpu_type=gpu_type,
-        prefix=prefix, reserve=reserve, module=module,
+        prefix=prefix, first=first, reserve=reserve, module=module,
         region=list(region) if region else None,
     )
 
@@ -1334,6 +1335,55 @@ def job_resume(session_name):
     _print_connector_result(result)
 
 
+def _print_session_daemon_status(session_name: str):
+    """One session's daemon state, for `job status --daemon`.
+
+    Sessions without a reachable daemon (bootstrap, iris, dropped tunnel) get a
+    dim note rather than an error — the queue view above is still useful.
+    """
+    from .remote_control import DaemonError, get_daemon_client
+
+    sc = Config.load_session(session_name)
+    if sc and sc.session_type == "iris":
+        console.print("  [dim]daemon: not applicable (iris)[/dim]")
+        return
+    client = get_daemon_client(session_name)
+    if not client:
+        console.print("  [dim]daemon: not applicable for this session[/dim]")
+        return
+    try:
+        with client:
+            if not client.is_daemon_running():
+                console.print("  [red]daemon: not running[/red]")
+                return
+            status = client.get_status()
+    except DaemonError as error:
+        console.print(f"  [yellow]daemon: unreachable ({error})[/yellow]")
+        return
+    d_status = status.get("status", "unknown")
+    d_color = {"idle": "green", "running": "cyan", "paused": "yellow"}.get(d_status, "white")
+    console.print(
+        f"  daemon: [{d_color}]{d_status}[/{d_color}], "
+        f"queue {status.get('queue_length', 0)} pending"
+    )
+    _print_start_block(status)
+
+
+def _print_start_block(status: dict):
+    """Surface a blocked queue head — without this, a queue stuck behind a busy
+    GPU reads exactly like an idle daemon with pending work."""
+    block = status.get("start_block")
+    if not block:
+        return
+    blocked_s = block.get("blocked_s") or 0
+    when = f"{blocked_s / 60:.0f}m" if blocked_s >= 90 else f"{blocked_s:.0f}s"
+    console.print(
+        f"  [yellow]Queue head blocked {when} "
+        f"({block.get('disposition', '?')}): {block.get('error', '')}[/yellow]"
+    )
+    console.print("  [dim]Retries automatically every tick; gpu_busy usually clears itself.[/dim]")
+
+
 @job.command("status")
 @click.option("--daemon", "-d", is_flag=True, help="Also show daemon status from remote")
 @click.option("--session", "session_name", default=None, help="Session name (default: all active sessions)")
@@ -1353,21 +1403,21 @@ def job_status(daemon: bool, session_name):
 
         if not active:
             console.print(f"[bold cyan]{sn}[/bold cyan] [dim](idle)[/dim]")
-            continue
+        else:
+            console.print(f"[bold cyan]{sn}[/bold cyan] [dim]({len(active)} running)[/dim]")
+            table = Table()
+            table.add_column("Job ID", style="cyan")
+            table.add_column("Script")
+            table.add_column("Status")
+            table.add_column("Created")
+            for j in active:
+                color = "green" if j.state == "running" else "yellow"
+                created = j.created_at[:19] if j.created_at else ""
+                table.add_row(j.job_id, j.script or "", f"[{color}]{j.state}[/{color}]", created)
+            console.print(table)
 
-        console.print(f"[bold cyan]{sn}[/bold cyan] [dim]({len(active)} running)[/dim]")
-        table = Table()
-        table.add_column("Job ID", style="cyan")
-        table.add_column("Script")
-        table.add_column("Status")
-        table.add_column("Created")
-        for j in active:
-            color = "green" if j.state == "running" else "yellow"
-            created = j.created_at[:19] if j.created_at else ""
-            table.add_row(j.job_id, j.script or "", f"[{color}]{j.state}[/{color}]", created)
-        console.print(table)
-
-    # Currently running experiment (local view)
+        if daemon:
+            _print_session_daemon_status(sn)
 
 
 @job.command("logs")
@@ -2057,6 +2107,7 @@ def daemon_status(session_name):
                 console.print(f"  Run ID: [dim]{status.get('current_run_id')}[/dim]")
 
         console.print(f"  Queue: {status.get('queue_length', 0)} pending")
+        _print_start_block(status)
 
         # GPU processes
         gpu_procs = status.get("gpu_processes", [])

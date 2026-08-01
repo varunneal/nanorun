@@ -775,12 +775,12 @@ python3 -c "import socket; socket.gethostbyname(socket.gethostname())" 2>/dev/nu
 
 # ── apt (background) ──
 (
-  if dpkg -l git curl tmux rsync build-essential python3-dev 2>/dev/null | grep -c '^ii' | grep -q '^6$'; then
+  if dpkg -l git curl tmux rsync build-essential python3-dev sqlite3 2>/dev/null | grep -c '^ii' | grep -q '^7$'; then
     echo "STATUS:apt:OK:already present"
   else
     OUT=$(DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get update -qq -o Acquire::Languages=none 2>&1 && \\
     DEBIAN_FRONTEND=noninteractive {sudo_prefix}apt-get install -y -qq --no-install-recommends \\
-      git curl tmux rsync build-essential python3-dev 2>&1)
+      git curl tmux rsync build-essential python3-dev sqlite3 2>&1)
     if [ $? -eq 0 ]; then echo "STATUS:apt:OK:installed"; else echo "STATUS:apt:FAIL:$(echo "$OUT" | tail -3 | tr '\\n' ' ')"; fi
   fi
 ) &

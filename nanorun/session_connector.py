@@ -119,15 +119,23 @@ class SessionConnector(ABC):
 
     def sweep(self, script: str, configs: List[Dict[str, str]], name: str,
               track: Optional[str], gpus: int = 1, gpu_type: str = "H100",
-              prefix: Optional[str] = None, **kwargs) -> List[SubmitResult]:
-        """Submit a parameter sweep. Default: call submit() per config."""
+              prefix: Optional[str] = None, first: bool = False,
+              **kwargs) -> List[SubmitResult]:
+        """Submit a parameter sweep. Default: call submit() per config.
+
+        With `first`, configs are submitted in reverse: each prepend lands at
+        position 0, so reversed submission leaves the sweep at the head in its
+        own order rather than backwards.
+        """
         results = []
-        for i, cfg in enumerate(configs):
+        for cfg in (reversed(configs) if first else configs):
             r = self.submit(
                 script, cfg, name, track, gpus=gpus, gpu_type=gpu_type,
-                prefix=prefix, first=False, **kwargs,
+                prefix=prefix, first=first, **kwargs,
             )
             results.append(r)
+        if first:
+            results.reverse()  # report in sweep order, not submission order
         return results
 
     def resolve_script(self, script: str) -> Optional[Path]:
@@ -181,14 +189,22 @@ class SshConnector(SessionConnector):
 
     def sweep(self, script: str, configs: List[Dict[str, str]], name: str,
               track: Optional[str], gpus: int = 1, gpu_type: str = "H100",
-              prefix: Optional[str] = None, **kwargs) -> List[SubmitResult]:
+              prefix: Optional[str] = None, first: bool = False,
+              **kwargs) -> List[SubmitResult]:
+        # Prepends land at position 0, so `first` submits in reverse to leave
+        # the sweep at the head in its own order. Auto-start belongs to the
+        # sweep's first config either way — the last submission when reversed.
         results = []
-        for i, cfg in enumerate(configs):
+        ordered = list(reversed(configs)) if first else configs
+        for i, cfg in enumerate(ordered):
+            starts = (i == len(ordered) - 1) if first else (i == 0)
             r = self.submit(
                 script, cfg, name, track, gpus=gpus, gpu_type=gpu_type,
-                prefix=prefix, first=False, auto_start=(i == 0), **kwargs,
+                prefix=prefix, first=first, auto_start=starts, **kwargs,
             )
             results.append(r)
+        if first:
+            results.reverse()  # report in sweep order, not submission order
         return results
 
     def queue(self) -> List[QueueItem]:
