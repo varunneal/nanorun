@@ -41,7 +41,7 @@ function lossColumnLabel(items) {
 }
 
 function formatLoss(loss, train_time_ms, loss_metric) {
-    if (!loss) return '<span class="val-loss-value">n/a</span>';
+    if (loss == null) return '<span class="val-loss-value">n/a</span>';
     // Train-loss runs get a marker so they're never mistaken for val numbers.
     const tag = loss_metric === 'train_loss' ? '<span class="loss-metric-tag">train</span>' : '';
     const value = `<span class="val-loss-value">${loss.toFixed(4)}</span>${tag}`;
@@ -96,15 +96,14 @@ function isMobile() {
 function detectStepInterval(runs) {
     for (const run of runs) {
         if (run.data && run.data.length >= 2) {
-            const steps = run.data.map(d => d.step).sort((a, b) => a - b);
-            const intervals = [];
-            for (let i = 1; i < steps.length; i++) {
-                const interval = steps[i] - steps[i - 1];
-                if (interval > 0) intervals.push(interval);
+            // Loss curves arrive sorted by step, so count intervals in one pass
+            // without cloning and sorting every point on each chart refresh.
+            const counts = {};
+            for (let i = 1; i < run.data.length; i++) {
+                const interval = run.data[i].step - run.data[i - 1].step;
+                if (interval > 0) counts[interval] = (counts[interval] || 0) + 1;
             }
-            if (intervals.length > 0) {
-                const counts = {};
-                intervals.forEach(i => counts[i] = (counts[i] || 0) + 1);
+            if (Object.keys(counts).length > 0) {
                 const mode = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
                 if (mode) return parseInt(mode[0]);
             }

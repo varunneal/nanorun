@@ -4,6 +4,93 @@ let lossChart = null;
 let _chartOriginalColors = [];
 
 const CHART_COLORS = ['#5a9a5e', '#5a8ab8', '#c9a054', '#b05a7a', '#7a5a9a', '#5a9a9a', '#c9b854', '#8a7058'];
+const LOSS_CHART_MAX_POINTS = 1200;
+
+// Reduce dense curves before handing them to Chart.js. Each bucket keeps its
+// local minimum and maximum (in source order), so spikes and dips survive while
+// the canvas only has to render roughly one point per horizontal pixel.
+function downsampleMinMax(points, maxPoints = LOSS_CHART_MAX_POINTS, valueOf = p => p.loss ?? p.val_loss) {
+    if (!points || points.length <= maxPoints) return points || [];
+    if (maxPoints < 4) throw new Error('maxPoints must be at least 4');
+
+    const result = [points[0]];
+    const interiorLength = points.length - 2;
+    const bucketCount = Math.floor((maxPoints - 2) / 2);
+
+    for (let bucket = 0; bucket < bucketCount; bucket++) {
+        const start = 1 + Math.floor(bucket * interiorLength / bucketCount);
+        const end = 1 + Math.floor((bucket + 1) * interiorLength / bucketCount);
+        if (start >= end) continue;
+
+        let minIndex = start;
+        let maxIndex = start;
+        let minValue = valueOf(points[start]);
+        let maxValue = minValue;
+
+        for (let i = start + 1; i < end; i++) {
+            const value = valueOf(points[i]);
+            if (value < minValue) {
+                minValue = value;
+                minIndex = i;
+            }
+            if (value > maxValue) {
+                maxValue = value;
+                maxIndex = i;
+            }
+        }
+
+        if (minIndex === maxIndex) {
+            result.push(points[minIndex]);
+        } else if (minIndex < maxIndex) {
+            result.push(points[minIndex], points[maxIndex]);
+        } else {
+            result.push(points[maxIndex], points[minIndex]);
+        }
+    }
+
+    result.push(points[points.length - 1]);
+    return result;
+}
+
+function computeLossYBounds(runs) {
+    let minLoss = Infinity;
+    let maxLoss = -Infinity;
+
+    runs.forEach(run => {
+        (run.data || []).forEach(point => {
+            const loss = point.loss ?? point.val_loss;
+            if (!Number.isFinite(loss)) return;
+            minLoss = Math.min(minLoss, loss);
+            maxLoss = Math.max(maxLoss, loss);
+        });
+    });
+
+    if (!Number.isFinite(minLoss) || !Number.isFinite(maxLoss)) return {};
+
+    const span = maxLoss - minLoss;
+    const magnitude = Math.max(Math.abs(minLoss), Math.abs(maxLoss), 1e-6);
+    const padding = Math.max(span * 0.05, magnitude * 0.02, 1e-6);
+    return {
+        // A small negative plotting margin keeps zero and near-zero losses off
+        // the canvas edge. It is display padding only; stored values are intact.
+        min: Math.min(0, minLoss - padding),
+        max: maxLoss + padding
+    };
+}
+
+function computeSeriesBounds(series, pointsOf, valueOf) {
+    let min = Infinity;
+    let max = -Infinity;
+    series.forEach(item => {
+        (pointsOf(item) || []).forEach(point => {
+            const value = valueOf(point);
+            if (!Number.isFinite(value)) return;
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+        });
+    });
+    return { min, max };
+}
 
 function computeHeatmapData(validData, selectedVars = null) {
     const completedData = validData.filter(d => d.status === 'completed');
@@ -619,9 +706,9 @@ function renderResidualChart(residualData) {
 
     const labels = computeSmartLabels(residualData);
 
-    const allSteps = residualData.flatMap(c => c.residuals.map(r => r.step));
-    const dataXMin = Math.min(...allSteps);
-    const maxStep = Math.max(...allSteps);
+    const stepBounds = computeSeriesBounds(residualData, curve => curve.residuals, point => point.step);
+    const dataXMin = stepBounds.min;
+    const maxStep = stepBounds.max;
 
     let chartXRange = State.get('chartXRange');
     if (!chartXRange) {
@@ -642,10 +729,15 @@ function renderResidualChart(residualData) {
 
     const datasets = residualData.map((curve, i) => {
         const color = CHART_COLORS[i % CHART_COLORS.length];
+        const displayResiduals = downsampleMinMax(
+            curve.residuals,
+            LOSS_CHART_MAX_POINTS,
+            point => point.residual
+        );
 
         return {
             label: multiRun ? labels[i] : 'Residual',
-            data: curve.residuals.map(d => ({ x: d.step, y: d.residual })),
+            data: displayResiduals.map(d => ({ x: d.step, y: d.residual })),
             borderColor: color,
             backgroundColor: color,
             borderWidth: 1.5,
@@ -665,13 +757,13 @@ function renderResidualChart(residualData) {
         fill: false
     });
 
-    const allResiduals = residualData.flatMap(c => c.residuals.map(r => r.residual));
-    const minResidual = Math.min(...allResiduals);
-    const maxResidual = Math.max(...allResiduals);
+    const residualBounds = computeSeriesBounds(residualData, curve => curve.residuals, point => point.residual);
+    const minResidual = residualBounds.min;
+    const maxResidual = residualBounds.max;
     const absMax = Math.max(Math.abs(minResidual), Math.abs(maxResidual));
     const yRange = Math.max(absMax * 1.05, 0.02);
 
-    const stepInterval = detectStepInterval(residualData.map(c => ({ data: c.residuals.map(r => ({ step: r.step })) })));
+    const stepInterval = detectStepInterval(residualData.map(c => ({ data: c.residuals })));
 
     lossChart = new Chart(ctx, {
         type: 'line',
@@ -680,6 +772,8 @@ function renderResidualChart(residualData) {
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
+            parsing: false,
+            normalized: true,
             interaction: {
                 mode: 'index',
                 intersect: false
@@ -802,21 +896,24 @@ function updateChartMultiple(runs, totalSteps = 0) {
 
     const datasets = validRuns.map((run, i) => {
         const color = CHART_COLORS[i % CHART_COLORS.length];
+        const displayData = downsampleMinMax(run.data);
         return {
             label: labels[i],
-            data: run.data.map(d => ({ x: d.step, y: d.loss ?? d.val_loss })),
+            data: displayData.map(d => ({ x: d.step, y: d.loss ?? d.val_loss })),
             borderColor: color,
             backgroundColor: color + '20',
             fill: !isMulti,
-            tension: 0.1,
-            pointRadius: isMulti ? 0 : 3,
+            tension: 0,
+            pointRadius: !isMulti && displayData.length <= 100 ? 2 : 0,
+            pointHoverRadius: 3,
+            pointHitRadius: 6,
             borderWidth: isMulti ? 1.5 : 2,
         };
     });
 
-    const allSteps = validRuns.flatMap(r => r.data.map(d => d.step));
-    const dataXMin = Math.min(...allSteps);
-    const dataXMax = Math.max(...allSteps);
+    const stepBounds = computeSeriesBounds(validRuns, run => run.data, point => point.step);
+    const dataXMin = stepBounds.min;
+    const dataXMax = stepBounds.max;
     const xMax = totalSteps > 0 ? Math.max(totalSteps, dataXMax) : dataXMax;
 
     let chartXRange = State.get('chartXRange');
@@ -826,6 +923,7 @@ function updateChartMultiple(runs, totalSteps = 0) {
     }
 
     const stepInterval = detectStepInterval(validRuns);
+    const yBounds = computeLossYBounds(validRuns);
 
     renderChartLegend(validRuns);
 
@@ -846,6 +944,8 @@ function updateChartMultiple(runs, totalSteps = 0) {
             responsive: true,
             maintainAspectRatio: false,
             animation: false,
+            parsing: false,
+            normalized: true,
             interaction: {
                 mode: 'x',
                 intersect: false
@@ -865,6 +965,8 @@ function updateChartMultiple(runs, totalSteps = 0) {
                 },
                 y: {
                     title: { display: false },
+                    min: yBounds.min,
+                    max: yBounds.max,
                     grid: { color: 'rgba(255, 255, 255, 0.15)', lineWidth: 1 }
                 }
             },

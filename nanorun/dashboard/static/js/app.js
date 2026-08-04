@@ -410,7 +410,7 @@ async function selectExperiment(codeHashOrId, experimentIds) {
                 <div class="stats-hero">
                     <div class="stat-box">
                         <span class="stat-label">${isMultiple ? `Mean ${lossLabel(lossMetric, true)} Loss` : lossLabel(lossMetric)}</span>
-                        <span class="stat-value ${lossMetric !== 'train_loss' && meanValLoss && meanValLoss < 3.3 ? 'good' : ''}">${meanValLoss ? meanValLoss.toFixed(4) : 'n/a'}</span>
+                        <span class="stat-value ${lossMetric !== 'train_loss' && meanValLoss != null && meanValLoss < 3.3 ? 'good' : ''}">${meanValLoss != null ? meanValLoss.toFixed(4) : 'n/a'}</span>
                         ${isMultiple && valLosses.length > 1 ? `<span class="stat-range">(${Math.min(...valLosses).toFixed(4)}-${Math.max(...valLosses).toFixed(4)})</span>` : ''}
                     </div>
                     <div class="stat-box">
@@ -536,7 +536,7 @@ async function refreshQueue() {
                         </div>
                         <span class="progress-text">${r.current_step || 0}/${r.total_steps || '?'}</span>
                     </div>
-                    ${(r.loss ?? r.val_loss) ? `<div class="queue-running-loss">${lossLabel(r.loss_metric)}: ${(r.loss ?? r.val_loss).toFixed(4)}</div>` : ''}
+                    ${(r.loss ?? r.val_loss) != null ? `<div class="queue-running-loss">${lossLabel(r.loss_metric)}: ${(r.loss ?? r.val_loss).toFixed(4)}</div>` : ''}
                 </div>
             `;
         });

@@ -454,7 +454,7 @@ function renderRunsTable() {
                     ${sessionHtml}
                     <td class="started-at">${formatStartedAt(d.started_at)}</td>
                     ${envHtml}
-                    <td class="val-loss">${(d.final_loss ?? d.final_val_loss) ? (d.final_loss ?? d.final_val_loss).toFixed(4) : 'n/a'}</td>
+                    <td class="val-loss">${(d.final_loss ?? d.final_val_loss) != null ? (d.final_loss ?? d.final_val_loss).toFixed(4) : 'n/a'}</td>
                     <td>${d.final_train_time_ms ? (d.final_train_time_ms/1000).toFixed(1) + 's' : 'n/a'}</td>
                     <td>${isBucketView
                         ? `<button class="delete-icon bucket-remove" onclick="event.stopPropagation(); removeFromBucket(${d.id})" title="Remove from bucket"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>`
@@ -480,7 +480,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
     }
 
     // Show most recent first
-    const recentData = lossData.slice().reverse();
+    const recentData = lossData.slice(-20).reverse();
     const isMultiple = currentValidData && currentValidData.length > 1;
 
     // Store for clipboard copy (full data, not just recent)
@@ -504,7 +504,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
                 ${recentData.map(m => `
                     <tr>
                         <td>${m.step}</td>
-                        <td class="val-loss">${(m.loss ?? m.val_loss) ? (m.loss ?? m.val_loss).toFixed(4) : '-'}</td>
+                        <td class="val-loss">${(m.loss ?? m.val_loss) != null ? (m.loss ?? m.val_loss).toFixed(4) : '-'}</td>
                         <td>${m.train_time_ms ? formatTime(m.train_time_ms) : '-'}</td>
                         <td>${m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-'}</td>
                     </tr>
@@ -527,7 +527,7 @@ function copyMetricsAsMarkdown() {
 
     currentMetricsData.forEach(m => {
         const step = m.step;
-        const valLoss = (m.loss ?? m.val_loss) ? (m.loss ?? m.val_loss).toFixed(4) : '-';
+        const valLoss = (m.loss ?? m.val_loss) != null ? (m.loss ?? m.val_loss).toFixed(4) : '-';
         const time = m.train_time_ms ? formatTime(m.train_time_ms) : '-';
         const stepAvg = m.step_avg_ms ? m.step_avg_ms.toFixed(1) + 'ms' : '-';
         lines.push(`| ${step} | ${valLoss} | ${time} | ${stepAvg} |`);
@@ -567,7 +567,7 @@ function copyRunsAsMarkdown() {
     runs.forEach(d => {
         const runId = d.remote_run_id || `#${d.id}`;
         const status = statusLabel(d.status || 'unknown');
-        const valLoss = (d.final_loss ?? d.final_val_loss) ? (d.final_loss ?? d.final_val_loss).toFixed(4) : '-';
+        const valLoss = (d.final_loss ?? d.final_val_loss) != null ? (d.final_loss ?? d.final_val_loss).toFixed(4) : '-';
         const time = d.final_train_time_ms ? (d.final_train_time_ms / 1000).toFixed(1) + 's' : '-';
         const script = d.script ? d.script.split('/').pop().replace('.py', '') : d.name;
         const env = Object.entries(d.env_vars || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '-';
