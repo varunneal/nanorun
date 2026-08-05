@@ -234,6 +234,9 @@ function _buildExperimentListHtml(experiments) {
 }
 
 async function refreshExperiments() {
+    if (_dashboardSnapshotReady) {
+        return renderExperimentListData(getDashboardExperimentGroups());
+    }
     const searchFilter = document.getElementById('search-filter').value.trim();
     const statusFilter = document.getElementById('status-filter').value;
     const trackFilter = document.getElementById('track-filter').value;
@@ -247,19 +250,24 @@ async function refreshExperiments() {
     const response = await fetch(url);
     let data = await response.json();
 
-    const listEl = document.getElementById('experiments-list');
+    return renderExperimentListData(data.experiments);
+}
 
-    if (data.experiments.length === 0) {
+function renderExperimentListData(experiments) {
+    const listEl = document.getElementById('experiments-list');
+    State.set('experimentList', experiments);
+
+    if (experiments.length === 0) {
         listEl.innerHTML = '<p class="placeholder">No experiments found. Run "nanorun run &lt;script&gt;" to start an experiment.</p>';
         _lastExperimentsJson = null;
         return [];
     }
 
     // Only rebuild sidebar DOM if the data actually changed
-    const fingerprint = JSON.stringify(data.experiments.map(e => [e.code_hash || e.id, e.status, e.loss ?? e.val_loss, e.current_step]));
+    const fingerprint = JSON.stringify(experiments.map(e => [e.group_key || e.code_hash || e.id, e.status, e.loss ?? e.val_loss, e.current_step, e.experiment_ids]));
     if (fingerprint !== _lastExperimentsJson) {
         _lastExperimentsJson = fingerprint;
-        listEl.innerHTML = _buildExperimentListHtml(data.experiments);
+        listEl.innerHTML = _buildExperimentListHtml(experiments);
 
         // Re-highlight selected
         const sel = State.get('selectedExp');
@@ -272,18 +280,22 @@ async function refreshExperiments() {
         renderBucketCard();
     }
 
-    return data.experiments;
+    return experiments;
 }
 
 // --- selectExperiment (main orchestrator) ---
 
-async function selectExperiment(codeHashOrId, experimentIds) {
+let _selectionGeneration = 0;
+let _selectionAbortController = null;
+
+async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = null) {
+    const generation = ++_selectionGeneration;
+    if (_selectionAbortController) _selectionAbortController.abort();
+    _selectionAbortController = new AbortController();
+    const signal = _selectionAbortController.signal;
     State.set('selectedQueuedScript', null);
     const prevExp = State.get('selectedExp');
     const isSameExperiment = prevExp === codeHashOrId;
-
-    // Reset metrics version tracking when switching experiments
-    if (!isSameExperiment) _lastMetricsVersion = null;
 
     State.update({
         selectedExp: codeHashOrId,
@@ -294,6 +306,7 @@ async function selectExperiment(codeHashOrId, experimentIds) {
         State.update({
             selectedRun: null,
             selectedCellExpIds: null,
+            selectedLossMetric: null,
             heatmapSelectedVars: [],
             chartView: null,
         });
@@ -304,10 +317,20 @@ async function selectExperiment(codeHashOrId, experimentIds) {
         el.classList.toggle('selected', el.dataset.id == codeHashOrId);
     });
 
-    // Fetch details for all experiments in the group
-    const allData = await Promise.all(
-        experimentIds.map(id => fetch(`/api/experiment/${id}`).then(r => r.json()))
-    );
+    // Fetch bounded chart details. A preloaded update can re-render the group
+    // without re-requesting completed siblings.
+    let allData;
+    try {
+        allData = prefetchedData || await Promise.all(
+            experimentIds.map(id => fetch(
+                `/api/experiment/${id}/chart?max_points=1200`, { signal }
+            ).then(r => r.json()))
+        );
+    } catch (error) {
+        if (error.name === 'AbortError') return;
+        throw error;
+    }
+    if (generation !== _selectionGeneration || signal.aborted) return;
     const validData = allData.filter(d => !d.error);
     if (validData.length === 0) {
         document.getElementById('experiment-details').innerHTML = '<p class="error">No valid experiments found</p>';
@@ -319,6 +342,10 @@ async function selectExperiment(codeHashOrId, experimentIds) {
 
     // Store experiment data in state
     State.set('experimentData', validData);
+    const activeLossMetric = getActiveLossMetric(validData);
+    if (State.get('selectedLossMetric') !== activeLossMetric) {
+        State.set('selectedLossMetric', activeLossMetric);
+    }
     State.set('currentTotalSteps', Math.max(...validData.map(d => d.total_steps || 0)));
 
     // Load heatmap defaults for this code hash
@@ -329,7 +356,8 @@ async function selectExperiment(codeHashOrId, experimentIds) {
         if (partialVars.length > 0 && primary.script) {
             const needsAutoDetect = partialVars.some(k => !heatmapDefs[k] || heatmapDefs[k] === '(default)');
             if (needsAutoDetect) {
-                fetch(`/api/env-defaults/${primary.script}`).then(r => r.json()).then(data => {
+                fetch(`/api/env-defaults/${primary.script}`, { signal }).then(r => r.json()).then(data => {
+                    if (generation !== _selectionGeneration || signal.aborted) return;
                     if (data.defaults) {
                         let changed = false;
                         for (const key of partialVars) {
@@ -353,8 +381,6 @@ async function selectExperiment(codeHashOrId, experimentIds) {
     // Check if sweep
     const envVarStrings = new Set(validData.map(d => JSON.stringify(d.env_vars || {})));
     const isSweep = envVarStrings.size > 1;
-
-    const chartableData = validData.filter(d => d.status !== 'queued');
 
     // Final summary statistics include only runs with a confirmed completion.
     // Failed, cancelled, unknown, and queued runs may have useful partial
@@ -455,21 +481,8 @@ async function selectExperiment(codeHashOrId, experimentIds) {
         State.set('selectedRun', null);
     }
 
-    // Metrics table
-    const currentCellIds = State.get('selectedCellExpIds');
-    const currentRunId = State.get('selectedRun');
-    if (currentCellIds) {
-        showAveragedMetricsForCell(currentCellIds);
-    } else if (currentRunId) {
-        const exp = validData.find(d => d.id === currentRunId);
-        if (exp) updateMetricsTable(exp.loss_curve, false, currentRunId);
-    } else if (isMultiple) {
-        const allCurves = chartableData.map(d => d.loss_curve);
-        const averaged = computeAveragedMetrics(allCurves);
-        updateMetricsTable(averaged, true, null);
-    } else {
-        updateMetricsTable(primary.loss_curve, false, null);
-    }
+    // Metrics table follows the selected train/validation series.
+    refreshMetricsTable();
 
     updateRunRowHighlights();
     updateHeatmapHighlights();
@@ -484,9 +497,100 @@ async function selectExperiment(codeHashOrId, experimentIds) {
     if (!isSameExperiment && isMobile()) switchMobilePanel('detail');
 }
 
+async function handleSelectedExperimentEvent(eventType, payload, revision) {
+    const generation = _selectionGeneration;
+    const selectedKey = State.get('selectedExp');
+    const experimentId = Number(payload.experiment_id);
+    const selectedIds = (State.get('selectedExpIds') || []).map(Number);
+    const currentData = State.get('experimentData') || [];
+    if (!experimentId || currentData.length === 0) return;
+
+    const currentGroupKey = dashboardGroupKey(currentData[0]);
+    const incomingSummary = payload.summary;
+    const incomingGroupKey = incomingSummary ? dashboardGroupKey(incomingSummary) : null;
+    let nextIds = selectedIds.slice();
+    const wasSelected = nextIds.includes(experimentId);
+    const belongsToSelectedGroup = incomingGroupKey === currentGroupKey;
+
+    if (eventType === 'experiment.deleted' || (wasSelected && !belongsToSelectedGroup)) {
+        nextIds = nextIds.filter(id => id !== experimentId);
+    } else if (belongsToSelectedGroup && !wasSelected) {
+        nextIds.push(experimentId);
+    }
+    if (!wasSelected && !belongsToSelectedGroup) return;
+
+    if (nextIds.length === 0) {
+        State.update({ selectedExp: null, selectedExpIds: null, experimentData: null });
+        document.getElementById('experiment-details').innerHTML = '<p class="placeholder">Select an experiment to view details</p>';
+        return;
+    }
+
+    if (eventType === 'metrics.changed' && wasSelected && belongsToSelectedGroup) {
+        await refreshSelectedMetricCurve(experimentId, revision, generation);
+        return;
+    }
+
+    let nextData = currentData.filter(item => nextIds.includes(Number(item.id)));
+    if (eventType !== 'experiment.deleted' && belongsToSelectedGroup) {
+        try {
+            const response = await fetch(`/api/experiment/${experimentId}/chart?max_points=1200`);
+            if (!response.ok || generation !== _selectionGeneration ||
+                _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
+            const detail = await response.json();
+            if (generation !== _selectionGeneration ||
+                _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
+            const existingIndex = nextData.findIndex(item => Number(item.id) === experimentId);
+            if (existingIndex >= 0) nextData[existingIndex] = detail;
+            else nextData.push(detail);
+        } catch (error) {
+            console.warn('Targeted experiment refresh failed:', error);
+            return;
+        }
+    }
+    if (generation !== _selectionGeneration || State.get('selectedExp') !== selectedKey) return;
+    await selectExperiment(selectedKey, nextIds, nextData);
+}
+
+async function refreshSelectedMetricCurve(experimentId, revision, generation = _selectionGeneration) {
+    const currentData = State.get('experimentData') || [];
+    const existing = currentData.find(item => Number(item.id) === Number(experimentId));
+    if (!existing) return;
+    const activeMetric = State.get('selectedLossMetric') || getActiveLossMetric(currentData);
+    const params = new URLSearchParams({ max_points: '1200' });
+    if (activeMetric) params.set('loss_metric', activeMetric);
+    try {
+        const response = await fetch(`/api/experiment/${experimentId}/chart?${params}`);
+        if (!response.ok || generation !== _selectionGeneration ||
+            _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
+        const patch = await response.json();
+        if (generation !== _selectionGeneration ||
+            _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
+        const merged = {
+            ...existing,
+            ...patch,
+            loss_curves: { ...(existing.loss_curves || {}), ...(patch.loss_curves || {}) },
+        };
+        if (!patch.loss_curve?.length && existing.loss_curve?.length) {
+            merged.loss_curve = existing.loss_curve;
+        }
+        const nextData = currentData.map(item => Number(item.id) === Number(experimentId) ? merged : item);
+        State.set('experimentData', nextData);
+        State.set('currentTotalSteps', Math.max(...nextData.map(item => item.total_steps || 0)));
+        renderRunsTable();
+        refreshMetricsTable();
+        replaceVisibleRunCurve(experimentId);
+    } catch (error) {
+        console.warn('Targeted metric refresh failed:', error);
+    }
+}
+
 // --- Queue ---
 
 async function refreshQueueCount() {
+    if (_dashboardSnapshotReady && getDashboardQueueData()) {
+        renderQueueData(getDashboardQueueData());
+        return;
+    }
     try {
         const response = await fetch('/api/queue');
         const data = await response.json();
@@ -497,12 +601,24 @@ async function refreshQueueCount() {
 }
 
 async function refreshQueue() {
+    if (_dashboardSnapshotReady && getDashboardQueueData()) {
+        renderQueueData(getDashboardQueueData());
+        return;
+    }
     try {
         const response = await fetch('/api/queue');
         const data = await response.json();
+        _dashboardQueueData = data;
+        renderQueueData(data);
+    } catch (e) {
+        console.error('Failed to refresh queue:', e);
+    }
+}
 
+function renderQueueData(data) {
         const contentEl = document.getElementById('queue-content');
         const stateBadge = document.getElementById('queue-state-badge');
+        if (!contentEl || !stateBadge || !data) return;
 
         stateBadge.textContent = data.state;
         stateBadge.className = `queue-state-badge ${data.state}`;
@@ -572,9 +688,6 @@ async function refreshQueue() {
         const queueBtn = document.querySelector('.view-btn[data-view="queue"]');
         const queueCount = (data.queued ? data.queued.length : 0) + runningList.length;
         if (queueBtn) queueBtn.textContent = queueCount > 0 ? `Queue (${queueCount})` : 'Queue';
-    } catch (e) {
-        console.error('Failed to refresh queue:', e);
-    }
 }
 
 async function goToQueuedItem(scriptPath) {
@@ -612,8 +725,18 @@ async function goToQueuedItem(scriptPath) {
 
 async function goToExperiment(expId) {
     if (!expId) return;
+    if (_dashboardSnapshotReady) {
+        const match = getDashboardExperimentGroups().find(group =>
+            (group.experiment_ids || [group.id]).map(Number).includes(Number(expId))
+        );
+        if (match) {
+            await selectExperiment(match.code_hash || match.id, match.experiment_ids || [match.id]);
+            if (State.get('view') === 'queue') refreshQueue();
+            return;
+        }
+    }
     try {
-        const resp = await fetch(`/api/experiment/${expId}`);
+        const resp = await fetch(`/api/experiment/${expId}/chart?max_points=1200`);
         const exp = await resp.json();
         if (exp.error) return;
         const codeHash = exp.code_hash;
@@ -643,6 +766,10 @@ let _sessionPopoverOpen = null;
 let _hubData = {};
 
 async function refreshSessionChips() {
+    if (_dashboardSnapshotReady) {
+        if (!_sessionPopoverOpen) renderSessionChips();
+        return;
+    }
     try {
         const resp = await fetch('/api/sessions');
         const data = await resp.json();
@@ -817,6 +944,10 @@ async function doReconnect(name) {
 }
 
 async function doRemoveSession(name) {
+    const confirmed = window.confirm(
+        `Remove ${name}? Any running or queued experiments for this machine will be marked cancelled.`
+    );
+    if (!confirmed) return;
     closeSessionPopover();
     const resp = await fetch(`/api/sessions/${name}`, { method: 'DELETE' });
     const data = await resp.json();
@@ -851,37 +982,11 @@ async function revealInFinder(expId) {
     }
 }
 
-// --- Auto-refresh / init ---
-
-let refreshInterval = null;
-let _lastMetricsVersion = null;
-
-async function _checkMetricsChanged() {
-    /**
-     * Lightweight poll: only returns true when metric rows have actually changed
-     * for the currently selected experiments.
-     */
-    const selIds = State.get('selectedExpIds');
-    if (!selIds || selIds.length === 0) return false;
-    try {
-        const resp = await fetch(`/api/metrics/version?experiment_ids=${selIds.join(',')}`);
-        const data = await resp.json();
-        const version = data.version;
-        if (_lastMetricsVersion === null) {
-            _lastMetricsVersion = version;
-            return false;
-        }
-        if (version !== _lastMetricsVersion) {
-            _lastMetricsVersion = version;
-            return true;
-        }
-        return false;
-    } catch {
-        return false;
-    }
-}
+// --- Snapshot + event stream init ---
 
 async function startAutoRefresh() {
+    await loadDashboardSnapshot();
+
     // Restore view
     const savedView = State.get('view');
     if (savedView === 'queue') {
@@ -891,11 +996,12 @@ async function startAutoRefresh() {
         document.querySelectorAll('.panel-view').forEach(view => {
             view.classList.toggle('active', view.id === 'queue-view');
         });
-        refreshQueue();
+        renderQueueData(getDashboardQueueData());
     }
 
     const experiments = await refreshExperiments();
-    refreshQueueCount();
+    renderQueueData(getDashboardQueueData());
+    renderSessionChips();
 
     // Restore tab
     const savedTab = State.get('tab');
@@ -930,26 +1036,7 @@ async function startAutoRefresh() {
         selectExperiment(first.code_hash || first.id, first.experiment_ids || [first.id]);
     }
 
-    refreshInterval = setInterval(async () => {
-        if (State.get('deleteInProgress')) return;
-        if (State.get('view') === 'queue') {
-            refreshQueue();
-        } else {
-            refreshExperiments();
-            refreshQueueCount();
-            // Only re-fetch detail panel when metrics actually changed
-            const sel = State.get('selectedExp');
-            const selIds = State.get('selectedExpIds');
-            const expData = State.get('experimentData');
-            const hasRunning = expData && expData.some(d => d.status === 'running');
-            if (sel && selIds && selIds.length > 0 && hasRunning) {
-                const changed = await _checkMetricsChanged();
-                if (changed) {
-                    selectExperiment(sel, selIds);
-                }
-            }
-        }
-    }, 5000);
+    connectDashboardEvents(_dashboardLastEventId);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -964,9 +1051,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     loadTracks();
-    startAutoRefresh();
-    refreshSessionChips();
-    setInterval(refreshSessionChips, 5000);
+    startAutoRefresh().catch(error => {
+        console.error('Dashboard initialization failed:', error);
+    });
 
     // Mobile init
     function initMobileState() {

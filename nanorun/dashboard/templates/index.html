@@ -83,27 +83,33 @@
             <div class="meta-chart-block">
                 <div class="meta-row-wrapper">
                     <div id="meta-row-container"></div>
-                    <div class="chart-view-switcher" id="chart-view-switcher">
-                        <button class="chart-view-btn" data-view="heatmap" onclick="switchChartView('heatmap')" title="Heatmap view">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                <rect x="3" y="3" width="5" height="5" rx="1"/><rect x="10" y="3" width="5" height="5" rx="1"/><rect x="17" y="3" width="5" height="5" rx="1"/>
-                                <rect x="3" y="10" width="5" height="5" rx="1"/><rect x="10" y="10" width="5" height="5" rx="1"/><rect x="17" y="10" width="5" height="5" rx="1"/>
-                                <rect x="3" y="17" width="5" height="5" rx="1"/><rect x="10" y="17" width="5" height="5" rx="1"/><rect x="17" y="17" width="5" height="5" rx="1"/>
-                            </svg>
-                        </button>
-                        <button class="chart-view-btn" data-view="residual" onclick="switchChartView('residual')" title="Residual view">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                <rect x="2" y="11" width="20" height="2"/>
-                                <path d="M4 8 L8 5 L12 9 L16 4 L20 7" stroke="currentColor" stroke-width="2" fill="none"/>
-                                <path d="M4 16 L8 19 L12 15 L16 20 L20 17" stroke="currentColor" stroke-width="2" fill="none"/>
-                            </svg>
-                        </button>
-                        <button class="chart-view-btn" data-view="line" onclick="switchChartView('line')" title="Line graph view">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                <path d="M3 17 L8 12 L12 14 L17 8 L21 10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
-                                <circle cx="3" cy="17" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="12" cy="14" r="2"/><circle cx="17" cy="8" r="2"/><circle cx="21" cy="10" r="2"/>
-                            </svg>
-                        </button>
+                    <div class="chart-header-controls">
+                        <div class="loss-metric-switcher" id="loss-metric-switcher" role="group" aria-label="Loss series">
+                            <button class="loss-metric-btn" data-loss-metric="val_loss" onclick="switchLossMetric('val_loss')">Val</button>
+                            <button class="loss-metric-btn" data-loss-metric="train_loss" onclick="switchLossMetric('train_loss')">Train</button>
+                        </div>
+                        <div class="chart-view-switcher" id="chart-view-switcher">
+                            <button class="chart-view-btn" data-view="heatmap" onclick="switchChartView('heatmap')" title="Heatmap view">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <rect x="3" y="3" width="5" height="5" rx="1"/><rect x="10" y="3" width="5" height="5" rx="1"/><rect x="17" y="3" width="5" height="5" rx="1"/>
+                                    <rect x="3" y="10" width="5" height="5" rx="1"/><rect x="10" y="10" width="5" height="5" rx="1"/><rect x="17" y="10" width="5" height="5" rx="1"/>
+                                    <rect x="3" y="17" width="5" height="5" rx="1"/><rect x="10" y="17" width="5" height="5" rx="1"/><rect x="17" y="17" width="5" height="5" rx="1"/>
+                                </svg>
+                            </button>
+                            <button class="chart-view-btn" data-view="residual" onclick="switchChartView('residual')" title="Residual view">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <rect x="2" y="11" width="20" height="2"/>
+                                    <path d="M4 8 L8 5 L12 9 L16 4 L20 7" stroke="currentColor" stroke-width="2" fill="none"/>
+                                    <path d="M4 16 L8 19 L12 15 L16 20 L20 17" stroke="currentColor" stroke-width="2" fill="none"/>
+                                </svg>
+                            </button>
+                            <button class="chart-view-btn" data-view="line" onclick="switchChartView('line')" title="Line graph view">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M3 17 L8 12 L12 14 L17 8 L21 10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/>
+                                    <circle cx="3" cy="17" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="12" cy="14" r="2"/><circle cx="17" cy="8" r="2"/><circle cx="21" cy="10" r="2"/>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
                 </div>
                 <div class="chart-container">
@@ -190,6 +196,7 @@
     <script src="/static/js/utils.js?v={{ v }}"></script>
     <script src="/static/js/chart.js?v={{ v }}"></script>
     <script src="/static/js/runs.js?v={{ v }}"></script>
+    <script src="/static/js/events.js?v={{ v }}"></script>
     <script src="/static/js/app.js?v={{ v }}"></script>
 </body>
 </html>

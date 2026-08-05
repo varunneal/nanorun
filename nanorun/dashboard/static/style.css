@@ -772,6 +772,49 @@ main {
     justify-content: space-between;
 }
 
+.chart-header-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+    padding-right: 1rem;
+}
+
+.loss-metric-switcher {
+    display: none;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+}
+
+.loss-metric-switcher.visible {
+    display: flex;
+}
+
+.loss-metric-btn {
+    background: var(--bg-dark);
+    border: 0;
+    border-right: 1px solid var(--border);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: var(--font-sm);
+    padding: 0.35rem 0.55rem;
+}
+
+.loss-metric-btn:last-child {
+    border-right: 0;
+}
+
+.loss-metric-btn:hover {
+    background: var(--bg-hover);
+}
+
+.loss-metric-btn.active {
+    background: var(--accent-dim);
+    color: var(--accent);
+}
+
 /* Compact legend table */
 .chart-legend {
     flex-shrink: 0;
@@ -1720,7 +1763,6 @@ main {
     display: flex;
     gap: 4px;
     flex-shrink: 0;
-    padding-right: 1rem;
 }
 
 .chart-view-btn {

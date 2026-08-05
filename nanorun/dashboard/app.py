@@ -1,12 +1,21 @@
 """FastAPI dashboard application."""
 
+import asyncio
+import json
 import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -23,6 +32,9 @@ from ..tracker import (
     get_loss_metrics,
     get_db,
     get_crash_log as get_crash_log_content,
+    get_dashboard_event_bounds,
+    get_dashboard_events,
+    append_dashboard_event,
 )
 
 app = FastAPI(title="nanorun Dashboard")
@@ -35,6 +47,9 @@ app.mount("/static", StaticFiles(directory=DASHBOARD_DIR / "static"), name="stat
 
 # Cache buster: changes on each server start
 BOOT_VERSION = str(int(time.time()))
+SSE_HEARTBEAT_SECONDS = 15.0
+SSE_POLL_SECONDS = 0.1
+SSE_REPLAY_BATCH = 100
 
 
 def _resolve_within(root: Path, untrusted_path: str) -> Optional[Path]:
@@ -55,6 +70,94 @@ async def list_themes():
     """List available themes from the themes directory."""
     themes_dir = DASHBOARD_DIR / "static" / "themes"
     return [p.stem for p in sorted(themes_dir.glob("*.css"))]
+
+
+def _format_sse(event: dict) -> str:
+    """Serialize one durable dashboard event as a standard SSE record."""
+    return (
+        f"id: {event['id']}\n"
+        f"event: {event['event_type']}\n"
+        f"data: {json.dumps(event['payload'], separators=(',', ':'))}\n\n"
+    )
+
+
+def _requested_event_id(request: Request, after: Optional[int]) -> int:
+    """Resolve explicit and native EventSource replay cursors safely."""
+    candidates = [after if after is not None else 0]
+    header = request.headers.get("last-event-id")
+    if header:
+        try:
+            candidates.append(int(header))
+        except ValueError:
+            pass
+    return max(0, *candidates)
+
+
+@app.get("/api/events")
+async def dashboard_events(request: Request, after: Optional[int] = None):
+    """Replay retained projection changes, then stream newly committed ones."""
+    requested_after = _requested_event_id(request, after)
+
+    async def replay_stream():
+        cursor = requested_after
+        last_output = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                return
+
+            oldest, newest = await asyncio.to_thread(get_dashboard_event_bounds)
+            if oldest and cursor < oldest - 1:
+                reset = {
+                    "id": newest,
+                    "event_type": "dashboard.reset",
+                    "payload": {
+                        "reason": "replay_unavailable",
+                        "oldest_event_id": oldest,
+                        "last_event_id": newest,
+                        "revision": newest,
+                    },
+                }
+                yield _format_sse(reset)
+                return
+
+            events = await asyncio.to_thread(
+                get_dashboard_events, cursor, SSE_REPLAY_BATCH,
+            )
+            if events:
+                for event in events:
+                    cursor = event["id"]
+                    yield _format_sse(event)
+                last_output = time.monotonic()
+                continue
+
+            now = time.monotonic()
+            if now - last_output >= SSE_HEARTBEAT_SECONDS:
+                # Comments keep the connection alive without advancing replay ID.
+                yield ": heartbeat\n\n"
+                last_output = now
+            await asyncio.sleep(SSE_POLL_SECONDS)
+
+    async def stream():
+        app.state.sse_connected_clients = (
+            getattr(app.state, "sse_connected_clients", 0) + 1
+        )
+        try:
+            async for record in replay_stream():
+                yield record
+        finally:
+            app.state.sse_connected_clients = max(
+                0, getattr(app.state, "sse_connected_clients", 1) - 1,
+            )
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
@@ -131,143 +234,135 @@ def _batch_latest_metrics(experiment_ids: List[int]) -> dict:
     }
 
 
-@app.get("/api/experiments")
-async def list_experiments(track: Optional[str] = None, status: Optional[str] = None, search: Optional[str] = None, limit: int = 100, aggregate: bool = True):
-    """List experiments, optionally aggregated by code_hash."""
-    # Aggregation collapses sweeps (50+ runs each), so fetch more raw rows than display limit
-    experiments = get_experiments(track=track, status=status, search=search, limit=2000)
-
-    # Batch-fetch latest metrics in one query instead of N+1
-    all_ids = [exp.id for exp in experiments]
-    latest_metrics = _batch_latest_metrics(all_ids)
-
-    if not aggregate:
-        # Return flat list (old behavior)
-        results = []
-        for exp in experiments:
-            m = latest_metrics.get(exp.id)
-            results.append({
-                "id": exp.id,
-                "name": exp.name,
-                "track": exp.track,
-                "script": exp.script,
+def _flat_experiment_summaries(
+    track: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    revision: int = 0,
+) -> list[dict]:
+    """Return the normalized experiment state used by snapshots and patches."""
+    experiments = get_experiments(
+        track=track, status=status, search=search, limit=2000,
+    )
+    latest_metrics = _batch_latest_metrics([exp.id for exp in experiments])
+    results = []
+    for exp in experiments:
+        m = latest_metrics.get(exp.id)
+        results.append({
+            "id": exp.id,
+            "name": exp.name,
+            "track": exp.track,
+            "script": exp.script,
+            "code_hash": exp.code_hash,
+            "status": exp.status,
+            "gpus": exp.gpus,
+            "gpu_type": exp.gpu_type,
+            "env_vars": exp.env_vars,
+            "session_name": exp.session_name,
+            "remote_run_id": exp.remote_run_id,
+            "started_at": exp.started_at.isoformat() if exp.started_at else None,
+            "finished_at": exp.finished_at.isoformat() if exp.finished_at else None,
+            "current_step": m["step"] if m else None,
+            "total_steps": m["total_steps"] if m else None,
+            "val_loss": m["val_loss"] if m else None,
+            "train_loss": m["train_loss"] if m else None,
+            "loss": m["loss"] if m else None,
+            "loss_metric": m["loss_metric"] if m else None,
+            "train_time_ms": m["train_time_ms"] if m else None,
+            "revision": revision,
+            "group": {
                 "code_hash": exp.code_hash,
-                "status": exp.status,
+                "track": exp.track or "",
                 "gpus": exp.gpus,
-                "gpu_type": exp.gpu_type,
-                "env_vars": exp.env_vars,
-                "started_at": exp.started_at.isoformat() if exp.started_at else None,
-                "finished_at": exp.finished_at.isoformat() if exp.finished_at else None,
-                "current_step": m["step"] if m else None,
-                "total_steps": m["total_steps"] if m else None,
-                "val_loss": m["val_loss"] if m else None,
-                "train_loss": m["train_loss"] if m else None,
-                "loss": m["loss"] if m else None,
-                "loss_metric": m["loss_metric"] if m else None,
-                "train_time_ms": m["train_time_ms"] if m else None,
-            })
-        return {"experiments": results[:limit]}
+                "gpu_type": exp.gpu_type or "H100",
+            },
+        })
+    return results
 
-    # Aggregate by (code_hash, track, gpus, gpu_type)
+
+def _aggregate_experiment_summaries(
+    summaries: list[dict],
+    limit: int = 100,
+) -> list[dict]:
+    """Aggregate normalized rows with the dashboard's stable group identity."""
     from collections import defaultdict
-    import json
 
     groups = defaultdict(list)
-    for exp in experiments:
-        # Use (code_hash, track, gpus, gpu_type) as key, or unique ID if no hash
-        gpu_type = getattr(exp, 'gpu_type', 'H100') or 'H100'
-        if exp.code_hash:
-            key = (exp.code_hash, exp.track or "", exp.gpus, gpu_type)
-        else:
-            key = (f"_no_hash_{exp.id}", exp.track or "", exp.gpus, gpu_type)
+    for exp in summaries:
+        group = exp["group"]
+        hash_key = group["code_hash"] or f"_no_hash_{exp['id']}"
+        key = (hash_key, group["track"], group["gpus"], group["gpu_type"])
         groups[key].append(exp)
 
     results = []
-    for code_hash, group_exps in groups.items():
-        # Sort by started_at desc to get most recent first
-        group_exps.sort(key=lambda e: e.started_at.isoformat() if e.started_at else "", reverse=True)
-        primary = group_exps[0]  # Most recent experiment
-
-        # Collect metrics for all experiments in group. Runs are grouped by
-        # code_hash, so every member is the same script and therefore reports
-        # the same loss series — averaging `loss` across the group is safe.
-        val_losses = []
-        train_times = []
-        loss_metrics = set()
-        env_var_sets = set()
-        experiment_ids = []
-        statuses = []
-
-        for exp in group_exps:
-            experiment_ids.append(exp.id)
-            statuses.append(exp.status)
-            env_var_sets.add(json.dumps(exp.env_vars, sort_keys=True))
-            m = latest_metrics.get(exp.id)
-            if m:
-                if m["loss"] is not None:
-                    val_losses.append(m["loss"])
-                    loss_metrics.add(m["loss_metric"])
-                if m["train_time_ms"] is not None:
-                    train_times.append(m["train_time_ms"])
-
-        # Determine if this is a sweep (same code, different env vars)
-        is_sweep = len(env_var_sets) > 1
-
-        # Compute aggregates
-        n_runs = len(group_exps)
-        mean_val_loss = sum(val_losses) / len(val_losses) if val_losses else None
-        mean_train_time = sum(train_times) / len(train_times) if train_times else None
-
-        # Aggregate status: running if any running, else completed if any completed, else first status
+    for group_exps in groups.values():
+        group_exps.sort(key=lambda e: e["started_at"] or "", reverse=True)
+        primary = group_exps[0]
+        losses = [e["loss"] for e in group_exps if e["loss"] is not None]
+        train_times = [
+            e["train_time_ms"] for e in group_exps
+            if e["train_time_ms"] is not None
+        ]
+        loss_metrics = {
+            e["loss_metric"] for e in group_exps if e["loss"] is not None
+        }
+        statuses = [e["status"] for e in group_exps]
         if "running" in statuses:
-            agg_status = "running"
+            aggregate_status = "running"
         elif "completed" in statuses:
-            agg_status = "completed"
+            aggregate_status = "completed"
         else:
-            agg_status = statuses[0] if statuses else "unknown"
-
-        # Get current step from most recent experiment with metrics
-        current_step = None
-        total_steps = None
-        for exp in group_exps:
-            m = latest_metrics.get(exp.id)
-            if m:
-                current_step = m["step"]
-                total_steps = m["total_steps"]
-                break
-
+            aggregate_status = statuses[0] if statuses else "unknown"
+        with_metrics = next(
+            (e for e in group_exps if e["current_step"] is not None), None,
+        )
         results.append({
-            "id": primary.id,  # Primary experiment ID
-            "experiment_ids": experiment_ids,  # All experiment IDs in group
-            "name": primary.name,
-            "track": primary.track,
-            "script": primary.script,
-            "code_hash": primary.code_hash,
-            "status": agg_status,
-            "gpus": primary.gpus,
-            "gpu_type": primary.gpu_type,
-            "env_vars": primary.env_vars,
-            "started_at": primary.started_at.isoformat() if primary.started_at else None,
-            # Aggregated metrics
-            "n_runs": n_runs,
-            "is_sweep": is_sweep,
-            "current_step": current_step,
-            "total_steps": total_steps,
-            "val_loss": mean_val_loss,
-            "loss": mean_val_loss,
-            # Single metric for the group, or None if members disagree (only
-            # possible if a script changed which series it logs without a code
-            # change — treat as unknown rather than silently mixing them).
+            "id": primary["id"],
+            "experiment_ids": [e["id"] for e in group_exps],
+            "name": primary["name"],
+            "track": primary["track"],
+            "script": primary["script"],
+            "code_hash": primary["code_hash"],
+            "status": aggregate_status,
+            "gpus": primary["gpus"],
+            "gpu_type": primary["gpu_type"],
+            "env_vars": primary["env_vars"],
+            "started_at": primary["started_at"],
+            "n_runs": len(group_exps),
+            "is_sweep": len({
+                json.dumps(e["env_vars"], sort_keys=True) for e in group_exps
+            }) > 1,
+            "current_step": with_metrics["current_step"] if with_metrics else None,
+            "total_steps": with_metrics["total_steps"] if with_metrics else None,
+            "val_loss": sum(losses) / len(losses) if losses else None,
+            "loss": sum(losses) / len(losses) if losses else None,
             "loss_metric": next(iter(loss_metrics)) if len(loss_metrics) == 1 else None,
-            "train_time_ms": mean_train_time,
-            "val_losses": val_losses,  # Individual values for details
-            "losses": val_losses,
+            "train_time_ms": (
+                sum(train_times) / len(train_times) if train_times else None
+            ),
+            "val_losses": losses,
+            "losses": losses,
             "train_times": train_times,
+            "group": primary["group"],
+            "revision": max(e.get("revision", 0) for e in group_exps),
         })
+    results.sort(key=lambda result: result["started_at"] or "", reverse=True)
+    return results[:max(1, min(limit, 2000))]
 
-    # Sort by most recent started_at
-    results.sort(key=lambda r: r["started_at"] or "", reverse=True)
-    return {"experiments": results[:limit]}
+
+@app.get("/api/experiments")
+async def list_experiments(
+    track: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    aggregate: bool = True,
+):
+    """List experiments, optionally aggregated by code hash and hardware."""
+    summaries = _flat_experiment_summaries(track, status, search)
+    if not aggregate:
+        return {"experiments": summaries[:max(1, min(limit, 2000))]}
+    return {"experiments": _aggregate_experiment_summaries(summaries, limit)}
 
 
 @app.get("/api/experiments/running")
@@ -304,12 +399,18 @@ async def get_queue_status():
     """
     from ..config import Config
 
+    return _get_queue_status()
+
+
+def _get_queue_status(session_name: Optional[str] = None) -> dict:
+    """Build queue projection globally or for exactly one session."""
     sessions = Config.list_sessions()
+    if session_name is not None:
+        sessions = [session for session in sessions if session.name == session_name]
     running_list = []
     queued_list = []
 
-    # Get running experiments from DB (all sessions)
-    running_exps = get_running_experiments()
+    running_exps = get_running_experiments(session_name=session_name)
     for exp in running_exps:
         latest = get_latest_metric(exp.id)
         running_list.append({
@@ -358,49 +459,59 @@ async def get_queue_status():
     }
 
 
+@app.get("/api/queue/{session_name}")
+async def get_session_queue_status(session_name: str):
+    """Return only one session's running and queued projection."""
+    if Config.load_session(session_name) is None:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return _get_queue_status(session_name)
+
+
+def _session_summary(sc, watcher=None) -> dict:
+    """Build the patchable dashboard representation for one session."""
+    from ..watcher import SessionState
+
+    state = SessionState.load(sc.name)
+    if sc.session_type == "iris":
+        host = "iris controller"
+        status = "iris"
+    elif sc.session_type == "local":
+        host = "this device"
+        status = state.status
+    elif getattr(sc, "bootstrap", False):
+        host = f"{sc.user}@{sc.host}:{sc.port}"
+        status = "bootstrap"
+    else:
+        host = f"{sc.user}@{sc.host}:{sc.port}"
+        status = state.status
+    return {
+        "name": sc.name,
+        "session_type": sc.session_type,
+        "bootstrap": getattr(sc, "bootstrap", False),
+        "host": host,
+        "gpu_type": sc.gpu_type,
+        "gpu_count": sc.gpu_count,
+        "status": status,
+        "git_branch": sc.git_branch if sc.session_type == "local" else None,
+        "hub_namespace": (
+            sc.hub_namespace
+            if sc.session_type == "local" or getattr(sc, "bootstrap", False)
+            else None
+        ),
+        "sync_paused": getattr(sc, "sync_paused", False),
+        "last_error": state.last_error,
+        "metrics_synced": state.metrics_synced,
+        "tracking_experiment_id": state.tracking_experiment_id,
+    }
+
+
 @app.get("/api/sessions")
 async def get_sessions():
     """Get session statuses + hub syncer state, sorted disconnected-first."""
-    from ..watcher import SessionState
-
     sessions = Config.list_sessions()
     watcher = getattr(app.state, "watcher", None)
     hub = watcher.hub_syncer if watcher else None
-    result = []
-    for sc in sessions:
-        state = SessionState.load(sc.name)
-        if sc.session_type == "iris":
-            host = "iris controller"
-            status = "iris"
-        elif sc.session_type == "local":
-            host = "this device"
-            status = state.status
-        elif getattr(sc, "bootstrap", False):
-            # Provision-only: never tracked, so "disconnected" would be noise.
-            host = f"{sc.user}@{sc.host}:{sc.port}"
-            status = "bootstrap"
-        else:
-            host = f"{sc.user}@{sc.host}:{sc.port}"
-            status = state.status
-        result.append({
-            "name": sc.name,
-            "session_type": sc.session_type,
-            "bootstrap": getattr(sc, "bootstrap", False),
-            "host": host,
-            "gpu_type": sc.gpu_type,
-            "gpu_count": sc.gpu_count,
-            "status": status,
-            "git_branch": sc.git_branch if sc.session_type == "local" else None,
-            "hub_namespace": (
-                sc.hub_namespace
-                if sc.session_type == "local" or getattr(sc, "bootstrap", False)
-                else None
-            ),
-            "sync_paused": getattr(sc, "sync_paused", False),
-            "last_error": state.last_error,
-            "metrics_synced": state.metrics_synced,
-            "tracking_experiment_id": state.tracking_experiment_id,
-        })
+    result = [_session_summary(sc, watcher) for sc in sessions]
     result.sort(key=lambda s: (0 if s["status"] == "disconnected" else 1, s["name"]))
     return {
         "sessions": result,
@@ -409,6 +520,38 @@ async def get_sessions():
             "last_error": hub.last_error if hub else None,
             "last_sync_at": hub.last_sync_at if hub else None,
         },
+    }
+
+
+@app.get("/api/sessions/{name}")
+async def get_session(name: str):
+    """Return one session chip/popover projection for a targeted patch."""
+    sc = Config.load_session(name)
+    if not sc:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return {"session": _session_summary(sc, getattr(app.state, "watcher", None))}
+
+
+@app.get("/api/dashboard/snapshot")
+async def get_dashboard_snapshot():
+    """Return normalized initial state plus a race-closing replay cursor.
+
+    The cursor is read first. A change committed later is therefore either
+    already visible in the following reads or replayed after this cursor (and a
+    harmless duplicate is possible), but it cannot fall into a connection gap.
+    """
+    oldest_event_id, last_event_id = get_dashboard_event_bounds()
+    summaries = _flat_experiment_summaries(revision=last_event_id)
+    queue = _get_queue_status()
+    sessions = await get_sessions()
+    return {
+        "experiment_summaries": summaries,
+        "experiments": _aggregate_experiment_summaries(summaries),
+        "queue": queue,
+        "sessions": sessions["sessions"],
+        "hub": sessions["hub"],
+        "oldest_event_id": oldest_event_id,
+        "last_event_id": last_event_id,
     }
 
 
@@ -434,8 +577,14 @@ async def reconnect_hub():
 
 @app.delete("/api/sessions/{name}")
 async def delete_session(name: str):
-    """Remove a session (only if disconnected)."""
+    """Remove a session and retire its in-flight dashboard state.
+
+    Removing a machine from the dashboard is explicit administrative intent,
+    unlike a transient disconnect. Treat its queued and running experiments as
+    cancelled before deleting the connection metadata and queue cache.
+    """
     import shutil
+    from ..tracker import terminate_session_experiments
     from ..watcher import SessionState
 
     session_config = Config.load_session(name)
@@ -457,7 +606,12 @@ async def delete_session(name: str):
             {"error": "Cannot remove a connected session. Disconnect first."},
             status_code=400,
         )
-    # Removing local connection metadata does not prove remote work stopped.
+
+    running_ids, queued_ids = terminate_session_experiments(
+        name,
+        note=f"Session '{name}' removed from dashboard; machine treated as terminated.",
+        session_id=session_config.session_id,
+    )
     removed, _ = Config.delete_session(name)
     if not removed:
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -467,8 +621,20 @@ async def delete_session(name: str):
     watcher = getattr(app.state, "watcher", None)
     if watcher and hasattr(watcher, "remove_session"):
         watcher.remove_session(name)
+    append_dashboard_event(
+        "session.changed", name,
+        {"session_name": name, "deleted": True},
+    )
+    cancelled_count = len(running_ids) + len(queued_ids)
     msg = f"Session '{name}' removed"
-    return {"success": True, "message": msg}
+    if cancelled_count:
+        msg += f"; cancelled {cancelled_count} in-flight experiment(s)"
+    return {
+        "success": True,
+        "message": msg,
+        "cancelled_running": len(running_ids),
+        "cancelled_queued": len(queued_ids),
+    }
 
 
 @app.post("/api/sessions/{name}/sync-pause")
@@ -481,6 +647,10 @@ async def set_session_sync_pause(name: str, paused: bool = True):
     """
     if not Config.set_session_paused(name, paused):
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    append_dashboard_event(
+        "session.changed", name,
+        {"session_name": name, "sync_paused": paused},
+    )
     return {
         "success": True,
         "paused": paused,
@@ -564,6 +734,193 @@ async def get_metrics_version(experiment_ids: Optional[str] = None):
         return {"version": row["cnt"]}
 
 
+def _bounded_loss_curve(
+    experiment_id: int,
+    metric_name: str,
+    max_points: int,
+) -> list[dict]:
+    """Return a min/max-preserving SQL-bounded loss series."""
+    if metric_name not in {"val_loss", "train_loss"}:
+        raise ValueError(f"Unsupported loss metric: {metric_name}")
+    max_points = max(4, min(max_points, 1200))
+    conn = get_db()
+    stats = conn.execute(
+        f"SELECT COUNT(*) AS count, MIN(step) AS min_step, MAX(step) AS max_step "
+        f"FROM metrics WHERE experiment_id = ? AND {metric_name} IS NOT NULL",
+        (experiment_id,),
+    ).fetchone()
+    if not stats["count"]:
+        return []
+
+    columns = (
+        f"step, {metric_name} AS loss, val_loss, train_loss, "
+        "train_time_ms, step_avg_ms"
+    )
+    if stats["count"] <= max_points:
+        rows = conn.execute(
+            f"SELECT {columns} FROM metrics WHERE experiment_id = ? "
+            f"AND {metric_name} IS NOT NULL ORDER BY step",
+            (experiment_id,),
+        ).fetchall()
+    else:
+        bucket_count = max(1, (max_points - 2) // 2)
+        rows = conn.execute(
+            f"""
+            WITH series AS (
+                SELECT {columns}
+                FROM metrics
+                WHERE experiment_id = ? AND {metric_name} IS NOT NULL
+            ), bounds AS (
+                SELECT MIN(step) AS min_step, MAX(step) AS max_step FROM series
+            ), bucketed AS (
+                SELECT series.*,
+                    CAST(
+                        (series.step - bounds.min_step - 1) * ? /
+                        MAX(1, bounds.max_step - bounds.min_step - 1)
+                        AS INTEGER
+                    ) AS bucket
+                FROM series CROSS JOIN bounds
+                WHERE series.step > bounds.min_step
+                  AND series.step < bounds.max_step
+            ), ranked AS (
+                SELECT bucketed.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bucket ORDER BY loss ASC, step ASC
+                    ) AS min_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bucket ORDER BY loss DESC, step ASC
+                    ) AS max_rank
+                FROM bucketed
+            )
+            SELECT series.* FROM series CROSS JOIN bounds
+            WHERE series.step IN (bounds.min_step, bounds.max_step)
+            UNION
+            SELECT step, loss, val_loss, train_loss, train_time_ms, step_avg_ms
+            FROM ranked WHERE min_rank = 1 OR max_rank = 1
+            ORDER BY step
+            """,
+            (experiment_id, bucket_count),
+        ).fetchall()
+
+    return [
+        {
+            "step": row["step"],
+            "loss": row["loss"],
+            "val_loss": row["val_loss"],
+            "train_loss": row["train_loss"],
+            "train_time_ms": row["train_time_ms"],
+            "step_avg_ms": row["step_avg_ms"],
+        }
+        for row in rows[:max_points]
+    ]
+
+
+def _bounded_experiment_detail(
+    exp_id: int,
+    max_points: int,
+    requested_loss_metric: Optional[str] = None,
+) -> Optional[dict]:
+    """Build chart-ready detail without materializing unbounded histories."""
+    exp = get_experiment(exp_id)
+    if not exp:
+        return None
+    if requested_loss_metric not in {None, "val_loss", "train_loss"}:
+        raise ValueError("loss_metric must be val_loss or train_loss")
+
+    conn = get_db()
+    counts = conn.execute(
+        "SELECT COUNT(*) AS metric_count, "
+        "SUM(val_loss IS NOT NULL) AS val_count, "
+        "SUM(train_loss IS NOT NULL) AS train_count "
+        "FROM metrics WHERE experiment_id = ?",
+        (exp_id,),
+    ).fetchone()
+    available_loss_metrics = []
+    if counts["val_count"]:
+        available_loss_metrics.append("val_loss")
+    if counts["train_count"]:
+        available_loss_metrics.append("train_loss")
+    primary_loss_metric = (
+        "val_loss" if counts["val_count"]
+        else ("train_loss" if counts["train_count"] else None)
+    )
+    requested = (
+        [requested_loss_metric] if requested_loss_metric
+        else available_loss_metrics
+    )
+    loss_curves = {
+        metric_name: _bounded_loss_curve(exp_id, metric_name, max_points)
+        for metric_name in requested
+        if metric_name in available_loss_metrics
+    }
+
+    final = get_final_metric(exp_id)
+    latest = get_latest_metric(exp_id)
+    primary_curve = loss_curves.get(primary_loss_metric)
+    if primary_curve is None and primary_loss_metric:
+        # A targeted alternate-series refresh still needs a stable run summary.
+        primary_curve = _bounded_loss_curve(
+            exp_id, primary_loss_metric, min(max_points, 16),
+        )
+    if final and final.loss is not None:
+        summary_loss = final.loss
+        summary_train_time = final.train_time_ms
+    elif primary_curve:
+        summary_loss = primary_curve[-1]["loss"]
+        summary_train_time = primary_curve[-1]["train_time_ms"]
+    else:
+        summary_loss = latest.loss if latest else None
+        summary_train_time = latest.train_time_ms if latest else None
+
+    return {
+        "id": exp.id,
+        "name": exp.name,
+        "track": exp.track,
+        "script": exp.script,
+        "code_hash": exp.code_hash,
+        "remote_run_id": exp.remote_run_id,
+        "status": exp.status,
+        "gpus": exp.gpus,
+        "gpu_type": exp.gpu_type,
+        "env_vars": exp.env_vars,
+        "git_commit": exp.git_commit,
+        "parent_hash": exp.parent_hash,
+        "kernels_path": exp.kernels_path,
+        "dependencies": exp.dependencies,
+        "tmux_window": exp.tmux_window,
+        "session_name": exp.session_name,
+        "started_at": exp.started_at.isoformat() if exp.started_at else None,
+        "finished_at": exp.finished_at.isoformat() if exp.finished_at else None,
+        "current_step": latest.step if latest else None,
+        "total_steps": latest.total_steps if latest else None,
+        "final_val_loss": summary_loss,
+        "final_loss": summary_loss,
+        "loss_metric": primary_loss_metric,
+        "requested_loss_metric": requested_loss_metric,
+        "available_loss_metrics": available_loss_metrics,
+        "final_train_time_ms": summary_train_time,
+        "loss_curves": loss_curves,
+        "metrics_count": counts["metric_count"],
+        "curve_max_points": max(4, min(max_points, 1200)),
+    }
+
+
+@app.get("/api/experiment/{exp_id}/chart")
+async def get_experiment_chart(
+    exp_id: int,
+    max_points: int = 1200,
+    loss_metric: Optional[str] = None,
+):
+    """Get bounded chart/detail data for one run."""
+    try:
+        detail = _bounded_experiment_detail(exp_id, max_points, loss_metric)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if detail is None:
+        return JSONResponse({"error": "Experiment not found"}, status_code=404)
+    return detail
+
+
 @app.get("/api/experiment/{exp_id}")
 async def get_experiment_detail(exp_id: int):
     """Get detailed data for a single experiment including loss curve."""
@@ -571,24 +928,31 @@ async def get_experiment_detail(exp_id: int):
     if not exp:
         return JSONResponse({"error": "Experiment not found"}, status_code=404)
 
-    # Get all metrics for loss curve. The curve follows the run's primary
-    # series only — a run that logs train_loss every step and val_loss every
-    # 125th would otherwise produce a curve alternating between two different
-    # quantities. `val_loss` stays on each point for backward compatibility.
+    # Keep the loss series separate: a run may log train_loss every step and
+    # val_loss only on eval steps. `loss_curve` remains the primary series for
+    # backward compatibility, while `loss_curves` lets the dashboard switch
+    # between the two without ever connecting unlike quantities.
     metrics = get_metrics(exp_id)
     loss_metric = get_loss_metrics([exp_id]).get(exp_id)
-    loss_curve = [
-        {
-            "step": m.step,
-            "loss": getattr(m, loss_metric),
-            "val_loss": m.val_loss,
-            "train_loss": m.train_loss,
-            "train_time_ms": m.train_time_ms,
-            "step_avg_ms": m.step_avg_ms,
-        }
-        for m in metrics
-        if loss_metric and getattr(m, loss_metric) is not None
+    loss_curves = {
+        metric_name: [
+            {
+                "step": m.step,
+                "loss": getattr(m, metric_name),
+                "val_loss": m.val_loss,
+                "train_loss": m.train_loss,
+                "train_time_ms": m.train_time_ms,
+                "step_avg_ms": m.step_avg_ms,
+            }
+            for m in metrics
+            if getattr(m, metric_name) is not None
+        ]
+        for metric_name in ("val_loss", "train_loss")
+    }
+    available_loss_metrics = [
+        metric_name for metric_name, curve in loss_curves.items() if curve
     ]
+    loss_curve = loss_curves.get(loss_metric, [])
 
     # Get final metric
     final = get_final_metric(exp_id)
@@ -631,9 +995,11 @@ async def get_experiment_detail(exp_id: int):
         "final_val_loss": summary_val_loss,
         "final_loss": summary_val_loss,
         "loss_metric": loss_metric,
+        "available_loss_metrics": available_loss_metrics,
         "final_train_time_ms": summary_train_time,
         # Full loss curve for plotting
         "loss_curve": loss_curve,
+        "loss_curves": loss_curves,
         "metrics_count": len(metrics),
     }
 

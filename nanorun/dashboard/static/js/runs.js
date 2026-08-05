@@ -205,7 +205,7 @@ function showMetricsForRun(expId) {
         if (currentValidData.length > 1) {
             showAveragedMetrics();
         } else {
-            updateMetricsTable(currentValidData[0].loss_curve, false, null);
+            updateMetricsTable(getLossCurve(currentValidData[0]), false, null);
         }
         updateRunRowHighlights();
         updateHeatmapHighlights();
@@ -215,7 +215,7 @@ function showMetricsForRun(expId) {
     const exp = currentValidData.find(d => d.id === expId);
     if (exp) {
         State.set('selectedRun', expId);
-        updateMetricsTable(exp.loss_curve, false, expId);
+        updateMetricsTable(getLossCurve(exp), false, expId);
         updateRunRowHighlights();
         updateHeatmapHighlights();
     }
@@ -224,7 +224,8 @@ function showMetricsForRun(expId) {
 function showAveragedMetrics() {
     const currentValidData = State.get('experimentData');
     if (!currentValidData) return;
-    const allCurves = currentValidData.map(d => d.loss_curve);
+    const lossMetric = getActiveLossMetric(currentValidData);
+    const allCurves = currentValidData.map(d => getLossCurve(d, lossMetric));
     const averaged = computeAveragedMetrics(allCurves);
     updateMetricsTable(averaged, true, null);
 }
@@ -234,9 +235,28 @@ function showAveragedMetricsForCell(expIds) {
     if (!currentValidData) return;
     const cellData = currentValidData.filter(d => expIds.includes(d.id));
     if (cellData.length === 0) return;
-    const allCurves = cellData.map(d => d.loss_curve);
+    const lossMetric = getActiveLossMetric(currentValidData);
+    const allCurves = cellData.map(d => getLossCurve(d, lossMetric));
     const averaged = computeAveragedMetrics(allCurves);
     updateMetricsTable(averaged, true, null);
+}
+
+function refreshMetricsTable() {
+    const currentValidData = State.get('experimentData');
+    if (!currentValidData || currentValidData.length === 0) return;
+
+    const selectedCellExpIds = State.get('selectedCellExpIds');
+    const selectedRunId = State.get('selectedRun');
+    if (selectedCellExpIds) {
+        showAveragedMetricsForCell(selectedCellExpIds);
+    } else if (selectedRunId) {
+        const exp = currentValidData.find(d => d.id === selectedRunId);
+        if (exp) updateMetricsTable(getLossCurve(exp), false, selectedRunId);
+    } else if (currentValidData.length > 1) {
+        showAveragedMetrics();
+    } else {
+        updateMetricsTable(getLossCurve(currentValidData[0]), false, null);
+    }
 }
 
 function updateRunRowHighlights() {
@@ -495,7 +515,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
             <thead>
                 <tr>
                     <th>Step</th>
-                    <th>${lossColumnLabel(currentValidData)}</th>
+                    <th>${lossLabel(getActiveLossMetric(currentValidData))}</th>
                     <th>Time</th>
                     <th>Step Avg</th>
                 </tr>
@@ -519,7 +539,7 @@ function copyMetricsAsMarkdown() {
     if (!currentMetricsData || currentMetricsData.length === 0) return;
 
     // Build markdown table
-    const label = lossColumnLabel(State.get('experimentData'));
+    const label = lossLabel(getActiveLossMetric(State.get('experimentData')));
     const lines = [
         `| Step | ${label} | Time | Step Avg |`,
         '|------|----------|------|----------|'

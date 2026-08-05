@@ -100,6 +100,7 @@ const State = createStateManager({
     runsEnvFilters: { default: {} },
     runsLimit: { default: 20 },
     chartXRange: { default: null },
+    selectedLossMetric: { default: null },
     heatmapSelectedVars: { default: [] },
     currentTotalSteps: { default: 0 },
     selectedQueuedScript: { default: null },

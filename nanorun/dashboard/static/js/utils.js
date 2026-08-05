@@ -40,6 +40,43 @@ function lossColumnLabel(items) {
     return lossLabel(metrics.size === 1 ? [...metrics][0] : undefined);
 }
 
+function getAvailableLossMetrics(items) {
+    const available = new Set();
+    (items || []).forEach(item => {
+        if (!item) return;
+        (item.available_loss_metrics || []).forEach(metric => available.add(metric));
+        if (item.loss_curves) {
+            for (const metric of ['val_loss', 'train_loss']) {
+                if ((item.loss_curves[metric] || []).length > 0) available.add(metric);
+            }
+        }
+        // Backward compatibility with detail responses cached before loss_curves.
+        if (item.loss_metric && (item.loss_curve || []).length > 0) {
+            available.add(item.loss_metric);
+        }
+    });
+    return ['val_loss', 'train_loss'].filter(metric => available.has(metric));
+}
+
+function getActiveLossMetric(items) {
+    const available = getAvailableLossMetrics(items);
+    const selected = State.get('selectedLossMetric');
+    if (available.includes(selected)) return selected;
+
+    const primary = (items || []).map(item => item && item.loss_metric)
+        .find(metric => available.includes(metric));
+    return primary || available[0] || null;
+}
+
+function getLossCurve(item, metric = null) {
+    if (!item) return [];
+    const selected = metric || State.get('selectedLossMetric') || getActiveLossMetric([item]);
+    if (item.loss_curves && selected && Array.isArray(item.loss_curves[selected])) {
+        return item.loss_curves[selected];
+    }
+    return selected === item.loss_metric ? (item.loss_curve || []) : [];
+}
+
 function formatLoss(loss, train_time_ms, loss_metric) {
     if (loss == null) return '<span class="val-loss-value">n/a</span>';
     // Train-loss runs get a marker so they're never mistaken for val numbers.

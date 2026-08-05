@@ -26,6 +26,7 @@ from .rpc_client import RpcClient, RpcError, kill_tunnel
 from .rpc_types import Event, EventMessage, Method
 from .tracker import (
     TERMINAL_EXPERIMENT_STATUSES,
+    append_dashboard_event, commit_metric_batch,
     apply_authoritative_experiment_status,
     get_db, close_db, parse_metric_line, record_metric,
     update_experiment_status, update_experiment_metadata,
@@ -233,6 +234,14 @@ def _apply_queue_snapshot(
                 session_id,
                 queue_items,
             )
+            old_queue = existing.get("queue", []) if isinstance(existing, dict) else []
+            old_connected = existing.get("connected") if isinstance(existing, dict) else None
+            if old_queue != queue_items or old_connected != resolved_connected:
+                append_dashboard_event(
+                    "queue.changed",
+                    session_name,
+                    {"session_name": session_name},
+                )
         return overwrite
 
 
@@ -383,8 +392,29 @@ def _ingest_mapping_lines_for_session(session_name: str, content: str):
                     # Live failure transition observed via the hub (no tracker on
                     # bootstrap sessions) — notify, matching the RPC event path.
                     record_crash(session_name, exp_id, crash_log)
-            if mapping.get("run_id") and not existing.remote_run_id:
-                update_experiment_metadata(exp_id, remote_run_id=mapping["run_id"])
+            # Queue snapshots create placeholder rows before launch. A mapping
+            # for such a row must backfill the complete daemon-authored launch
+            # identity, not only its run id. Otherwise queued runs that miss the
+            # direct EXPERIMENT_STARTED event never acquire a code hash in the
+            # dashboard even though their durable mappings contain one.
+            metadata = {
+                key: value
+                for key, value in {
+                    "code_hash": mapping.get("code_hash"),
+                    "tmux_window": mapping.get("tmux_window"),
+                    "remote_run_id": mapping.get("run_id"),
+                    "started_at": mapping.get("started_at"),
+                    "finished_at": mapping.get("finished_at"),
+                    "git_commit": mapping.get("git_commit"),
+                    "parent_hash": mapping.get("parent_hash"),
+                    "kernels_path": mapping.get("kernels_path"),
+                    "dependencies": mapping.get("dependencies"),
+                    "session_name": session_name,
+                    "session_id": session_id,
+                }.items()
+                if value is not None
+            }
+            update_experiment_metadata(exp_id, **metadata)
         # Terminal failed mappings carry the crash tail; store it if we don't
         # already have one (the tracker's RPC backfill fetches a fuller log).
         if remote_status == "failed" and crash_log and get_crash_log(exp_id) is None:
@@ -504,6 +534,10 @@ class HubSyncer:
         log.info("[hub] Starting hub syncer")
         self.event("Hub syncer starting")
         self.status = "connected"
+        append_dashboard_event(
+            "session.changed", "__hub__",
+            {"hub": {"status": self.status, "last_error": None, "last_sync_at": None}},
+        )
         self._was_connected = True
         while self.running:
             now = time.monotonic()
@@ -555,6 +589,15 @@ class HubSyncer:
             log.warning(message, exc_info=exc_info)
             self._session_errors_logged[session_name] = message
         self.last_error = message
+        if previous != message:
+            append_dashboard_event(
+                "session.changed", "__hub__",
+                {"hub": {
+                    "status": self.status,
+                    "last_error": self.last_error,
+                    "last_sync_at": self.last_sync_at,
+                }},
+            )
 
     def _do_sync(self):
         if not hasattr(self, '_session_errors_logged'):
@@ -671,6 +714,14 @@ class HubSyncer:
                 self._session_errors_logged.pop(session_name, None)
                 self.last_error = None
         self.last_sync_at = datetime.now().strftime("%H:%M:%S")
+        append_dashboard_event(
+            "session.changed", "__hub__",
+            {"hub": {
+                "status": self.status,
+                "last_error": self.last_error,
+                "last_sync_at": self.last_sync_at,
+            }},
+        )
 
     def _parse_metrics_for_session(self, session_name: str, changed: Optional[List[str]] = None):
         """Parse metrics from materialized log files for the session type.
@@ -830,9 +881,15 @@ class HubSyncer:
                     train_loss=m.get("train_loss"),
                     train_time_ms=m["train_time_ms"],
                     step_avg_ms=m.get("step_avg_ms"), is_final_step=is_final,
+                    commit=False,
                 )
                 if inserted:
                     new_count += 1
+
+            if new_count:
+                commit_metric_batch([exp_id])
+            else:
+                get_db().commit()
 
             if found_final and row["status"] != "completed":
                 update_experiment_status(exp_id, "completed")
@@ -987,9 +1044,11 @@ def _parse_local_metrics(experiment_id: int, run_id: str, log_path: Path) -> tup
             if inserted:
                 recorded += 1
 
-    # One commit per parse pass instead of one per metric line (N fsyncs -> 1).
-    # Harmless no-op if the pass wrote nothing (no open transaction to flush).
-    get_db().commit()
+    # One projection commit and one coalesced dashboard event per parse pass.
+    if recorded:
+        commit_metric_batch([experiment_id])
+    else:
+        get_db().commit()
     _log_offsets[run_id] = new_offset
     if recorded:
         log.info(f"Recorded {recorded} metrics for exp {experiment_id}")
@@ -1010,6 +1069,11 @@ class SessionState:
             return
         PATHS.state_file(session_name).write_text(data)
         _cache[session_name] = data
+        append_dashboard_event(
+            "session.changed",
+            session_name,
+            {"session_name": session_name, "session": asdict(self)},
+        )
 
     @classmethod
     def load(cls, session_name: str) -> "SessionState":

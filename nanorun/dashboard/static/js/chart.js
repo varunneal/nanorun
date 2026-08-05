@@ -471,12 +471,14 @@ function computeResidualData(validData) {
     const chartableData = validData.filter(d => d.status !== 'queued');
     if (chartableData.length < 2) return null;
 
+    const lossMetric = getActiveLossMetric(chartableData);
+
     const curves = chartableData.map(d => ({
         id: d.id,
         name: d.name,
         script: d.script,
         env_vars: d.env_vars,
-        data: d.loss_curve || []
+        data: getLossCurve(d, lossMetric)
     })).filter(c => c.data.length > 0);
 
     if (curves.length < 2) return null;
@@ -532,6 +534,8 @@ function computeResidualData(validData) {
 function getEligibleViews(validData) {
     const views = [];
     const chartableData = validData.filter(d => d.status !== 'queued');
+    const lossMetric = getActiveLossMetric(chartableData);
+    const curveData = chartableData.filter(d => getLossCurve(d, lossMetric).length > 0);
 
     if (!isBucketKey(State.get('selectedExp'))) {
         const { processed } = getHeatmapData(validData);
@@ -539,9 +543,9 @@ function getEligibleViews(validData) {
     }
 
     // Curve-based views remain useful for failed, cancelled, and unknown runs.
-    if (chartableData.length >= 2) views.push('residual');
+    if (curveData.length >= 2) views.push('residual');
 
-    if (chartableData.length >= 1) views.push('line');
+    if (curveData.length >= 1) views.push('line');
 
     return views;
 }
@@ -616,6 +620,7 @@ function switchChartView(viewName, updateState = true) {
     buttons.forEach(btn => {
         btn.classList.toggle('active', btn.dataset.view === viewName);
     });
+    updateLossMetricSwitcher(currentValidData);
 
     const chartContainer = document.querySelector('.chart-container');
     const canvas = document.getElementById('loss-chart');
@@ -660,15 +665,53 @@ function switchChartView(viewName, updateState = true) {
         case 'line':
             canvas.style.display = 'block';
             heatmapContainer.style.display = 'none';
+            const lossMetric = getActiveLossMetric(getVisibleRuns());
             const runs = getVisibleRuns().filter(d => d.status !== 'queued').map(d => ({
+                id: d.id,
                 name: d.name,
                 script: d.script,
-                data: d.loss_curve,
+                data: getLossCurve(d, lossMetric),
                 env_vars: d.env_vars
             }));
             updateChartMultiple(runs, State.get('currentTotalSteps'));
             break;
     }
+}
+
+function updateLossMetricSwitcher(validData) {
+    const switcher = document.getElementById('loss-metric-switcher');
+    if (!switcher) return;
+
+    const available = getAvailableLossMetrics(validData);
+    const active = getActiveLossMetric(validData);
+    const show = available.includes('val_loss') &&
+        available.includes('train_loss');
+
+    switcher.classList.toggle('visible', show);
+    switcher.querySelectorAll('.loss-metric-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.lossMetric === active);
+    });
+}
+
+function switchLossMetric(metric) {
+    const currentValidData = State.get('experimentData');
+    if (!currentValidData || !getAvailableLossMetrics(currentValidData).includes(metric)) return;
+
+    State.update({ selectedLossMetric: metric, chartXRange: null });
+
+    const eligibleViews = getEligibleViews(currentValidData);
+    updateViewSwitcher(eligibleViews);
+    let viewName = State.get('chartView');
+    if (viewName === 'heatmap' && eligibleViews.includes('line')) {
+        viewName = 'line';
+        State.set('chartView', viewName);
+    }
+    if (!eligibleViews.includes(viewName)) {
+        viewName = eligibleViews.includes('line') ? 'line' : eligibleViews[0];
+        State.set('chartView', viewName);
+    }
+    if (viewName) switchChartView(viewName, false);
+    refreshMetricsTable();
 }
 
 function renderResidualChart(residualData) {
@@ -899,6 +942,7 @@ function updateChartMultiple(runs, totalSteps = 0) {
         const displayData = downsampleMinMax(run.data);
         return {
             label: labels[i],
+            experimentId: run.id,
             data: displayData.map(d => ({ x: d.step, y: d.loss ?? d.val_loss })),
             borderColor: color,
             backgroundColor: color + '20',
@@ -995,6 +1039,52 @@ function updateChartMultiple(runs, totalSteps = 0) {
 
 function updateChart(lossData, totalSteps) {
     updateChartMultiple([{ name: 'Run', data: lossData, env_vars: {} }], totalSteps);
+}
+
+function replaceVisibleRunCurve(expId) {
+    const viewName = State.get('chartView');
+    if (viewName === 'residual') {
+        // Residuals depend on every visible curve, but reuse the bounded curves
+        // already in state rather than fetching any sibling again.
+        switchChartView('residual', false);
+        return;
+    }
+    if (viewName !== 'line' || !lossChart) return;
+
+    const visibleRuns = getVisibleRuns().filter(run => run.status !== 'queued');
+    const run = visibleRuns.find(item => Number(item.id) === Number(expId));
+    if (!run) return;
+    const dataset = lossChart.data.datasets.find(
+        item => Number(item.experimentId) === Number(expId)
+    );
+    if (!dataset) {
+        // A run can become chartable on its first metric event.
+        switchChartView('line', false);
+        return;
+    }
+
+    const metric = getActiveLossMetric(visibleRuns);
+    const curve = getLossCurve(run, metric);
+    const displayData = downsampleMinMax(curve);
+    const oldDataMax = Math.max(...dataset.data.map(point => point.x));
+    dataset.data = displayData.map(point => ({
+        x: point.step,
+        y: point.loss ?? point.val_loss,
+    }));
+    dataset.pointRadius = visibleRuns.length === 1 && displayData.length <= 100 ? 2 : 0;
+
+    const chartRuns = visibleRuns.map(item => ({ data: getLossCurve(item, metric) }));
+    const yBounds = computeLossYBounds(chartRuns);
+    lossChart.options.scales.y.min = yBounds.min;
+    lossChart.options.scales.y.max = yBounds.max;
+    const newDataMax = Math.max(...dataset.data.map(point => point.x));
+    const chartXRange = State.get('chartXRange');
+    if (chartXRange && chartXRange.max === oldDataMax && newDataMax > oldDataMax) {
+        const nextRange = { ...chartXRange, max: newDataMax };
+        State.set('chartXRange', nextRange);
+        lossChart.options.scales.x.max = newDataMax;
+    }
+    lossChart.update('none');
 }
 
 function toggleChartDataset(idx) {

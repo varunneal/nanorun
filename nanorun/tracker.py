@@ -7,9 +7,13 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict, Tuple
 
 from .config import Config
+
+
+DASHBOARD_EVENT_MAX_ROWS = 10_000
+DASHBOARD_EVENT_MAX_AGE_DAYS = 7
 
 
 def get_db_path() -> Path:
@@ -68,9 +72,21 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS dashboard_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            entity_id TEXT,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_metrics_experiment ON metrics(experiment_id);
         CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
         CREATE INDEX IF NOT EXISTS idx_experiments_track ON experiments(track);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_events_created_at
+            ON dashboard_events(created_at);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_events_entity
+            ON dashboard_events(event_type, entity_id, id);
     """)
     conn.commit()
 
@@ -272,6 +288,198 @@ class Metric:
 # Database operations
 # =============================================================================
 
+def _dashboard_group(exp: sqlite3.Row) -> Dict[str, Any]:
+    """Return the structured identity used by the dashboard's group cards."""
+    gpu_type = exp["gpu_type"] or "H100"
+    return {
+        "code_hash": exp["code_hash"],
+        "track": exp["track"] or "",
+        "gpus": exp["gpus"],
+        "gpu_type": gpu_type,
+    }
+
+
+def _dashboard_experiment_summary(
+    conn: sqlite3.Connection,
+    experiment_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Build the bounded experiment patch carried by dashboard events."""
+    exp = conn.execute(
+        "SELECT * FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if not exp or ("deleted" in exp.keys() and exp["deleted"]):
+        return None
+
+    latest = conn.execute(
+        "SELECT step, total_steps, step_avg_ms FROM metrics "
+        "WHERE experiment_id = ? ORDER BY step DESC LIMIT 1",
+        (experiment_id,),
+    ).fetchone()
+    latest_val = conn.execute(
+        "SELECT val_loss, train_time_ms FROM metrics "
+        "WHERE experiment_id = ? AND val_loss IS NOT NULL "
+        "ORDER BY step DESC LIMIT 1",
+        (experiment_id,),
+    ).fetchone()
+    latest_train = conn.execute(
+        "SELECT train_loss, train_time_ms FROM metrics "
+        "WHERE experiment_id = ? AND train_loss IS NOT NULL "
+        "ORDER BY step DESC LIMIT 1",
+        (experiment_id,),
+    ).fetchone()
+    metric_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM metrics WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()["count"]
+
+    val_loss = latest_val["val_loss"] if latest_val else None
+    train_loss = latest_train["train_loss"] if latest_train else None
+    loss = val_loss if val_loss is not None else train_loss
+    loss_metric = (
+        "val_loss" if val_loss is not None
+        else ("train_loss" if train_loss is not None else None)
+    )
+    train_time_ms = (
+        latest_val["train_time_ms"] if latest_val
+        else (latest_train["train_time_ms"] if latest_train else None)
+    )
+    return {
+        "id": exp["id"],
+        "name": exp["name"],
+        "track": exp["track"],
+        "script": exp["script"],
+        "code_hash": exp["code_hash"],
+        "status": exp["status"],
+        "gpus": exp["gpus"],
+        "gpu_type": exp["gpu_type"] or "H100",
+        "env_vars": json.loads(exp["env_vars"]) if exp["env_vars"] else {},
+        "session_name": exp["session_name"],
+        "remote_run_id": exp["remote_run_id"],
+        "started_at": exp["started_at"],
+        "finished_at": exp["finished_at"],
+        "current_step": latest["step"] if latest else None,
+        "total_steps": latest["total_steps"] if latest else None,
+        "val_loss": val_loss,
+        "train_loss": train_loss,
+        "loss": loss,
+        "loss_metric": loss_metric,
+        "train_time_ms": train_time_ms,
+        "step_avg_ms": latest["step_avg_ms"] if latest else None,
+        "metric_count": metric_count,
+        "group": _dashboard_group(exp),
+    }
+
+
+def _compact_dashboard_events(conn: sqlite3.Connection) -> None:
+    """Keep replay storage bounded without touching projection data."""
+    conn.execute(
+        "DELETE FROM dashboard_events WHERE id < COALESCE(("
+        "SELECT id FROM dashboard_events ORDER BY id DESC LIMIT 1 OFFSET ?"
+        "), 0)",
+        (DASHBOARD_EVENT_MAX_ROWS - 1,),
+    )
+    conn.execute(
+        "DELETE FROM dashboard_events "
+        "WHERE created_at < datetime('now', ?)",
+        (f"-{DASHBOARD_EVENT_MAX_AGE_DAYS} days",),
+    )
+
+
+def _append_dashboard_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    entity_id: Optional[str],
+    payload: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Append one event inside the caller's current SQLite transaction."""
+    event_payload = dict(payload or {})
+    event_payload.setdefault("committed_at", datetime.now(timezone.utc).isoformat())
+    cursor = conn.execute(
+        "INSERT INTO dashboard_events (event_type, entity_id, payload) "
+        "VALUES (?, ?, ?)",
+        (event_type, str(entity_id) if entity_id is not None else None,
+         json.dumps(event_payload, separators=(",", ":"), sort_keys=True)),
+    )
+    event_id = cursor.lastrowid
+    event_payload["revision"] = event_id
+    summary = event_payload.get("summary")
+    if isinstance(summary, dict):
+        summary["revision"] = event_id
+    conn.execute(
+        "UPDATE dashboard_events SET payload = ? WHERE id = ?",
+        (json.dumps(event_payload, separators=(",", ":"), sort_keys=True), event_id),
+    )
+    _compact_dashboard_events(conn)
+    return event_id
+
+
+def append_dashboard_event(
+    event_type: str,
+    entity_id: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Append and commit an event for a projection stored outside SQLite."""
+    conn = get_db()
+    event_id = _append_dashboard_event(conn, event_type, entity_id, payload)
+    conn.commit()
+    return event_id
+
+
+def get_dashboard_event_bounds() -> Tuple[int, int]:
+    """Return the oldest and newest retained event IDs (zero when empty)."""
+    row = get_db().execute(
+        "SELECT COALESCE(MIN(id), 0) AS oldest, "
+        "COALESCE(MAX(id), 0) AS newest FROM dashboard_events"
+    ).fetchone()
+    return row["oldest"], row["newest"]
+
+
+def get_dashboard_events(after: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Read one bounded, ordered replay page."""
+    bounded_limit = max(1, min(limit, 500))
+    rows = get_db().execute(
+        "SELECT id, event_type, entity_id, payload, created_at "
+        "FROM dashboard_events WHERE id > ? ORDER BY id LIMIT ?",
+        (after, bounded_limit),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "entity_id": row["entity_id"],
+            "payload": json.loads(row["payload"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_dashboard_experiment_summary(experiment_id: int) -> Optional[Dict[str, Any]]:
+    """Return a current event-shaped summary for one experiment."""
+    return _dashboard_experiment_summary(get_db(), experiment_id)
+
+
+def commit_metric_batch(experiment_ids: List[int]) -> None:
+    """Commit a parse batch and emit at most one metric event per experiment."""
+    conn = get_db()
+    for experiment_id in dict.fromkeys(experiment_ids):
+        summary = _dashboard_experiment_summary(conn, experiment_id)
+        if summary:
+            _append_dashboard_event(
+                conn,
+                "metrics.changed",
+                str(experiment_id),
+                {
+                    "experiment_id": experiment_id,
+                    "group": summary["group"],
+                    "latest_step": summary["current_step"],
+                    "metric_count": summary["metric_count"],
+                    "summary": summary,
+                },
+            )
+    conn.commit()
+
 def _build_queue_command(script: str, env_vars: Optional[Dict[str, str]]) -> str:
     """Build a reproducible nanorun command from script + env_vars."""
     parts = ["nanorun job add", script]
@@ -323,8 +531,13 @@ def create_experiment(
             "queue_command": _build_queue_command(script, env_vars),
         }
     )
-    conn.commit()
     exp_id = cursor.lastrowid
+    summary = _dashboard_experiment_summary(conn, exp_id)
+    _append_dashboard_event(
+        conn, "experiment.created", str(exp_id),
+        {"experiment_id": exp_id, "group": summary["group"], "summary": summary},
+    )
+    conn.commit()
     return exp_id
 
 
@@ -380,31 +593,58 @@ def record_metric(
     )
     changed = cursor.rowcount > 0
     if commit:
+        if changed:
+            summary = _dashboard_experiment_summary(conn, experiment_id)
+            if summary:
+                _append_dashboard_event(
+                    conn,
+                    "metrics.changed",
+                    str(experiment_id),
+                    {
+                        "experiment_id": experiment_id,
+                        "group": summary["group"],
+                        "latest_step": summary["current_step"],
+                        "metric_count": summary["metric_count"],
+                        "summary": summary,
+                    },
+                )
         conn.commit()
     return changed
 
 
-def update_experiment_status(experiment_id: int, status: str) -> None:
+def update_experiment_status(experiment_id: int, status: str) -> bool:
     """Update experiment status and keep terminal timestamps consistent."""
     conn = get_db()
     if status in ("completed", "failed", "cancelled"):
-        conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = ? WHERE id = ?",
-            (status, datetime.now(timezone.utc).isoformat(), experiment_id)
+        cursor = conn.execute(
+            "UPDATE experiments SET status = ?, finished_at = ? "
+            "WHERE id = ? AND (status IS NOT ? OR finished_at IS NULL)",
+            (status, datetime.now(timezone.utc).isoformat(), experiment_id, status)
         )
     elif status == "running":
         # A direct remote observation may correct a stale terminal projection.
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE experiments SET status = ?, started_at = COALESCE(started_at, ?), "
-            "finished_at = NULL WHERE id = ?",
-            (status, datetime.now(timezone.utc).isoformat(), experiment_id)
+            "finished_at = NULL WHERE id = ? "
+            "AND (status IS NOT ? OR finished_at IS NOT NULL)",
+            (status, datetime.now(timezone.utc).isoformat(), experiment_id, status)
         )
     else:
-        conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = NULL WHERE id = ?",
-            (status, experiment_id)
+        cursor = conn.execute(
+            "UPDATE experiments SET status = ?, finished_at = NULL WHERE id = ? "
+            "AND (status IS NOT ? OR finished_at IS NOT NULL)",
+            (status, experiment_id, status)
         )
+    changed = cursor.rowcount > 0
+    if changed:
+        summary = _dashboard_experiment_summary(conn, experiment_id)
+        if summary:
+            _append_dashboard_event(
+                conn, "experiment.updated", str(experiment_id),
+                {"experiment_id": experiment_id, "group": summary["group"], "summary": summary},
+            )
     conn.commit()
+    return changed
 
 
 TERMINAL_EXPERIMENT_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -505,6 +745,13 @@ def terminate_session_experiments(
             f"WHERE status = 'queued' AND {scope_sql}",
             (queued_status, now, *scope_params),
         )
+    for exp_id in running_ids + queued_ids:
+        summary = _dashboard_experiment_summary(conn, exp_id)
+        if summary:
+            _append_dashboard_event(
+                conn, "experiment.updated", str(exp_id),
+                {"experiment_id": exp_id, "group": summary["group"], "summary": summary},
+            )
     conn.commit()
     return running_ids, queued_ids
 
@@ -515,6 +762,7 @@ def update_experiment_metadata(
     tmux_window: Optional[str] = None,
     remote_run_id: Optional[str] = None,
     started_at: Optional[str] = None,
+    finished_at: Optional[str] = None,
     git_commit: Optional[str] = None,
     parent_hash: Optional[str] = None,
     kernels_path: Optional[str] = None,
@@ -543,6 +791,9 @@ def update_experiment_metadata(
     if started_at is not None:
         updates.append("started_at = ?")
         params.append(started_at)
+    if finished_at is not None:
+        updates.append("finished_at = ?")
+        params.append(finished_at)
     if git_commit is not None:
         updates.append("git_commit = ?")
         params.append(git_commit)
@@ -563,9 +814,16 @@ def update_experiment_metadata(
         params.append(session_id)
 
     if updates:
+        before = _dashboard_experiment_summary(conn, experiment_id)
         params.append(experiment_id)
         query = f"UPDATE experiments SET {', '.join(updates)} WHERE id = ?"
         conn.execute(query, params)
+        after = _dashboard_experiment_summary(conn, experiment_id)
+        if after and after != before:
+            _append_dashboard_event(
+                conn, "experiment.updated", str(experiment_id),
+                {"experiment_id": experiment_id, "group": after["group"], "summary": after},
+            )
         conn.commit()
 
 
@@ -670,7 +928,16 @@ def get_experiment(experiment_id: int) -> Optional[Experiment]:
 def delete_experiment(experiment_id: int) -> None:
     """Soft delete an experiment (sets deleted flag)."""
     conn = get_db()
-    conn.execute("UPDATE experiments SET deleted = 1 WHERE id = ?", (experiment_id,))
+    cursor = conn.execute(
+        "UPDATE experiments SET deleted = 1 "
+        "WHERE id = ? AND COALESCE(deleted, 0) = 0",
+        (experiment_id,),
+    )
+    if cursor.rowcount:
+        _append_dashboard_event(
+            conn, "experiment.deleted", str(experiment_id),
+            {"experiment_id": experiment_id},
+        )
     conn.commit()
 
 
@@ -735,7 +1002,7 @@ def create_experiment_from_mapping(
     Returns the experiment ID.
     """
     conn = get_db()
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO experiments (id, name, track, script, code_hash, parent_hash, git_commit, env_vars, gpus, gpu_type, tmux_window, remote_run_id, status, started_at, finished_at, kernels_path, dependencies, session_name, session_id, queue_command)
         VALUES (:id, :name, :track, :script, :code_hash, :parent_hash, :git_commit, :env_vars, :gpus, :gpu_type, :tmux_window, :remote_run_id, :status, :started_at, :finished_at, :kernels_path, :dependencies, :session_name, :session_id, :queue_command)
@@ -764,6 +1031,12 @@ def create_experiment_from_mapping(
             "queue_command": _build_queue_command(script, env_vars),
         }
     )
+    if cursor.rowcount:
+        summary = _dashboard_experiment_summary(conn, experiment_id)
+        _append_dashboard_event(
+            conn, "experiment.created", str(experiment_id),
+            {"experiment_id": experiment_id, "group": summary["group"], "summary": summary},
+        )
     conn.commit()
     if crash_log is not None:
         set_crash_log(experiment_id, crash_log)
