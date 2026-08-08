@@ -161,7 +161,7 @@ function getDifferingKeys(runs) {
 }
 
 function computeSmartLabels(runs) {
-    if (runs.length <= 1) return runs.map(() => 'Validation Loss');
+    if (runs.length <= 1) return runs.map(run => lossLabel(run.loss_metric));
     const differingKeys = getDifferingKeys(runs);
     const inBucket = isBucketKey(State.get('selectedExp'));
     return runs.map((run, i) => {

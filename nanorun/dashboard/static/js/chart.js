@@ -670,6 +670,7 @@ function switchChartView(viewName, updateState = true) {
                 id: d.id,
                 name: d.name,
                 script: d.script,
+                loss_metric: lossMetric,
                 data: getLossCurve(d, lossMetric),
                 env_vars: d.env_vars
             }));
@@ -1017,7 +1018,8 @@ function updateChartMultiple(runs, totalSteps = 0) {
             plugins: {
                 legend: { display: false },
                 tooltip: {
-                    mode: 'x',
+                    mode: 'nearest',
+                    axis: 'x',
                     intersect: false,
                     callbacks: {
                         title: function(items) {

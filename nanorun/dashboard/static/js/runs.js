@@ -502,12 +502,30 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
     // Show most recent first
     const recentData = lossData.slice(-20).reverse();
     const isMultiple = currentValidData && currentValidData.length > 1;
+    const selectedCellExpIds = State.get('selectedCellExpIds');
+    const metricItems = selectedExpId != null
+        ? currentValidData.filter(item => Number(item.id) === Number(selectedExpId))
+        : selectedCellExpIds
+            ? currentValidData.filter(item => selectedCellExpIds.includes(item.id))
+            : currentValidData;
+    const availableMetrics = getAvailableLossMetrics(metricItems);
+    const activeMetric = getActiveLossMetric(metricItems);
+    const metricSwitcher = availableMetrics.includes('val_loss') &&
+        availableMetrics.includes('train_loss')
+        ? `<div class="loss-metric-switcher visible metrics-loss-metric-switcher" role="group" aria-label="Metrics history loss series">
+            <button class="loss-metric-btn${activeMetric === 'val_loss' ? ' active' : ''}" onclick="switchLossMetric('val_loss')">Val</button>
+            <button class="loss-metric-btn${activeMetric === 'train_loss' ? ' active' : ''}" onclick="switchLossMetric('train_loss')">Train</button>
+        </div>`
+        : '';
 
     // Store for clipboard copy (full data, not just recent)
     currentMetricsData = lossData.slice().reverse();
 
     tableEl.innerHTML = `
-        <h3 class="metrics-header-clickable" onclick="copyMetricsAsMarkdown()" title="Click to copy as markdown">Metrics History</h3>
+        <div class="metrics-title-row">
+            <h3 class="metrics-header-clickable" onclick="copyMetricsAsMarkdown()" title="Click to copy as markdown">Metrics History</h3>
+            ${metricSwitcher}
+        </div>
         ${isMultiple ? `<div class="metrics-header">
             <span class="metrics-label">${isAveraged ? 'Averaged across ' + currentValidData.length + ' runs' : 'Run #' + selectedExpId}</span>
         </div>` : ''}
@@ -515,7 +533,7 @@ function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) 
             <thead>
                 <tr>
                     <th>Step</th>
-                    <th>${lossLabel(getActiveLossMetric(currentValidData))}</th>
+                    <th>${lossLabel(activeMetric)}</th>
                     <th>Time</th>
                     <th>Step Avg</th>
                 </tr>

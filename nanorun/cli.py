@@ -509,9 +509,9 @@ def session_start(host: str | None, local_session: bool, bootstrap_session: bool
 
     if bootstrap_session:
         console.print(f"[green]Bootstrap session '{name}' created.[/green]")
-        _offer_copy(f"nanorun session setup --session {name}", "provision the machine")
     else:
         console.print(f"[green]Session '{name}' started! Config saved to .nanorun/sessions/{name}.json[/green]")
+    _offer_copy(f"nanorun session setup --session {name}", "provision the machine")
 
 
 @session.command("stop")
