@@ -1651,6 +1651,8 @@ class SessionTracker:
 
 
 class Watcher:
+    SESSION_DISCOVERY_INTERVAL = 1
+
     def __init__(self, dashboard_port: int = 8080, no_dashboard: bool = False):
         self.running = True
         self.trackers: Dict[str, SessionTracker] = {}
@@ -1662,6 +1664,46 @@ class Watcher:
 
     def _discover_sessions(self) -> Dict[str, SessionConfig]:
         return {s.name: s for s in Config.list_sessions()}
+
+    def _reconcile_sessions(
+        self, current: Optional[Dict[str, SessionConfig]] = None,
+    ) -> Dict[str, SessionConfig]:
+        """Make the live tracker set match the session configs on disk.
+
+        Session configs are created by a different CLI process, so discovery is
+        inherently cross-process.  Keep it centralized here and publish an event
+        for every config-set transition; tracker state changes alone are not
+        sufficient because bootstrap and Iris sessions intentionally have no
+        SessionTracker.
+        """
+        current = current if current is not None else self._discover_sessions()
+        tracked = set(self.trackers)
+        configured = set(current)
+
+        for name in sorted(tracked - configured):
+            self._stop_tracker(name)
+            append_dashboard_event(
+                "session.changed", name,
+                {"session_name": name, "deleted": True},
+            )
+
+        for name in sorted(configured - tracked):
+            self._start_tracker(current[name])
+            append_dashboard_event(
+                "session.changed", name,
+                {"session_name": name},
+            )
+
+        for name in sorted(configured & tracked):
+            if self.tracker_configs.get(name) != current[name]:
+                self._stop_tracker(name)
+                self._start_tracker(current[name])
+                append_dashboard_event(
+                    "session.changed", name,
+                    {"session_name": name},
+                )
+
+        return current
 
     # --- session trackers (SSH/RPC) ---
 
@@ -1807,29 +1849,20 @@ class Watcher:
         try:
             PATHS.pid_file.write_text(str(os.getpid()))
             sessions = self._discover_sessions()
-            if not sessions:
-                print("No sessions configured. Run 'nanorun session start' first.", file=sys.stderr)
-                return
-            print(f"Starting watcher with {len(sessions)} session(s): {', '.join(sessions.keys())}")
+            if sessions:
+                print(f"Starting watcher with {len(sessions)} session(s): {', '.join(sessions.keys())}")
+            else:
+                print("Starting watcher with no sessions configured; waiting for one to be created.")
             if not self.no_dashboard:
                 self._start_dashboard()
             self._start_hub_syncer()
-            for config in sessions.values():
-                self._start_tracker(config)
+            self._reconcile_sessions(sessions)
             tick = 0
             while self.running:
                 time.sleep(1)
                 tick += 1
-                if tick % 10 == 0:
-                    current = self._discover_sessions()
-                    for name in set(current) - set(self.trackers):
-                        self._start_tracker(current[name])
-                    for name in set(self.trackers) - set(current):
-                        self._stop_tracker(name)
-                    for name in set(current) & set(self.trackers):
-                        if self.tracker_configs.get(name) != current[name]:
-                            self._stop_tracker(name)
-                            self._start_tracker(current[name])
+                if tick % self.SESSION_DISCOVERY_INTERVAL == 0:
+                    self._reconcile_sessions()
                 if self.interactive and tick % 5 == 0:
                     self._check_reconnect()
         except KeyboardInterrupt:
