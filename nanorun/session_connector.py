@@ -20,7 +20,7 @@ from .hub import _IRIS_STATE_MAP
 from .tracker import (
     apply_authoritative_experiment_status,
     create_experiment, update_experiment_metadata, update_experiment_status,
-    get_db,
+    get_db, get_dashboard_experiment_summary, append_dashboard_event,
 )
 
 
@@ -585,11 +585,25 @@ class IrisConnector(SessionConnector):
         update_experiment_metadata(exp_id, remote_run_id=wandb_run_id)
         conn = get_db()
         conn.execute(
-            "UPDATE experiments SET env_vars = json_set(COALESCE(env_vars, '{}'), '$._iris_job_id', ?) WHERE id = ?",
+            "UPDATE experiments SET "
+            "env_vars = json_set(COALESCE(env_vars, '{}'), '$._iris_job_id', ?), "
+            "revision = revision + 1 WHERE id = ?",
             (iris_job_id, exp_id),
         )
         conn.commit()
         conn.close()
+        summary = get_dashboard_experiment_summary(exp_id)
+        if summary:
+            append_dashboard_event(
+                "experiment.updated", str(exp_id),
+                {
+                    "experiment_id": exp_id,
+                    "group": summary["group"],
+                    "revision": summary["revision"],
+                    "metrics_revision": summary["metrics_revision"],
+                    "summary": summary,
+                },
+            )
         self._write_log_header(wandb_run_id, script, abs_script, wandb_run_id, iris_job_id)
 
         return SubmitResult(experiment_id=exp_id, job_id=iris_job_id)

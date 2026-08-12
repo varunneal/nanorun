@@ -749,6 +749,7 @@ main {
     flex-direction: column;
     height: 320px;
     padding: 1rem;
+    position: relative;
 }
 
 .chart-body {
@@ -757,6 +758,64 @@ main {
     flex: 1;
     min-height: 0;
     gap: 0;
+    transition: filter 140ms ease, opacity 140ms ease;
+}
+
+.chart-container.is-loading {
+    cursor: progress;
+}
+
+.chart-container.is-loading .chart-body {
+    filter: blur(4px);
+    opacity: 0.45;
+}
+
+.chart-loading-overlay {
+    align-items: center;
+    background: rgba(0, 0, 0, 0.12);
+    color: var(--text-primary);
+    display: flex;
+    font-size: var(--font-sm);
+    font-weight: 600;
+    gap: 0.5rem;
+    inset: 0;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    position: absolute;
+    transition: opacity 140ms ease;
+    z-index: 3;
+}
+
+.chart-container.is-loading .chart-loading-overlay {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.chart-loading-overlay > span:last-child {
+    background: var(--bg-dark);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0.35rem 0.5rem;
+}
+
+.chart-loading-spinner {
+    animation: chart-loading-spin 700ms linear infinite;
+    border: 2px solid var(--border);
+    border-radius: 50%;
+    border-top-color: var(--accent);
+    height: 15px;
+    width: 15px;
+}
+
+@keyframes chart-loading-spin {
+    to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chart-loading-spinner {
+        animation: none;
+    }
 }
 
 .chart-canvas-wrap {

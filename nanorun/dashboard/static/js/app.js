@@ -190,20 +190,22 @@ function switchDiffNotesTab(tabName) {
 // --- Tracks loading ---
 
 async function loadTracks() {
-    const response = await fetch('/api/tracks');
-    const data = await response.json();
     const select = document.getElementById('track-filter');
-    data.tracks.forEach(track => {
+    const selected = select.value;
+    Array.from(select.options).slice(1).forEach(option => option.remove());
+    (_dashboardTracks || []).forEach(track => {
         const option = document.createElement('option');
         option.value = track.name;
         option.textContent = track.name;
         select.appendChild(option);
     });
+    select.value = selected;
 }
 
 // --- Experiments list ---
 
 let _lastExperimentsJson = null;
+let _discoveryAbortController = null;
 
 function _buildExperimentListHtml(experiments) {
     return experiments.map(exp => {
@@ -234,23 +236,34 @@ function _buildExperimentListHtml(experiments) {
 }
 
 async function refreshExperiments() {
-    if (_dashboardSnapshotReady) {
-        return renderExperimentListData(getDashboardExperimentGroups());
-    }
     const searchFilter = document.getElementById('search-filter').value.trim();
     const statusFilter = document.getElementById('status-filter').value;
     const trackFilter = document.getElementById('track-filter').value;
 
-    const params = new URLSearchParams();
-    if (trackFilter) params.set('track', trackFilter);
-    if (statusFilter) params.set('status', statusFilter);
-    if (searchFilter) params.set('search', searchFilter);
-
-    const url = params.toString() ? `/api/experiments?${params}` : '/api/experiments';
-    const response = await fetch(url);
-    let data = await response.json();
-
-    return renderExperimentListData(data.experiments);
+    if (_discoveryAbortController) _discoveryAbortController.abort();
+    _discoveryAbortController = new AbortController();
+    const selector = { type: 'discovery', limit: 100 };
+    if (trackFilter) selector.track = trackFilter;
+    if (statusFilter) selector.status = statusFilter;
+    if (searchFilter) selector.search = searchFilter;
+    let groups = null;
+    try {
+        await streamExperimentQueries({
+            sidebar: { selector, projections: ['summary'] },
+        }, {
+            signal: _discoveryAbortController.signal,
+            onFrame: frame => {
+                if (frame.type === 'group_page' && frame.query === 'sidebar') {
+                    groups = frame.groups || [];
+                }
+            },
+        });
+    } catch (error) {
+        if (error.name === 'AbortError') return State.get('experimentList') || [];
+        if (_dashboardSnapshotReady) return renderExperimentListData(getDashboardExperimentGroups());
+        throw error;
+    }
+    return renderExperimentListData(groups || getDashboardExperimentGroups());
 }
 
 function renderExperimentListData(experiments) {
@@ -288,11 +301,23 @@ function renderExperimentListData(experiments) {
 let _selectionGeneration = 0;
 let _selectionAbortController = null;
 
+function setChartLoading(isLoading, generation) {
+    if (generation !== _selectionGeneration) return;
+    const chartContainer = document.querySelector('.chart-container');
+    if (!chartContainer) return;
+    chartContainer.classList.toggle('is-loading', isLoading);
+    chartContainer.setAttribute('aria-busy', String(isLoading));
+    const overlay = chartContainer.querySelector('.chart-loading-overlay');
+    if (overlay) overlay.setAttribute('aria-hidden', String(!isLoading));
+}
+
 async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = null) {
     const generation = ++_selectionGeneration;
     if (_selectionAbortController) _selectionAbortController.abort();
     _selectionAbortController = new AbortController();
     const signal = _selectionAbortController.signal;
+    setChartLoading(true, generation);
+    try {
     State.set('selectedQueuedScript', null);
     const prevExp = State.get('selectedExp');
     const isSameExperiment = prevExp === codeHashOrId;
@@ -317,15 +342,57 @@ async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = nu
         el.classList.toggle('selected', el.dataset.id == codeHashOrId);
     });
 
-    // Fetch bounded chart details. A preloaded update can re-render the group
-    // without re-requesting completed siblings.
+    // Fetch every run through one named query. Cached curves are usable
+    // immediately and are validated by their metrics_revision in the request.
     let allData;
     try {
-        allData = prefetchedData || await Promise.all(
-            experimentIds.map(id => fetch(
-                `/api/experiment/${id}/chart?max_points=1200`, { signal }
-            ).then(r => r.json()))
-        );
+        if (prefetchedData) {
+            allData = prefetchedData;
+        } else {
+            const collected = new Map();
+            await Promise.all(experimentIds.map(async id => {
+                const curveRevision = _dashboardCurveRevisions.get(Number(id));
+                if (curveRevision === undefined) return;
+                const cached = await DashboardCache.get(`curve:${Number(id)}:${curveRevision}`);
+                if (cached) collected.set(Number(id), cached);
+            }));
+            let authoritativeIds = experimentIds.map(Number);
+            const isBucket = isBucketKey(codeHashOrId);
+            const selector = isBucket
+                ? { type: 'ids', ids: authoritativeIds }
+                : { type: 'experiment', id: authoritativeIds[0], expand_group: true };
+            await streamExperimentQueries({
+                selection: {
+                    selector,
+                    projections: ['summary', 'metadata', 'curves'],
+                    curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+                },
+            }, {
+                signal,
+                onFrame: frame => {
+                    if (frame.type === 'experiment' && frame.queries?.includes('selection')) {
+                        const id = Number(frame.experiment.id);
+                        const progressive = _dashboardExperimentSummaries.get(id) || frame.experiment;
+                        collected.set(id, progressive);
+                        const rendered = State.get('experimentData');
+                        if (rendered?.length && State.get('selectedExp') === codeHashOrId) {
+                            const next = rendered.some(item => Number(item.id) === id)
+                                ? rendered.map(item => Number(item.id) === id ? progressive : item)
+                                : rendered.concat([progressive]);
+                            State.set('experimentData', next);
+                            renderRunsTable();
+                            refreshMetricsTable();
+                            replaceVisibleRunCurve(id);
+                        }
+                    } else if (frame.type === 'complete' && frame.query === 'selection') {
+                        authoritativeIds = (frame.experiment_ids || []).map(Number);
+                    }
+                },
+            });
+            experimentIds = authoritativeIds;
+            State.set('selectedExpIds', experimentIds);
+            allData = authoritativeIds.map(id => collected.get(id)).filter(Boolean);
+        }
     } catch (error) {
         if (error.name === 'AbortError') return;
         throw error;
@@ -495,6 +562,10 @@ async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = nu
 
     // Mobile auto-navigate
     if (!isSameExperiment && isMobile()) switchMobilePanel('detail');
+    } finally {
+        // Let the newly rendered chart reach the next paint before revealing it.
+        requestAnimationFrame(() => setChartLoading(false, generation));
+    }
 }
 
 async function handleSelectedExperimentEvent(eventType, payload, revision) {
@@ -525,63 +596,8 @@ async function handleSelectedExperimentEvent(eventType, payload, revision) {
         return;
     }
 
-    if (eventType === 'metrics.changed' && wasSelected && belongsToSelectedGroup) {
-        await refreshSelectedMetricCurve(experimentId, revision, generation);
-        return;
-    }
-
-    let nextData = currentData.filter(item => nextIds.includes(Number(item.id)));
-    if (eventType !== 'experiment.deleted' && belongsToSelectedGroup) {
-        try {
-            const response = await fetch(`/api/experiment/${experimentId}/chart?max_points=1200`);
-            if (!response.ok || generation !== _selectionGeneration ||
-                _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
-            const detail = await response.json();
-            if (generation !== _selectionGeneration ||
-                _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
-            const existingIndex = nextData.findIndex(item => Number(item.id) === experimentId);
-            if (existingIndex >= 0) nextData[existingIndex] = detail;
-            else nextData.push(detail);
-        } catch (error) {
-            console.warn('Targeted experiment refresh failed:', error);
-            return;
-        }
-    }
     if (generation !== _selectionGeneration || State.get('selectedExp') !== selectedKey) return;
-    await selectExperiment(selectedKey, nextIds, nextData);
-}
-
-async function refreshSelectedMetricCurve(experimentId, revision, generation = _selectionGeneration) {
-    const currentData = State.get('experimentData') || [];
-    const existing = currentData.find(item => Number(item.id) === Number(experimentId));
-    if (!existing) return;
-    const activeMetric = State.get('selectedLossMetric') || getActiveLossMetric(currentData);
-    const params = new URLSearchParams({ max_points: '1200' });
-    if (activeMetric) params.set('loss_metric', activeMetric);
-    try {
-        const response = await fetch(`/api/experiment/${experimentId}/chart?${params}`);
-        if (!response.ok || generation !== _selectionGeneration ||
-            _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
-        const patch = await response.json();
-        if (generation !== _selectionGeneration ||
-            _dashboardEntityRevisions.get(`experiment:${experimentId}`) !== revision) return;
-        const merged = {
-            ...existing,
-            ...patch,
-            loss_curves: { ...(existing.loss_curves || {}), ...(patch.loss_curves || {}) },
-        };
-        if (!patch.loss_curve?.length && existing.loss_curve?.length) {
-            merged.loss_curve = existing.loss_curve;
-        }
-        const nextData = currentData.map(item => Number(item.id) === Number(experimentId) ? merged : item);
-        State.set('experimentData', nextData);
-        State.set('currentTotalSteps', Math.max(...nextData.map(item => item.total_steps || 0)));
-        renderRunsTable();
-        refreshMetricsTable();
-        replaceVisibleRunCurve(experimentId);
-    } catch (error) {
-        console.warn('Targeted metric refresh failed:', error);
-    }
+    await selectExperiment(selectedKey, nextIds);
 }
 
 // --- Queue ---
@@ -714,11 +730,22 @@ async function goToQueuedItem(scriptPath) {
     } catch {}
     loadNotes(scriptPath);
     try {
-        const resp = await fetch(`/api/experiments?search=${encodeURIComponent(scriptPath.split('/').pop().replace('.py', ''))}&limit=1&aggregate=false`);
-        const data = await resp.json();
-        if (data.experiments && data.experiments.length > 0 && data.experiments[0].code_hash) {
-            loadDiff(data.experiments[0].code_hash);
-        }
+        let match = null;
+        await streamExperimentQueries({
+            queued_lookup: {
+                selector: {
+                    type: 'discovery',
+                    search: scriptPath.split('/').pop().replace('.py', ''),
+                    limit: 1,
+                },
+                projections: ['summary'],
+            },
+        }, { onFrame: frame => {
+            if (frame.type === 'group_page' && frame.query === 'queued_lookup') {
+                match = frame.groups?.[0] || null;
+            }
+        }});
+        if (match?.code_hash) loadDiff(match.code_hash);
     } catch {}
     switchDiffNotesTab('diff');
 }
@@ -735,26 +762,7 @@ async function goToExperiment(expId) {
             return;
         }
     }
-    try {
-        const resp = await fetch(`/api/experiment/${expId}/chart?max_points=1200`);
-        const exp = await resp.json();
-        if (exp.error) return;
-        const codeHash = exp.code_hash;
-        if (codeHash) {
-            const listResp = await fetch(`/api/experiments?search=${codeHash}&limit=1`);
-            const listData = await listResp.json();
-            const match = listData.experiments.find(e => e.code_hash === codeHash);
-            if (match) {
-                await selectExperiment(match.code_hash, match.experiment_ids || [match.id]);
-            } else {
-                await selectExperiment(codeHash, [expId]);
-            }
-        } else {
-            await selectExperiment(expId, [expId]);
-        }
-    } catch {
-        await selectExperiment(expId, [expId]);
-    }
+    await selectExperiment(String(expId), [Number(expId)]);
     if (State.get('view') === 'queue') refreshQueue();
 }
 
@@ -985,7 +993,14 @@ async function revealInFinder(expId) {
 // --- Snapshot + event stream init ---
 
 async function startAutoRefresh() {
-    await loadDashboardSnapshot();
+    const cached = await restoreDashboardCache();
+    if (cached.groups.length) renderExperimentListData(cached.groups);
+    else if (_dashboardExperimentSummaries.size) {
+        renderExperimentListData(getDashboardExperimentGroups());
+    }
+    loadTracks();
+    if (_dashboardQueueData) renderQueueData(_dashboardQueueData);
+    if (_sessionData.length || _hubData) renderSessionChips();
 
     // Restore view
     const savedView = State.get('view');
@@ -999,10 +1014,6 @@ async function startAutoRefresh() {
         renderQueueData(getDashboardQueueData());
     }
 
-    const experiments = await refreshExperiments();
-    renderQueueData(getDashboardQueueData());
-    renderSessionChips();
-
     // Restore tab
     const savedTab = State.get('tab');
     if (savedTab && (savedTab === 'diff' || savedTab === 'notes')) {
@@ -1010,33 +1021,81 @@ async function startAutoRefresh() {
         switchDiffNotesTab(savedTab);
     }
 
-    // Restore selected experiment
     const savedExp = State.get('selectedExp');
+    const cachedGroups = cached.groups.length ? cached.groups : getDashboardExperimentGroups();
+    let cachedSelectionIds = [];
     if (isBucketKey(savedExp)) {
-        const bucketIds = getBucket(parseBucketKey(savedExp));
-        if (bucketIds.length > 0) {
-            await selectExperiment(savedExp, bucketIds.slice());
-        }
-    } else if (savedExp && experiments && experiments.length > 0) {
-        const match = experiments.find(e =>
-            e.code_hash === savedExp || String(e.id) === savedExp
+        cachedSelectionIds = getBucket(parseBucketKey(savedExp)).map(Number);
+    } else if (savedExp) {
+        const match = cachedGroups.find(group =>
+            group.code_hash === savedExp || String(group.id) === String(savedExp)
         );
-        if (match) {
-            await selectExperiment(match.code_hash || match.id, match.experiment_ids || [match.id]);
-            const savedRun = State.get('selectedRun');
-            if (savedRun) {
-                const data = State.get('experimentData');
-                if (data && data.find(d => d.id === savedRun)) {
-                    showMetricsForRun(savedRun);
-                }
-            }
-        }
-    } else if (!State.get('selectedExp') && experiments && experiments.length > 0) {
-        const first = experiments[0];
-        selectExperiment(first.code_hash || first.id, first.experiment_ids || [first.id]);
+        cachedSelectionIds = (match?.experiment_ids || (match ? [match.id] : [])).map(Number);
+    }
+    const cachedSelectionData = cachedSelectionIds.map(id => cached.details.get(id)).filter(Boolean);
+    if (savedExp && cachedSelectionData.length) {
+        await selectExperiment(savedExp, cachedSelectionIds, cachedSelectionData);
     }
 
-    connectDashboardEvents(_dashboardLastEventId);
+    const sidebarSelector = { type: 'discovery', limit: 100 };
+    const queries = {
+        sidebar: { selector: sidebarSelector, projections: ['summary'] },
+    };
+    if (savedExp) {
+        let selector;
+        if (isBucketKey(savedExp)) {
+            selector = { type: 'ids', ids: getBucket(parseBucketKey(savedExp)).map(Number) };
+        } else {
+            const cachedGroup = cachedGroups.find(group =>
+                group.code_hash === savedExp || String(group.id) === String(savedExp)
+            );
+            if (cachedGroup?.id) {
+                selector = { type: 'experiment', id: Number(cachedGroup.id), expand_group: true };
+            } else if (/^\d+$/.test(String(savedExp))) {
+                selector = { type: 'experiment', id: Number(savedExp), expand_group: true };
+            } else {
+                selector = { type: 'group', group: { code_hash: savedExp } };
+            }
+        }
+        queries.selection = {
+            selector,
+            projections: ['summary', 'metadata', 'curves'],
+            curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+        };
+    }
+
+    const freshSelection = new Map(cachedSelectionData.map(item => [Number(item.id), item]));
+    let authoritativeSelectionIds = cachedSelectionIds;
+    await Promise.all([
+        loadDashboardSnapshot(),
+        streamExperimentQueries(queries, {
+            onFrame: frame => {
+                if (frame.type === 'experiment' && frame.queries?.includes('selection')) {
+                    const id = Number(frame.experiment.id);
+                    freshSelection.set(id, _dashboardExperimentSummaries.get(id) || frame.experiment);
+                } else if (frame.type === 'complete' && frame.query === 'selection') {
+                    authoritativeSelectionIds = (frame.experiment_ids || []).map(Number);
+                }
+            },
+        }),
+    ]);
+    loadTracks();
+    renderQueueData(getDashboardQueueData());
+    renderSessionChips();
+    const experiments = renderExperimentListData(getDashboardExperimentGroups());
+
+    if (savedExp && authoritativeSelectionIds.length) {
+        const freshData = authoritativeSelectionIds
+            .map(id => freshSelection.get(id) || cached.details.get(id))
+            .filter(Boolean);
+        if (freshData.length) await selectExperiment(savedExp, authoritativeSelectionIds, freshData);
+    } else if (!savedExp && experiments.length > 0) {
+        // A first visit has no selection to include in the initial multi-query.
+        // The first authoritative group frame determines the one follow-up query.
+        const first = experiments[0];
+        await selectExperiment(first.code_hash || first.id, first.experiment_ids || [first.id]);
+    }
+    connectDashboardEvents(_dashboardQueryCursor ?? _dashboardLastEventId);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1050,7 +1109,6 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('experiments-panel').classList.add('collapsed');
     }
 
-    loadTracks();
     startAutoRefresh().catch(error => {
         console.error('Dashboard initialization failed:', error);
     });

@@ -3,10 +3,16 @@
 let _dashboardExperimentSummaries = new Map();
 let _dashboardQueueData = null;
 let _dashboardLastEventId = 0;
+let _dashboardQueryCursor = null;
 let _dashboardEventSource = null;
 let _dashboardSnapshotReady = false;
 let _dashboardResetInProgress = false;
 const _dashboardEntityRevisions = new Map();
+const _dashboardMetricRevisions = new Map();
+const _dashboardCurveRevisions = new Map();
+let _dashboardDiscoveryMembership = new Set();
+let _dashboardPriorDiscoveryMembership = new Set();
+let _dashboardTracks = [];
 const _dashboardLatencySamples = [];
 window.nanorunDashboardSSE = {
     connected: false,
@@ -43,7 +49,12 @@ function getDashboardExperimentGroups() {
     const track = document.getElementById('track-filter')?.value || '';
     const status = document.getElementById('status-filter')?.value || '';
     const search = (document.getElementById('search-filter')?.value || '').trim().toLowerCase();
-    const summaries = Array.from(_dashboardExperimentSummaries.values())
+    const source = _dashboardDiscoveryMembership.size > 0
+        ? Array.from(_dashboardDiscoveryMembership)
+            .map(id => _dashboardExperimentSummaries.get(Number(id)))
+            .filter(Boolean)
+        : Array.from(_dashboardExperimentSummaries.values());
+    const summaries = source
         .filter(exp => !track || exp.track === track)
         .filter(exp => !status || exp.status === status)
         .filter(exp => {
@@ -108,18 +119,20 @@ function getDashboardQueueData() {
 }
 
 function _installDashboardSnapshot(snapshot) {
-    _dashboardLastEventId = Number(snapshot.last_event_id || 0);
-    _dashboardExperimentSummaries = new Map();
-    _dashboardEntityRevisions.clear();
-    (snapshot.experiment_summaries || []).forEach(summary => {
-        summary.revision = Number(summary.revision || _dashboardLastEventId);
-        _dashboardExperimentSummaries.set(Number(summary.id), summary);
-        _dashboardEntityRevisions.set(`experiment:${summary.id}`, summary.revision);
-    });
+    _dashboardLastEventId = Math.max(_dashboardLastEventId, Number(snapshot.last_event_id || 0));
     _dashboardQueueData = snapshot.queue || { running: null, running_list: [], queued: [], state: 'active' };
     _sessionData = snapshot.sessions || [];
     _hubData = snapshot.hub || {};
+    _dashboardTracks = snapshot.tracks || _dashboardTracks;
     _dashboardSnapshotReady = true;
+    DashboardCache.set('dashboard:shell', {
+        queue: _dashboardQueueData,
+        sessions: _sessionData,
+        hub: _hubData,
+        tracks: _dashboardTracks,
+        event_cursor: _dashboardLastEventId,
+        discovery_membership: Array.from(_dashboardDiscoveryMembership),
+    });
 }
 
 async function loadDashboardSnapshot() {
@@ -130,12 +143,173 @@ async function loadDashboardSnapshot() {
     return snapshot;
 }
 
+async function restoreDashboardCache() {
+    const [shell, cachedGroups, summaryEntries, detailEntries] = await Promise.all([
+        DashboardCache.get('dashboard:shell'),
+        DashboardCache.get('sidebar:groups'),
+        DashboardCache.entries('experiment:'),
+        DashboardCache.entries('curve:'),
+    ]);
+    if (shell) {
+        _dashboardQueueData = shell.queue || _dashboardQueueData;
+        _sessionData = shell.sessions || _sessionData;
+        _hubData = shell.hub || _hubData;
+        _dashboardTracks = shell.tracks || [];
+        _dashboardLastEventId = Number(shell.event_cursor || 0);
+        _dashboardDiscoveryMembership = new Set(
+            (shell.discovery_membership || []).map(Number)
+        );
+    }
+    summaryEntries.forEach(({ value: summary }) => {
+        if (!summary?.id) return;
+        const id = Number(summary.id);
+        _dashboardExperimentSummaries.set(id, summary);
+        _dashboardEntityRevisions.set(`experiment:${id}`, Number(summary.revision || 0));
+        _dashboardMetricRevisions.set(id, Number(summary.metrics_revision || 0));
+    });
+    const details = new Map();
+    detailEntries.forEach(({ value }) => {
+        if (value?.id) {
+            const id = Number(value.id);
+            const revision = Number(value.metrics_revision || 0);
+            const prior = details.get(id);
+            if (!prior || Number(prior.metrics_revision || 0) <= revision) {
+                details.set(id, value);
+                _dashboardCurveRevisions.set(id, revision);
+            }
+        }
+    });
+    if (summaryEntries.length || shell) _dashboardSnapshotReady = true;
+    return { shell, groups: cachedGroups || [], details };
+}
+
+function _knownExperimentCacheState() {
+    const experiments = {};
+    const metrics = {};
+    _dashboardExperimentSummaries.forEach((summary, id) => {
+        experiments[id] = Number(summary.revision || 0);
+        if (_dashboardCurveRevisions.has(Number(id))) {
+            metrics[id] = Number(_dashboardCurveRevisions.get(Number(id)) || 0);
+        }
+    });
+    return { experiments, metrics };
+}
+
+async function streamExperimentQueries(queries, { signal = null, onFrame = null } = {}) {
+    const response = await fetch('/api/experiments/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' },
+        body: JSON.stringify({ queries, cache_state: _knownExperimentCacheState() }),
+        signal,
+    });
+    if (!response.ok) {
+        let message = `Experiment query failed (${response.status})`;
+        try { message = (await response.json()).error || message; } catch {}
+        throw new Error(message);
+    }
+    const frames = [];
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        buffered += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const lines = buffered.split('\n');
+        buffered = done ? '' : lines.pop();
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            const frame = JSON.parse(line);
+            frames.push(frame);
+            await applyExperimentQueryFrame(frame);
+            if (onFrame) await onFrame(frame);
+        }
+        if (done) break;
+    }
+    if (buffered.trim()) {
+        const frame = JSON.parse(buffered);
+        frames.push(frame);
+        await applyExperimentQueryFrame(frame);
+        if (onFrame) await onFrame(frame);
+    }
+    return frames;
+}
+
+async function applyExperimentQueryFrame(frame) {
+    if (frame.type === 'metadata') {
+        _dashboardQueryCursor = Number(frame.event_cursor || 0);
+        _dashboardLastEventId = Math.max(
+            _dashboardLastEventId, Number(frame.event_cursor || 0)
+        );
+        return;
+    }
+    if (frame.type === 'group_page') {
+        if (frame.query !== 'sidebar') return;
+        const ids = (frame.groups || []).flatMap(group => group.experiment_ids || [group.id]).map(Number);
+        _dashboardPriorDiscoveryMembership = new Set(_dashboardDiscoveryMembership);
+        _dashboardDiscoveryMembership = new Set(ids);
+        renderExperimentListData(frame.groups || []);
+        DashboardCache.set('sidebar:groups', frame.groups || []);
+        return;
+    }
+    if (frame.type === 'experiment') {
+        const incoming = frame.experiment;
+        const id = Number(incoming.id);
+        const previous = _dashboardExperimentSummaries.get(id);
+        const previousRevision = Number(previous?.revision || -1);
+        if (Number(incoming.revision || 0) < previousRevision) return;
+        const merged = {
+            ...(previous || {}),
+            ...incoming,
+            loss_curves: {
+                ...(previous?.loss_curves || {}),
+                ...(incoming.loss_curves || {}),
+            },
+        };
+        _dashboardExperimentSummaries.set(id, merged);
+        _dashboardEntityRevisions.set(`experiment:${id}`, Number(merged.revision || 0));
+        _dashboardMetricRevisions.set(id, Number(merged.metrics_revision || 0));
+        const cachedSummary = { ...merged };
+        delete cachedSummary.loss_curves;
+        delete cachedSummary.loss_curve;
+        delete cachedSummary.curve_max_points;
+        DashboardCache.set(`experiment:${id}`, cachedSummary);
+        if (incoming.loss_curves) {
+            _dashboardCurveRevisions.set(id, Number(merged.metrics_revision || 0));
+            DashboardCache.set(
+                `curve:${id}:${Number(merged.metrics_revision || 0)}`, merged
+            );
+        }
+        return;
+    }
+    if (frame.type === 'complete' && frame.query === 'sidebar') {
+        const authoritative = new Set((frame.experiment_ids || []).map(Number));
+        const removed = Array.from(_dashboardPriorDiscoveryMembership)
+            .filter(id => !authoritative.has(Number(id)));
+        _dashboardDiscoveryMembership = authoritative;
+        for (const id of removed) {
+            _dashboardExperimentSummaries.delete(Number(id));
+            _dashboardEntityRevisions.delete(`experiment:${id}`);
+            _dashboardMetricRevisions.delete(Number(id));
+            await DashboardCache.remove(`experiment:${id}`);
+        }
+        const shell = await DashboardCache.get('dashboard:shell') || {};
+        shell.discovery_membership = Array.from(authoritative);
+        shell.event_cursor = _dashboardLastEventId;
+        await DashboardCache.set('dashboard:shell', shell);
+    }
+}
+
 function _eventRevision(event, payload) {
-    return Number(event.lastEventId || payload.revision || 0);
+    return Number(payload.revision || payload.summary?.revision || 0);
+}
+
+function _eventCursor(event, payload) {
+    return Number(event.lastEventId || payload.event_cursor || 0);
 }
 
 function _acceptEntityRevision(entityKey, revision) {
-    const previous = Number(_dashboardEntityRevisions.get(entityKey) || 0);
+    const previous = _dashboardEntityRevisions.has(entityKey)
+        ? Number(_dashboardEntityRevisions.get(entityKey)) : -1;
     if (revision <= previous) return false;
     _dashboardEntityRevisions.set(entityKey, revision);
     return true;
@@ -149,9 +323,15 @@ function _onExperimentEvent(eventType, event) {
 
     if (eventType === 'experiment.deleted') {
         _dashboardExperimentSummaries.delete(experimentId);
+        _dashboardMetricRevisions.delete(experimentId);
+        _dashboardCurveRevisions.delete(experimentId);
+        DashboardCache.remove(`experiment:${experimentId}`);
     } else if (payload.summary) {
-        payload.summary.revision = revision;
         _dashboardExperimentSummaries.set(experimentId, payload.summary);
+        _dashboardMetricRevisions.set(
+            experimentId, Number(payload.metrics_revision || payload.summary.metrics_revision || 0)
+        );
+        DashboardCache.set(`experiment:${experimentId}`, payload.summary);
         if (_dashboardQueueData) {
             const running = (_dashboardQueueData.running_list || [])
                 .filter(item => Number(item.id) !== experimentId);
@@ -171,7 +351,7 @@ function _onExperimentEvent(eventType, event) {
 
 async function _onQueueEvent(event) {
     const payload = JSON.parse(event.data || '{}');
-    const revision = _eventRevision(event, payload);
+    const revision = _eventCursor(event, payload);
     const sessionName = payload.session_name;
     if (!sessionName || !_acceptEntityRevision(`queue:${sessionName}`, revision)) return;
     try {
@@ -200,7 +380,7 @@ async function _onQueueEvent(event) {
 
 async function _onSessionEvent(event) {
     const payload = JSON.parse(event.data || '{}');
-    const revision = _eventRevision(event, payload);
+    const revision = _eventCursor(event, payload);
     if (payload.hub) {
         const revisionKey = 'session:__hub__';
         if (!_acceptEntityRevision(revisionKey, revision)) return;
@@ -245,7 +425,7 @@ async function _recoverDashboardSnapshot() {
         if (match) {
             await selectExperiment(match.code_hash || match.id, match.experiment_ids || [match.id]);
         }
-        connectDashboardEvents(_dashboardLastEventId);
+        connectDashboardEvents(_dashboardQueryCursor ?? _dashboardLastEventId);
     } catch (error) {
         console.error('Dashboard reset recovery failed:', error);
         setTimeout(_recoverDashboardSnapshot, 1000);
@@ -256,7 +436,8 @@ async function _recoverDashboardSnapshot() {
 
 function connectDashboardEvents(afterEventId) {
     if (_dashboardEventSource) _dashboardEventSource.close();
-    _dashboardEventSource = new EventSource(`/api/events?after=${Number(afterEventId || 0)}`);
+    _dashboardLastEventId = Number(afterEventId || 0);
+    _dashboardEventSource = new EventSource(`/api/events?after=${_dashboardLastEventId}`);
     _dashboardEventSource.onopen = () => {
         window.nanorunDashboardSSE.connected = true;
     };
@@ -268,16 +449,16 @@ function connectDashboardEvents(afterEventId) {
             _dashboardEventSource.addEventListener(eventType, event => {
                 const payload = JSON.parse(event.data || '{}');
                 _recordDashboardEventLatency(payload);
-                const revision = _eventRevision(event, payload);
-                if (revision <= _dashboardLastEventId) return;
-                _dashboardLastEventId = revision;
+                const cursor = _eventCursor(event, payload);
+                if (cursor <= _dashboardLastEventId) return;
+                _dashboardLastEventId = cursor;
                 _onExperimentEvent(eventType, event);
             });
         });
     _dashboardEventSource.addEventListener('queue.changed', event => {
         const payload = JSON.parse(event.data || '{}');
         _recordDashboardEventLatency(payload);
-        const revision = _eventRevision(event, payload);
+        const revision = _eventCursor(event, payload);
         if (revision <= _dashboardLastEventId) return;
         _dashboardLastEventId = revision;
         _onQueueEvent(event);
@@ -285,14 +466,14 @@ function connectDashboardEvents(afterEventId) {
     _dashboardEventSource.addEventListener('session.changed', event => {
         const payload = JSON.parse(event.data || '{}');
         _recordDashboardEventLatency(payload);
-        const revision = _eventRevision(event, payload);
+        const revision = _eventCursor(event, payload);
         if (revision <= _dashboardLastEventId) return;
         _dashboardLastEventId = revision;
         _onSessionEvent(event);
     });
     _dashboardEventSource.addEventListener('dashboard.reset', event => {
         const payload = JSON.parse(event.data || '{}');
-        _dashboardLastEventId = Math.max(_dashboardLastEventId, _eventRevision(event, payload));
+        _dashboardLastEventId = Math.max(_dashboardLastEventId, _eventCursor(event, payload));
         _recoverDashboardSnapshot();
     });
 }

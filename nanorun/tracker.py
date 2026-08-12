@@ -46,6 +46,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             tmux_window TEXT,
             remote_run_id TEXT,
             status TEXT DEFAULT 'running',
+            revision INTEGER NOT NULL DEFAULT 0,
+            metrics_revision INTEGER NOT NULL DEFAULT 0,
             started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             finished_at TIMESTAMP
         );
@@ -106,6 +108,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "session_name": "TEXT",
         "session_id": "TEXT",
         "queue_command": "TEXT",
+        "revision": "INTEGER NOT NULL DEFAULT 0",
+        "metrics_revision": "INTEGER NOT NULL DEFAULT 0",
     }
     metric_migrations = {
         "train_loss": "REAL",
@@ -129,6 +133,30 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     # are idempotent (IF NOT EXISTS).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiments_run_id ON experiments(remote_run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_experiments_session_id ON experiments(session_id)")
+    # Dashboard query indexes.  The partial metric indexes make the correlated
+    # latest-row lookups seek directly to the selected point instead of scanning
+    # a run's history.  Existing databases start with zero revisions; no metric
+    # history scan or backfill is needed.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiments_visible_order "
+        "ON experiments(COALESCE(deleted, 0), started_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_experiments_group_order "
+        "ON experiments(code_hash, track, gpus, gpu_type, deleted, started_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_experiment_step "
+        "ON metrics(experiment_id, step DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_latest_val "
+        "ON metrics(experiment_id, step DESC) WHERE val_loss IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_final_step "
+        "ON metrics(experiment_id, step DESC) WHERE is_final_step = 1"
+    )
     conn.commit()
 
     # NOTE: moving the legacy inlined crash_log data into crash_logs and dropping
@@ -217,6 +245,8 @@ class Experiment:
     dependencies: Dict[str, str] = field(default_factory=dict)
     session_name: Optional[str] = None
     session_id: Optional[str] = None  # {name}::{started_at} — per-incarnation scope key
+    revision: int = 0
+    metrics_revision: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Experiment":
@@ -250,6 +280,10 @@ class Experiment:
             ),
             session_name=row["session_name"] if "session_name" in keys else None,
             session_id=row["session_id"] if "session_id" in keys else None,
+            revision=row["revision"] if "revision" in keys else 0,
+            metrics_revision=(
+                row["metrics_revision"] if "metrics_revision" in keys else 0
+            ),
         )
 
 
@@ -299,76 +333,164 @@ def _dashboard_group(exp: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def read_experiment_summaries(
+    experiment_ids: List[int],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    include_deleted: bool = False,
+) -> Dict[int, Dict[str, Any]]:
+    """Read canonical dashboard summaries for any number of experiments.
+
+    This is the one loss/progress definition used by query responses, queue
+    state, and durable events.  It is deliberately one SQL statement: every
+    selected metric row is found through an indexed ``(experiment_id, step)``
+    lookup, so adding runs does not add statements or introduce a whole-metrics
+    ``GROUP BY/MAX`` scan.
+    """
+    ids = list(dict.fromkeys(
+        int(experiment_id) for experiment_id in experiment_ids
+        if isinstance(experiment_id, int) and not isinstance(experiment_id, bool)
+    ))
+    if not ids:
+        return {}
+    db = conn or get_db()
+    placeholders = ",".join("?" for _ in ids)
+    deleted_clause = "" if include_deleted else "AND COALESCE(e.deleted, 0) = 0"
+    rows = db.execute(
+        f"""
+        SELECT e.*,
+               progress.step AS progress_step,
+               progress.total_steps AS progress_total_steps,
+               latest_val.step AS latest_val_step,
+               latest_val.val_loss AS latest_val_loss,
+               latest_val.train_time_ms AS latest_val_time,
+               latest_val.step_avg_ms AS latest_val_step_avg,
+               latest_train.step AS latest_train_step,
+               latest_train.train_loss AS latest_train_loss,
+               latest_train.train_time_ms AS latest_train_time,
+               latest_train.step_avg_ms AS latest_train_step_avg,
+               final_val.step AS final_val_step,
+               final_val.val_loss AS final_val_loss,
+               final_val.train_time_ms AS final_val_time,
+               final_train.step AS final_train_step,
+               final_train.train_loss AS final_train_loss,
+               final_train.train_time_ms AS final_train_time
+        FROM experiments e
+        LEFT JOIN metrics progress ON progress.id = (
+            SELECT p.id FROM metrics p
+            WHERE p.experiment_id = e.id
+            ORDER BY p.step DESC LIMIT 1
+        )
+        LEFT JOIN metrics latest_val ON latest_val.id = (
+            SELECT v.id FROM metrics v
+            WHERE v.experiment_id = e.id AND v.val_loss IS NOT NULL
+            ORDER BY v.step DESC LIMIT 1
+        )
+        LEFT JOIN metrics latest_train ON latest_train.id = (
+            SELECT t.id FROM metrics t
+            WHERE t.experiment_id = e.id AND t.train_loss IS NOT NULL
+            ORDER BY t.step DESC LIMIT 1
+        )
+        LEFT JOIN metrics final_val ON final_val.id = (
+            SELECT fv.id FROM metrics fv
+            WHERE fv.experiment_id = e.id AND fv.is_final_step = 1
+              AND fv.val_loss IS NOT NULL
+            ORDER BY fv.step DESC LIMIT 1
+        )
+        LEFT JOIN metrics final_train ON final_train.id = (
+            SELECT ft.id FROM metrics ft
+            WHERE ft.experiment_id = e.id AND ft.is_final_step = 1
+              AND ft.train_loss IS NOT NULL
+            ORDER BY ft.step DESC LIMIT 1
+        )
+        WHERE e.id IN ({placeholders}) {deleted_clause}
+        """,
+        ids,
+    ).fetchall()
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        has_val = row["latest_val_step"] is not None
+        has_train = row["latest_train_step"] is not None
+        primary = "val_loss" if has_val else ("train_loss" if has_train else None)
+        if primary == "val_loss":
+            latest_loss = row["latest_val_loss"]
+            latest_loss_step = row["latest_val_step"]
+            latest_time = row["latest_val_time"]
+            latest_step_avg = row["latest_val_step_avg"]
+            final_loss = row["final_val_loss"]
+            final_loss_step = row["final_val_step"]
+            final_time = row["final_val_time"]
+        elif primary == "train_loss":
+            latest_loss = row["latest_train_loss"]
+            latest_loss_step = row["latest_train_step"]
+            latest_time = row["latest_train_time"]
+            latest_step_avg = row["latest_train_step_avg"]
+            final_loss = row["final_train_loss"]
+            final_loss_step = row["final_train_step"]
+            final_time = row["final_train_time"]
+        else:
+            latest_loss = latest_loss_step = latest_time = latest_step_avg = None
+            final_loss = final_loss_step = final_time = None
+
+        available = []
+        if has_val:
+            available.append("val_loss")
+        if has_train:
+            available.append("train_loss")
+        summary = {
+            "id": row["id"],
+            "name": row["name"],
+            "track": row["track"],
+            "script": row["script"],
+            "code_hash": row["code_hash"],
+            "parent_hash": row["parent_hash"],
+            "git_commit": row["git_commit"],
+            "status": row["status"],
+            "gpus": row["gpus"],
+            "gpu_type": row["gpu_type"] or "H100",
+            "env_vars": json.loads(row["env_vars"]) if row["env_vars"] else {},
+            "run_number": row["run_number"],
+            "tmux_window": row["tmux_window"],
+            "remote_run_id": row["remote_run_id"],
+            "kernels_path": row["kernels_path"],
+            "dependencies": (
+                json.loads(row["dependencies"]) if row["dependencies"] else {}
+            ),
+            "session_name": row["session_name"],
+            "session_id": row["session_id"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "revision": int(row["revision"] or 0),
+            "metrics_revision": int(row["metrics_revision"] or 0),
+            "current_step": row["progress_step"],
+            "total_steps": row["progress_total_steps"],
+            "val_loss": row["latest_val_loss"],
+            "train_loss": row["latest_train_loss"],
+            "latest_loss": latest_loss,
+            "latest_loss_step": latest_loss_step,
+            "loss": latest_loss,
+            "loss_metric": primary,
+            "available_loss_metrics": available,
+            "train_time_ms": latest_time,
+            "step_avg_ms": latest_step_avg,
+            "final_loss": final_loss,
+            "final_loss_step": final_loss_step,
+            # Existing rendering uses this as the explicit latest fallback.
+            "final_val_loss": latest_loss,
+            "final_train_time_ms": final_time if final_loss is not None else latest_time,
+            "group": _dashboard_group(row),
+        }
+        result[row["id"]] = summary
+    return result
+
+
 def _dashboard_experiment_summary(
     conn: sqlite3.Connection,
     experiment_id: int,
 ) -> Optional[Dict[str, Any]]:
-    """Build the bounded experiment patch carried by dashboard events."""
-    exp = conn.execute(
-        "SELECT * FROM experiments WHERE id = ?",
-        (experiment_id,),
-    ).fetchone()
-    if not exp or ("deleted" in exp.keys() and exp["deleted"]):
-        return None
-
-    latest = conn.execute(
-        "SELECT step, total_steps, step_avg_ms FROM metrics "
-        "WHERE experiment_id = ? ORDER BY step DESC LIMIT 1",
-        (experiment_id,),
-    ).fetchone()
-    latest_val = conn.execute(
-        "SELECT val_loss, train_time_ms FROM metrics "
-        "WHERE experiment_id = ? AND val_loss IS NOT NULL "
-        "ORDER BY step DESC LIMIT 1",
-        (experiment_id,),
-    ).fetchone()
-    latest_train = conn.execute(
-        "SELECT train_loss, train_time_ms FROM metrics "
-        "WHERE experiment_id = ? AND train_loss IS NOT NULL "
-        "ORDER BY step DESC LIMIT 1",
-        (experiment_id,),
-    ).fetchone()
-    metric_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM metrics WHERE experiment_id = ?",
-        (experiment_id,),
-    ).fetchone()["count"]
-
-    val_loss = latest_val["val_loss"] if latest_val else None
-    train_loss = latest_train["train_loss"] if latest_train else None
-    loss = val_loss if val_loss is not None else train_loss
-    loss_metric = (
-        "val_loss" if val_loss is not None
-        else ("train_loss" if train_loss is not None else None)
-    )
-    train_time_ms = (
-        latest_val["train_time_ms"] if latest_val
-        else (latest_train["train_time_ms"] if latest_train else None)
-    )
-    return {
-        "id": exp["id"],
-        "name": exp["name"],
-        "track": exp["track"],
-        "script": exp["script"],
-        "code_hash": exp["code_hash"],
-        "status": exp["status"],
-        "gpus": exp["gpus"],
-        "gpu_type": exp["gpu_type"] or "H100",
-        "env_vars": json.loads(exp["env_vars"]) if exp["env_vars"] else {},
-        "session_name": exp["session_name"],
-        "remote_run_id": exp["remote_run_id"],
-        "started_at": exp["started_at"],
-        "finished_at": exp["finished_at"],
-        "current_step": latest["step"] if latest else None,
-        "total_steps": latest["total_steps"] if latest else None,
-        "val_loss": val_loss,
-        "train_loss": train_loss,
-        "loss": loss,
-        "loss_metric": loss_metric,
-        "train_time_ms": train_time_ms,
-        "step_avg_ms": latest["step_avg_ms"] if latest else None,
-        "metric_count": metric_count,
-        "group": _dashboard_group(exp),
-    }
+    """Build the canonical bounded experiment patch carried by events."""
+    return read_experiment_summaries([experiment_id], conn=conn).get(experiment_id)
 
 
 def _compact_dashboard_events(conn: sqlite3.Connection) -> None:
@@ -402,10 +524,10 @@ def _append_dashboard_event(
          json.dumps(event_payload, separators=(",", ":"), sort_keys=True)),
     )
     event_id = cursor.lastrowid
-    event_payload["revision"] = event_id
-    summary = event_payload.get("summary")
-    if isinstance(summary, dict):
-        summary["revision"] = event_id
+    # The replay cursor orders the event log; experiment revision counters order
+    # entity state.  Keeping them separate prevents an older query response from
+    # winning merely because its HTTP request completed after a newer SSE event.
+    event_payload["event_cursor"] = event_id
     conn.execute(
         "UPDATE dashboard_events SET payload = ? WHERE id = ?",
         (json.dumps(event_payload, separators=(",", ":"), sort_keys=True), event_id),
@@ -463,8 +585,18 @@ def get_dashboard_experiment_summary(experiment_id: int) -> Optional[Dict[str, A
 def commit_metric_batch(experiment_ids: List[int]) -> None:
     """Commit a parse batch and emit at most one metric event per experiment."""
     conn = get_db()
-    for experiment_id in dict.fromkeys(experiment_ids):
-        summary = _dashboard_experiment_summary(conn, experiment_id)
+    ids = list(dict.fromkeys(experiment_ids))
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"UPDATE experiments SET revision = revision + 1, "
+            f"metrics_revision = metrics_revision + 1 "
+            f"WHERE id IN ({placeholders})",
+            ids,
+        )
+    summaries = read_experiment_summaries(ids, conn=conn)
+    for experiment_id in ids:
+        summary = summaries.get(experiment_id)
         if summary:
             _append_dashboard_event(
                 conn,
@@ -474,7 +606,8 @@ def commit_metric_batch(experiment_ids: List[int]) -> None:
                     "experiment_id": experiment_id,
                     "group": summary["group"],
                     "latest_step": summary["current_step"],
-                    "metric_count": summary["metric_count"],
+                    "revision": summary["revision"],
+                    "metrics_revision": summary["metrics_revision"],
                     "summary": summary,
                 },
             )
@@ -535,7 +668,9 @@ def create_experiment(
     summary = _dashboard_experiment_summary(conn, exp_id)
     _append_dashboard_event(
         conn, "experiment.created", str(exp_id),
-        {"experiment_id": exp_id, "group": summary["group"], "summary": summary},
+        {"experiment_id": exp_id, "group": summary["group"],
+         "revision": summary["revision"],
+         "metrics_revision": summary["metrics_revision"], "summary": summary},
     )
     conn.commit()
     return exp_id
@@ -594,6 +729,11 @@ def record_metric(
     changed = cursor.rowcount > 0
     if commit:
         if changed:
+            conn.execute(
+                "UPDATE experiments SET revision = revision + 1, "
+                "metrics_revision = metrics_revision + 1 WHERE id = ?",
+                (experiment_id,),
+            )
             summary = _dashboard_experiment_summary(conn, experiment_id)
             if summary:
                 _append_dashboard_event(
@@ -604,7 +744,8 @@ def record_metric(
                         "experiment_id": experiment_id,
                         "group": summary["group"],
                         "latest_step": summary["current_step"],
-                        "metric_count": summary["metric_count"],
+                        "revision": summary["revision"],
+                        "metrics_revision": summary["metrics_revision"],
                         "summary": summary,
                     },
                 )
@@ -617,7 +758,8 @@ def update_experiment_status(experiment_id: int, status: str) -> bool:
     conn = get_db()
     if status in ("completed", "failed", "cancelled"):
         cursor = conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = ? "
+            "UPDATE experiments SET status = ?, finished_at = ?, "
+            "revision = revision + 1 "
             "WHERE id = ? AND (status IS NOT ? OR finished_at IS NULL)",
             (status, datetime.now(timezone.utc).isoformat(), experiment_id, status)
         )
@@ -625,13 +767,14 @@ def update_experiment_status(experiment_id: int, status: str) -> bool:
         # A direct remote observation may correct a stale terminal projection.
         cursor = conn.execute(
             "UPDATE experiments SET status = ?, started_at = COALESCE(started_at, ?), "
-            "finished_at = NULL WHERE id = ? "
+            "finished_at = NULL, revision = revision + 1 WHERE id = ? "
             "AND (status IS NOT ? OR finished_at IS NOT NULL)",
             (status, datetime.now(timezone.utc).isoformat(), experiment_id, status)
         )
     else:
         cursor = conn.execute(
-            "UPDATE experiments SET status = ?, finished_at = NULL WHERE id = ? "
+            "UPDATE experiments SET status = ?, finished_at = NULL, "
+            "revision = revision + 1 WHERE id = ? "
             "AND (status IS NOT ? OR finished_at IS NOT NULL)",
             (status, experiment_id, status)
         )
@@ -641,7 +784,9 @@ def update_experiment_status(experiment_id: int, status: str) -> bool:
         if summary:
             _append_dashboard_event(
                 conn, "experiment.updated", str(experiment_id),
-                {"experiment_id": experiment_id, "group": summary["group"], "summary": summary},
+                {"experiment_id": experiment_id, "group": summary["group"],
+                 "revision": summary["revision"],
+                 "metrics_revision": summary["metrics_revision"], "summary": summary},
             )
     conn.commit()
     return changed
@@ -735,22 +880,28 @@ def terminate_session_experiments(
 
     if running_ids:
         conn.execute(
-            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?), "
+            f"revision = revision + 1 "
             f"WHERE status = 'running' AND {scope_sql}",
             (running_status, now, *scope_params),
         )
     if queued_ids:
         conn.execute(
-            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?) "
+            f"UPDATE experiments SET status = ?, finished_at = COALESCE(finished_at, ?), "
+            f"revision = revision + 1 "
             f"WHERE status = 'queued' AND {scope_sql}",
             (queued_status, now, *scope_params),
         )
-    for exp_id in running_ids + queued_ids:
-        summary = _dashboard_experiment_summary(conn, exp_id)
+    changed_ids = running_ids + queued_ids
+    summaries = read_experiment_summaries(changed_ids, conn=conn)
+    for exp_id in changed_ids:
+        summary = summaries.get(exp_id)
         if summary:
             _append_dashboard_event(
                 conn, "experiment.updated", str(exp_id),
-                {"experiment_id": exp_id, "group": summary["group"], "summary": summary},
+                {"experiment_id": exp_id, "group": summary["group"],
+                 "revision": summary["revision"],
+                 "metrics_revision": summary["metrics_revision"], "summary": summary},
             )
     conn.commit()
     return running_ids, queued_ids
@@ -820,9 +971,16 @@ def update_experiment_metadata(
         conn.execute(query, params)
         after = _dashboard_experiment_summary(conn, experiment_id)
         if after and after != before:
+            conn.execute(
+                "UPDATE experiments SET revision = revision + 1 WHERE id = ?",
+                (experiment_id,),
+            )
+            after = _dashboard_experiment_summary(conn, experiment_id)
             _append_dashboard_event(
                 conn, "experiment.updated", str(experiment_id),
-                {"experiment_id": experiment_id, "group": after["group"], "summary": after},
+                {"experiment_id": experiment_id, "group": after["group"],
+                 "revision": after["revision"],
+                 "metrics_revision": after["metrics_revision"], "summary": after},
             )
         conn.commit()
 
@@ -929,14 +1087,21 @@ def delete_experiment(experiment_id: int) -> None:
     """Soft delete an experiment (sets deleted flag)."""
     conn = get_db()
     cursor = conn.execute(
-        "UPDATE experiments SET deleted = 1 "
+        "UPDATE experiments SET deleted = 1, revision = revision + 1 "
         "WHERE id = ? AND COALESCE(deleted, 0) = 0",
         (experiment_id,),
     )
     if cursor.rowcount:
+        deleted_summary = read_experiment_summaries(
+            [experiment_id], conn=conn, include_deleted=True,
+        ).get(experiment_id)
         _append_dashboard_event(
             conn, "experiment.deleted", str(experiment_id),
-            {"experiment_id": experiment_id},
+            {"experiment_id": experiment_id,
+             "revision": deleted_summary["revision"] if deleted_summary else 0,
+             "metrics_revision": (
+                 deleted_summary["metrics_revision"] if deleted_summary else 0
+             )},
         )
     conn.commit()
 
@@ -1035,7 +1200,9 @@ def create_experiment_from_mapping(
         summary = _dashboard_experiment_summary(conn, experiment_id)
         _append_dashboard_event(
             conn, "experiment.created", str(experiment_id),
-            {"experiment_id": experiment_id, "group": summary["group"], "summary": summary},
+            {"experiment_id": experiment_id, "group": summary["group"],
+             "revision": summary["revision"],
+             "metrics_revision": summary["metrics_revision"], "summary": summary},
         )
     conn.commit()
     if crash_log is not None:

@@ -112,13 +112,17 @@
                         </div>
                     </div>
                 </div>
-                <div class="chart-container">
+                <div class="chart-container" aria-busy="false">
                     <div class="chart-body">
                         <div id="chart-legend" class="chart-legend"></div>
                         <div class="chart-canvas-wrap">
                             <canvas id="loss-chart"></canvas>
                             <div id="chart-heatmap-container"></div>
                         </div>
+                    </div>
+                    <div class="chart-loading-overlay" role="status" aria-live="polite" aria-hidden="true">
+                        <span class="chart-loading-spinner" aria-hidden="true"></span>
+                        <span>Loading curves…</span>
                     </div>
                     <div class="chart-toolbar">
                         <div id="chart-range" class="chart-range"></div>
@@ -193,6 +197,7 @@
 
     <!-- JS modules (order matters: state first, then utils, then chart/runs, then app last) -->
     <script src="/static/js/state.js?v={{ v }}"></script>
+    <script src="/static/js/cache.js?v={{ v }}"></script>
     <script src="/static/js/utils.js?v={{ v }}"></script>
     <script src="/static/js/chart.js?v={{ v }}"></script>
     <script src="/static/js/runs.js?v={{ v }}"></script>
