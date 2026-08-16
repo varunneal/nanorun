@@ -712,22 +712,14 @@ PID_GIT=""
 ) &
 PID_CLAUDE=$!
 
-# ── Codex CLI (parallel; release binary, arch-aware, no node needed) ──
+# ── Codex CLI (parallel; official installer also updates existing installs) ──
 (
   {codex_cred_write}
   mkdir -p $HOME_DIR/.local/bin
-  if [ -x $HOME_DIR/.local/bin/codex ]; then
-    echo "STATUS:codex:OK:already installed"
+  if OUT=$(curl -fsSL https://chatgpt.com/codex/install.sh 2>&1 | sh 2>&1) && [ -x $HOME_DIR/.local/bin/codex ]; then
+    echo "STATUS:codex:OK:installed/updated"
   else
-    ARCH=$(uname -m)
-    OUT=$(curl -fsSL https://github.com/openai/codex/releases/latest/download/codex-$ARCH-unknown-linux-musl.tar.gz | tar -xz -C $HOME_DIR/.local/bin 2>&1)
-    [ -f $HOME_DIR/.local/bin/codex-$ARCH-unknown-linux-musl ] && mv $HOME_DIR/.local/bin/codex-$ARCH-unknown-linux-musl $HOME_DIR/.local/bin/codex
-    if [ -e $HOME_DIR/.local/bin/codex ]; then
-      chmod +x $HOME_DIR/.local/bin/codex
-      echo "STATUS:codex:OK:installed"
-    else
-      echo "STATUS:codex:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"
-    fi
+    echo "STATUS:codex:FAIL:$(echo "$OUT" | tail -2 | tr '\\n' ' ')"
   fi
 ) &
 PID_CODEX=$!
