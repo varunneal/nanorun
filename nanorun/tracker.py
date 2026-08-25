@@ -82,6 +82,31 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Derived multiresolution extrema used by dashboard curve queries. Raw
+        -- metrics remain authoritative; these rows are safe to rebuild.
+        CREATE TABLE IF NOT EXISTS metric_curve_bins (
+            experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+            metric_name TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            bucket INTEGER NOT NULL,
+            min_step INTEGER NOT NULL,
+            min_value REAL NOT NULL,
+            max_step INTEGER NOT NULL,
+            max_value REAL NOT NULL,
+            point_count INTEGER NOT NULL,
+            PRIMARY KEY (experiment_id, metric_name, level, bucket)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS metric_curve_index_state (
+            experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+            metric_name TEXT NOT NULL,
+            metrics_revision INTEGER NOT NULL,
+            min_step INTEGER NOT NULL,
+            max_step INTEGER NOT NULL,
+            point_count INTEGER NOT NULL,
+            PRIMARY KEY (experiment_id, metric_name)
+        ) WITHOUT ROWID;
+
         CREATE INDEX IF NOT EXISTS idx_metrics_experiment ON metrics(experiment_id);
         CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status);
         CREATE INDEX IF NOT EXISTS idx_experiments_track ON experiments(track);
@@ -154,6 +179,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         "ON metrics(experiment_id, step DESC) WHERE val_loss IS NOT NULL"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_latest_train "
+        "ON metrics(experiment_id, step DESC) WHERE train_loss IS NOT NULL"
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_metrics_final_step "
         "ON metrics(experiment_id, step DESC) WHERE is_final_step = 1"
     )
@@ -173,6 +202,42 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 # opening/closing one per call — this eliminates the WAL cycling + fsync churn
 # that per-call connections caused (dozens of open/close per metric line).
 _local = threading.local()
+
+
+def _remember_curve_step(experiment_id: int, step: int) -> None:
+    pending = getattr(_local, "curve_steps", None)
+    if pending is None:
+        pending = {}
+        _local.curve_steps = pending
+    pending.setdefault(int(experiment_id), set()).add(int(step))
+
+
+def _take_curve_steps(experiment_id: int) -> set[int]:
+    pending = getattr(_local, "curve_steps", None)
+    if not pending:
+        return set()
+    return pending.pop(int(experiment_id), set())
+
+
+def _refresh_curve_index(
+    conn: sqlite3.Connection,
+    experiment_id: int,
+    metrics_revision: int,
+) -> None:
+    """Refresh derived curve data without making metric ingestion fragile."""
+    steps = _take_curve_steps(experiment_id)
+    if not steps:
+        return
+    try:
+        from .curve_index import update_curve_index
+        update_curve_index(conn, experiment_id, metrics_revision, steps)
+    except Exception:
+        # The raw metric transaction is authoritative. A missing state row makes
+        # the dashboard use its raw fallback and lets the backfiller repair it.
+        conn.execute(
+            "DELETE FROM metric_curve_index_state WHERE experiment_id=?",
+            (experiment_id,),
+        )
 
 
 def get_db() -> sqlite3.Connection:
@@ -598,6 +663,9 @@ def commit_metric_batch(experiment_ids: List[int]) -> None:
     for experiment_id in ids:
         summary = summaries.get(experiment_id)
         if summary:
+            _refresh_curve_index(
+                conn, experiment_id, int(summary["metrics_revision"]),
+            )
             _append_dashboard_event(
                 conn,
                 "metrics.changed",
@@ -727,6 +795,8 @@ def record_metric(
         }
     )
     changed = cursor.rowcount > 0
+    if changed:
+        _remember_curve_step(experiment_id, step)
     if commit:
         if changed:
             conn.execute(
@@ -736,6 +806,9 @@ def record_metric(
             )
             summary = _dashboard_experiment_summary(conn, experiment_id)
             if summary:
+                _refresh_curve_index(
+                    conn, experiment_id, int(summary["metrics_revision"]),
+                )
                 _append_dashboard_event(
                     conn,
                     "metrics.changed",
@@ -1092,6 +1165,8 @@ def delete_experiment(experiment_id: int) -> None:
         (experiment_id,),
     )
     if cursor.rowcount:
+        conn.execute("DELETE FROM metric_curve_bins WHERE experiment_id=?", (experiment_id,))
+        conn.execute("DELETE FROM metric_curve_index_state WHERE experiment_id=?", (experiment_id,))
         deleted_summary = read_experiment_summaries(
             [experiment_id], conn=conn, include_deleted=True,
         ).get(experiment_id)

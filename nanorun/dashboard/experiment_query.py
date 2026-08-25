@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import Any, Iterable, Optional
 
 from ..tracker import get_db, read_experiment_summaries
+from ..curve_index import ensure_curve_index, indexed_curve_candidates
 
 
 SCHEMA_VERSION = 1
@@ -451,7 +452,7 @@ def _metric_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _bounded_curve(rows: list[sqlite3.Row], metric_name: str, max_points: int) -> list[dict[str, Any]]:
+def _bounded_curve(rows: list[Any], metric_name: str, max_points: int) -> list[dict[str, Any]]:
     series = [row for row in rows if row[metric_name] is not None]
     if len(series) <= max_points:
         selected = series
@@ -485,27 +486,34 @@ def _bounded_curve(rows: list[sqlite3.Row], metric_name: str, max_points: int) -
 
 def _query_metrics(
     conn: sqlite3.Connection,
-    curve_requirements: dict[int, tuple[set[str], int]],
+    curve_requirements: dict[int, tuple[set[str], int, int]],
     raw_ids: set[int],
 ) -> tuple[dict[int, dict[str, list[dict[str, Any]]]], dict[int, list[dict[str, Any]]]]:
-    scan_ids = sorted(set(curve_requirements) | raw_ids)
+    indexed: dict[int, dict[str, list[dict[str, Any]]]] = defaultdict(dict)
+    fallback_requirements: dict[int, tuple[set[str], int]] = {}
+    for experiment_id, (series, max_points, metrics_revision) in curve_requirements.items():
+        try:
+            ensure_curve_index(conn, experiment_id, series, metrics_revision)
+        except sqlite3.Error:
+            conn.rollback()
+        missing: set[str] = set()
+        for metric_name in series:
+            candidates = indexed_curve_candidates(
+                conn, experiment_id, metric_name, metrics_revision, max_points,
+            )
+            if candidates is None:
+                missing.add(metric_name)
+            else:
+                indexed[experiment_id][metric_name] = _bounded_curve(
+                    candidates, metric_name, max_points,
+                )
+        if missing:
+            fallback_requirements[experiment_id] = (missing, max_points)
+
+    scan_ids = sorted(set(fallback_requirements) | raw_ids)
     if not scan_ids:
-        return {}, {}
+        return dict(indexed), {}
     placeholders = ",".join("?" for _ in scan_ids)
-    # One statistics query for every curve candidate.  Besides documenting the
-    # bounded work, this lets SQLite use the experiment range index and is kept
-    # separate from the single ordered row scan used by curves and raw metrics.
-    curve_ids = sorted(curve_requirements)
-    if curve_ids:
-        curve_placeholders = ",".join("?" for _ in curve_ids)
-        conn.execute(
-            f"SELECT experiment_id, COUNT(*) AS metric_count, "
-            f"SUM(val_loss IS NOT NULL) AS val_count, "
-            f"SUM(train_loss IS NOT NULL) AS train_count "
-            f"FROM metrics WHERE experiment_id IN ({curve_placeholders}) "
-            f"GROUP BY experiment_id",
-            curve_ids,
-        ).fetchall()
     rows = conn.execute(
         f"SELECT experiment_id, step, total_steps, val_loss, train_loss, "
         f"train_time_ms, step_avg_ms, is_final_step, recorded_at "
@@ -516,13 +524,15 @@ def _query_metrics(
     by_experiment: dict[int, list[sqlite3.Row]] = defaultdict(list)
     for row in rows:
         by_experiment[row["experiment_id"]].append(row)
-    curves: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    curves: dict[int, dict[str, list[dict[str, Any]]]] = {
+        experiment_id: dict(series) for experiment_id, series in indexed.items()
+    }
     raw: dict[int, list[dict[str, Any]]] = {}
-    for experiment_id, (series, max_points) in curve_requirements.items():
-        curves[experiment_id] = {
+    for experiment_id, (series, max_points) in fallback_requirements.items():
+        curves.setdefault(experiment_id, {}).update({
             metric_name: _bounded_curve(by_experiment[experiment_id], metric_name, max_points)
             for metric_name in LOSS_SERIES if metric_name in series
-        }
+        })
     for experiment_id in raw_ids:
         raw[experiment_id] = [_metric_row(row) for row in by_experiment[experiment_id]]
     return curves, raw
@@ -557,7 +567,7 @@ def execute_experiment_query(normalized: dict[str, Any]) -> list[dict[str, Any]]
     summaries = read_experiment_summaries(all_ids, conn=conn)
 
     queries_by_id: dict[int, list[str]] = defaultdict(list)
-    curve_requirements: dict[int, tuple[set[str], int]] = {}
+    curve_requirements: dict[int, tuple[set[str], int, int]] = {}
     raw_ids: set[int] = set()
     for key, resolution in resolutions.items():
         query = normalized["queries"][key]
@@ -569,9 +579,17 @@ def execute_experiment_query(normalized: dict[str, Any]) -> list[dict[str, Any]]
             if "curves" in query["projections"] and (
                 normalized["known_metrics"].get(experiment_id) != summary["metrics_revision"]
             ):
-                current_series, current_max = curve_requirements.get(experiment_id, (set(), 0))
+                available = set(summary.get("available_loss_metrics") or [])
+                requested = set(query["series"]) & available
+                if not requested:
+                    continue
+                current_series, current_max, _current_revision = curve_requirements.get(
+                    experiment_id, (set(), 0, summary["metrics_revision"]),
+                )
                 curve_requirements[experiment_id] = (
-                    current_series | set(query["series"]), max(current_max, query["max_points"])
+                    current_series | requested,
+                    max(current_max, query["max_points"]),
+                    summary["metrics_revision"],
                 )
             if "raw_metrics" in query["projections"]:
                 raw_ids.add(experiment_id)

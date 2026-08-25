@@ -33,6 +33,7 @@ from .tracker import (
     get_experiment, create_experiment_from_mapping,
     set_crash_log, get_crash_log,
 )
+from .curve_index import backfill_next_curve_index
 
 
 def safe_json_load(path: Path, default: Any = None) -> Any:
@@ -1650,6 +1651,43 @@ class SessionTracker:
             log.error(f"[{self.session_name}] Failed to create experiment {exp_id}: {e}")
 
 
+class CurveIndexer:
+    """Low-priority repair/backfill worker for derived dashboard curves."""
+
+    BACKFILL_PAUSE_SECONDS = 1.0
+
+    def __init__(self):
+        self.running = True
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop, name="curve-indexer", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    def _loop(self) -> None:
+        while self.running:
+            try:
+                indexed = backfill_next_curve_index(get_db())
+            except Exception:
+                log.exception("Curve index backfill failed")
+                get_db().rollback()
+                indexed = None
+            deadline = time.monotonic() + self.BACKFILL_PAUSE_SECONDS
+            while self.running and time.monotonic() < deadline:
+                time.sleep(min(0.2, deadline - time.monotonic()))
+            if indexed is None:
+                # Avoid repeatedly scanning for work once caught up.
+                time.sleep(4)
+        close_db()
+
+
 class Watcher:
     SESSION_DISCOVERY_INTERVAL = 1
 
@@ -1658,6 +1696,7 @@ class Watcher:
         self.trackers: Dict[str, SessionTracker] = {}
         self.tracker_configs: Dict[str, SessionConfig] = {}
         self.hub_syncer: Optional[HubSyncer] = None
+        self.curve_indexer: Optional[CurveIndexer] = None
         self.interactive = False
         self.dashboard_port = dashboard_port
         self.no_dashboard = no_dashboard
@@ -1742,6 +1781,17 @@ class Watcher:
             self.hub_syncer.stop()
             self.hub_syncer = None
             log.info("Stopped hub syncer")
+
+    def _start_curve_indexer(self):
+        self.curve_indexer = CurveIndexer()
+        self.curve_indexer.start()
+        log.info("Started curve indexer")
+
+    def _stop_curve_indexer(self):
+        if self.curve_indexer:
+            self.curve_indexer.stop()
+            self.curve_indexer = None
+            log.info("Stopped curve indexer")
 
     # --- dashboard ---
 
@@ -1856,6 +1906,7 @@ class Watcher:
             if not self.no_dashboard:
                 self._start_dashboard()
             self._start_hub_syncer()
+            self._start_curve_indexer()
             self._reconcile_sessions(sessions)
             tick = 0
             while self.running:
@@ -1870,6 +1921,7 @@ class Watcher:
         finally:
             for name in list(self.trackers):
                 self._stop_tracker(name)
+            self._stop_curve_indexer()
             self._stop_hub_syncer()
             close_db()  # release the main thread's DB connection
             remove_watcher_pid_file()

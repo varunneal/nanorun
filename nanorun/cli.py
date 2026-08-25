@@ -594,6 +594,74 @@ def session_cleanup():
         console.print("[dim]No disconnected sessions to clean up[/dim]")
 
 
+@session.command("remove")
+@click.argument("name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+def session_remove(name: str, yes: bool):
+    """Remove one disconnected session by NAME.
+
+    This is the CLI counterpart to removing a session from the dashboard.
+    Running and queued experiment records for the session are marked cancelled,
+    but removing the local configuration does not stop a remote machine.
+    """
+    import shutil
+
+    from .tracker import append_dashboard_event, terminate_session_experiments
+    from .watcher import SessionState
+
+    session_config = Config.load_session(name)
+    if not session_config:
+        console.print(f"[red]Session '{name}' not found.[/red]")
+        raise SystemExit(1)
+
+    if session_config.session_type == "local":
+        from .remote_control import local_session_removal_blocker
+
+        blocker = local_session_removal_blocker(session_config)
+        if blocker:
+            console.print(f"[red]Cannot remove local session: {blocker}[/red]")
+            raise SystemExit(1)
+
+    state = SessionState.load(name)
+    if state.status == "connected":
+        console.print(
+            "[red]Cannot remove a connected session. Disconnect first.[/red]"
+        )
+        raise SystemExit(1)
+
+    if not yes and not click.confirm(
+        f"Remove session '{name}'? Any running or queued experiments for this "
+        "machine will be marked cancelled.",
+        default=False,
+    ):
+        return
+
+    running_ids, queued_ids = terminate_session_experiments(
+        name,
+        note=f"Session '{name}' removed with the CLI; machine treated as terminated.",
+        session_id=session_config.session_id,
+    )
+    removed, _ = Config.delete_session(name)
+    if not removed:
+        console.print(f"[red]Session '{name}' not found.[/red]")
+        raise SystemExit(1)
+
+    state_dir = Config.get_sessions_dir() / name
+    if state_dir.exists():
+        shutil.rmtree(state_dir, ignore_errors=True)
+    append_dashboard_event(
+        "session.changed",
+        name,
+        {"session_name": name, "deleted": True},
+    )
+
+    cancelled_count = len(running_ids) + len(queued_ids)
+    message = f"Session '{name}' removed"
+    if cancelled_count:
+        message += f"; cancelled {cancelled_count} in-flight experiment(s)"
+    console.print(f"[green]{message}[/green]")
+
+
 @session.command("status")
 @session_option
 def session_status(session_name):
