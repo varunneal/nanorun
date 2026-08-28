@@ -1659,6 +1659,7 @@ class CurveIndexer:
     def __init__(self):
         self.running = True
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -1668,6 +1669,7 @@ class CurveIndexer:
 
     def stop(self) -> None:
         self.running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
 
@@ -1679,12 +1681,8 @@ class CurveIndexer:
                 log.exception("Curve index backfill failed")
                 get_db().rollback()
                 indexed = None
-            deadline = time.monotonic() + self.BACKFILL_PAUSE_SECONDS
-            while self.running and time.monotonic() < deadline:
-                time.sleep(min(0.2, deadline - time.monotonic()))
-            if indexed is None:
-                # Avoid repeatedly scanning for work once caught up.
-                time.sleep(4)
+            pause = self.BACKFILL_PAUSE_SECONDS + (4.0 if indexed is None else 0.0)
+            self._stop_event.wait(pause)
         close_db()
 
 

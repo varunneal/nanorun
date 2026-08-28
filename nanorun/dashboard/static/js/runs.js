@@ -225,6 +225,17 @@ function showAveragedMetrics() {
     const currentValidData = State.get('experimentData');
     if (!currentValidData) return;
     const lossMetric = getActiveLossMetric(currentValidData);
+    const pending = currentValidData.some(item =>
+        (item.available_loss_metrics || []).includes(lossMetric) &&
+        Number(_dashboardCurveRevisions.get(Number(item.id)) ?? -1) !==
+            Number(item.metrics_revision || 0)
+    );
+    if (pending) {
+        const tableEl = document.getElementById('metrics-table');
+        if (tableEl) tableEl.innerHTML = '<h3>Metrics History</h3><p class="placeholder">Loading complete group average…</p>';
+        currentMetricsData = null;
+        return;
+    }
     const allCurves = currentValidData.map(d => getLossCurve(d, lossMetric));
     const averaged = computeAveragedMetrics(allCurves);
     updateMetricsTable(averaged, true, null);
@@ -236,6 +247,17 @@ function showAveragedMetricsForCell(expIds) {
     const cellData = currentValidData.filter(d => expIds.includes(d.id));
     if (cellData.length === 0) return;
     const lossMetric = getActiveLossMetric(currentValidData);
+    const pending = cellData.some(item =>
+        (item.available_loss_metrics || []).includes(lossMetric) &&
+        Number(_dashboardCurveRevisions.get(Number(item.id)) ?? -1) !==
+            Number(item.metrics_revision || 0)
+    );
+    if (pending) {
+        const tableEl = document.getElementById('metrics-table');
+        if (tableEl) tableEl.innerHTML = '<h3>Metrics History</h3><p class="placeholder">Loading selected-run average…</p>';
+        currentMetricsData = null;
+        return;
+    }
     const allCurves = cellData.map(d => getLossCurve(d, lossMetric));
     const averaged = computeAveragedMetrics(allCurves);
     updateMetricsTable(averaged, true, null);
@@ -487,6 +509,9 @@ function renderRunsTable() {
     // Update chart to reflect filtered data
     const cv = State.get('chartView');
     if (cv) switchChartView(cv, false);
+    queueMicrotask(() => {
+        if (typeof ensureVisibleSelectionCurves === 'function') ensureVisibleSelectionCurves();
+    });
 }
 
 function updateMetricsTable(lossData, isAveraged = false, selectedExpId = null) {

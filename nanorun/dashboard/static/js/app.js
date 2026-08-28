@@ -300,6 +300,7 @@ function renderExperimentListData(experiments) {
 
 let _selectionGeneration = 0;
 let _selectionAbortController = null;
+const _curveLoadsInFlight = new Set();
 
 function setChartLoading(isLoading, generation) {
     if (generation !== _selectionGeneration) return;
@@ -309,6 +310,112 @@ function setChartLoading(isLoading, generation) {
     chartContainer.setAttribute('aria-busy', String(isLoading));
     const overlay = chartContainer.querySelector('.chart-loading-overlay');
     if (overlay) overlay.setAttribute('aria-hidden', String(!isLoading));
+}
+
+async function loadCachedCurves(ids) {
+    await Promise.all(ids.map(async rawId => {
+        const id = Number(rawId);
+        const summary = _dashboardExperimentSummaries.get(id);
+        const cached = await DashboardCache.get(`curve:${id}`);
+        if (!cached || !summary ||
+            Number(cached.metrics_revision || 0) !== Number(summary.metrics_revision || 0)) return;
+        const merged = {
+            ...summary,
+            loss_curves: cached.loss_curves || {},
+            loss_curve: cached.loss_curve || [],
+            curve_max_points: cached.curve_max_points,
+        };
+        _dashboardExperimentSummaries.set(id, merged);
+        _dashboardCurveRevisions.set(id, Number(summary.metrics_revision || 0));
+    }));
+}
+
+function installSelectedCurveFrame(frame, selectedKey, generation) {
+    if (frame.type !== 'experiment' || !frame.experiment?.id) return;
+    if (generation !== _selectionGeneration || State.get('selectedExp') !== selectedKey) return;
+    const id = Number(frame.experiment.id);
+    const progressive = _dashboardExperimentSummaries.get(id) || frame.experiment;
+    const rendered = State.get('experimentData') || [];
+    const next = rendered.some(item => Number(item.id) === id)
+        ? rendered.map(item => Number(item.id) === id ? progressive : item)
+        : rendered.concat([progressive]);
+    State.set('experimentData', next);
+    renderRunsTable();
+    refreshMetricsTable();
+    replaceVisibleRunCurve(id);
+}
+
+function installCachedSelectionCurves(ids, selectedKey, generation) {
+    if (generation !== _selectionGeneration || State.get('selectedExp') !== selectedKey) return;
+    const wanted = new Set(ids.map(Number));
+    const rendered = State.get('experimentData') || [];
+    let changed = false;
+    const next = rendered.map(item => {
+        if (!wanted.has(Number(item.id))) return item;
+        const cached = _dashboardExperimentSummaries.get(Number(item.id));
+        if (!cached || cached === item) return item;
+        changed = true;
+        return cached;
+    });
+    if (!changed) return;
+    State.set('experimentData', next);
+    renderRunsTable();
+    refreshMetricsTable();
+    ids.forEach(id => replaceVisibleRunCurve(Number(id)));
+}
+
+async function loadBackgroundSelectionCurves(selectedKey, ids, generation, signal) {
+    const batchSize = 20;
+    for (let offset = 0; offset < ids.length; offset += batchSize) {
+        if (signal.aborted || generation !== _selectionGeneration ||
+            State.get('selectedExp') !== selectedKey) return;
+        const batch = ids.slice(offset, offset + batchSize).map(Number);
+        batch.forEach(id => _curveLoadsInFlight.add(id));
+        await loadCachedCurves(batch);
+        installCachedSelectionCurves(batch, selectedKey, generation);
+        try {
+            await streamExperimentQueries({
+                background_curves: {
+                    selector: { type: 'ids', ids: batch },
+                    projections: ['curves'],
+                    curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+                },
+            }, {
+                signal,
+                onFrame: frame => installSelectedCurveFrame(frame, selectedKey, generation),
+            });
+        } finally {
+            batch.forEach(id => _curveLoadsInFlight.delete(id));
+        }
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+}
+
+function ensureVisibleSelectionCurves() {
+    const selectedKey = State.get('selectedExp');
+    const generation = _selectionGeneration;
+    const signal = _selectionAbortController?.signal;
+    if (!selectedKey || !signal || signal.aborted) return;
+    const missing = getVisibleRuns().filter(item =>
+        (item.available_loss_metrics || []).length > 0 &&
+        Number(_dashboardCurveRevisions.get(Number(item.id)) ?? -1) !==
+            Number(item.metrics_revision || 0) &&
+        !_curveLoadsInFlight.has(Number(item.id))
+    ).map(item => Number(item.id));
+    if (!missing.length) return;
+    missing.forEach(id => _curveLoadsInFlight.add(id));
+    streamExperimentQueries({
+        newly_visible_curves: {
+            selector: { type: 'ids', ids: missing },
+            projections: ['curves'],
+            curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+        },
+    }, {
+        signal,
+        onFrame: frame => installSelectedCurveFrame(frame, selectedKey, generation),
+    }).catch(error => {
+        if (error.name !== 'AbortError') console.warn('Visible curve load failed:', error);
+    }).finally(() => missing.forEach(id => _curveLoadsInFlight.delete(id)));
 }
 
 async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = null) {
@@ -342,56 +449,77 @@ async function selectExperiment(codeHashOrId, experimentIds, prefetchedData = nu
         el.classList.toggle('selected', el.dataset.id == codeHashOrId);
     });
 
-    // Fetch every run through one named query. Cached curves are usable
-    // immediately and are validated by their metrics_revision in the request.
+    // Resolve complete group metadata first, then block only on the currently
+    // visible curves. Remaining runs fill in through bounded background batches.
     let allData;
     try {
         if (prefetchedData) {
             allData = prefetchedData;
         } else {
             const collected = new Map();
-            await Promise.all(experimentIds.map(async id => {
-                const curveRevision = _dashboardCurveRevisions.get(Number(id));
-                if (curveRevision === undefined) return;
-                const cached = await DashboardCache.get(`curve:${Number(id)}:${curveRevision}`);
-                if (cached) collected.set(Number(id), cached);
-            }));
             let authoritativeIds = experimentIds.map(Number);
             const isBucket = isBucketKey(codeHashOrId);
             const selector = isBucket
                 ? { type: 'ids', ids: authoritativeIds }
                 : { type: 'experiment', id: authoritativeIds[0], expand_group: true };
             await streamExperimentQueries({
-                selection: {
+                selection_metadata: {
                     selector,
-                    projections: ['summary', 'metadata', 'curves'],
-                    curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+                    projections: ['summary', 'metadata'],
                 },
             }, {
                 signal,
                 onFrame: frame => {
-                    if (frame.type === 'experiment' && frame.queries?.includes('selection')) {
+                    if (frame.type === 'experiment' && frame.queries?.includes('selection_metadata')) {
                         const id = Number(frame.experiment.id);
-                        const progressive = _dashboardExperimentSummaries.get(id) || frame.experiment;
-                        collected.set(id, progressive);
-                        const rendered = State.get('experimentData');
-                        if (rendered?.length && State.get('selectedExp') === codeHashOrId) {
-                            const next = rendered.some(item => Number(item.id) === id)
-                                ? rendered.map(item => Number(item.id) === id ? progressive : item)
-                                : rendered.concat([progressive]);
-                            State.set('experimentData', next);
-                            renderRunsTable();
-                            refreshMetricsTable();
-                            replaceVisibleRunCurve(id);
-                        }
-                    } else if (frame.type === 'complete' && frame.query === 'selection') {
+                        collected.set(id, _dashboardExperimentSummaries.get(id) || frame.experiment);
+                    } else if (frame.type === 'complete' && frame.query === 'selection_metadata') {
                         authoritativeIds = (frame.experiment_ids || []).map(Number);
                     }
                 },
             });
             experimentIds = authoritativeIds;
             State.set('selectedExpIds', experimentIds);
+            authoritativeIds.forEach(id => {
+                if (!collected.has(Number(id))) {
+                    const summary = _dashboardExperimentSummaries.get(Number(id));
+                    if (summary) collected.set(Number(id), summary);
+                }
+            });
+            State.set('experimentData', authoritativeIds.map(id => collected.get(id)).filter(Boolean));
+            const visibleIds = getVisibleRuns().map(item => Number(item.id));
+            visibleIds.forEach(id => _curveLoadsInFlight.add(id));
+            await loadCachedCurves(visibleIds);
+            try {
+                await streamExperimentQueries({
+                    visible_curves: {
+                        selector: { type: 'ids', ids: visibleIds },
+                        projections: ['curves'],
+                        curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+                    },
+                }, {
+                    signal,
+                    onFrame: frame => installSelectedCurveFrame(
+                        frame, codeHashOrId, generation,
+                    ),
+                });
+            } finally {
+                visibleIds.forEach(id => _curveLoadsInFlight.delete(id));
+            }
+            authoritativeIds.forEach(id => {
+                const current = _dashboardExperimentSummaries.get(Number(id));
+                if (current) collected.set(Number(id), current);
+            });
             allData = authoritativeIds.map(id => collected.get(id)).filter(Boolean);
+            const visibleSet = new Set(visibleIds);
+            const backgroundIds = authoritativeIds.filter(id => !visibleSet.has(Number(id)));
+            if (backgroundIds.length) {
+                queueMicrotask(() => loadBackgroundSelectionCurves(
+                    codeHashOrId, backgroundIds, generation, signal,
+                ).catch(error => {
+                    if (error.name !== 'AbortError') console.warn('Background curve load failed:', error);
+                }));
+            }
         }
     } catch (error) {
         if (error.name === 'AbortError') return;
@@ -589,6 +717,24 @@ async function handleSelectedExperimentEvent(eventType, payload, revision) {
         nextIds.push(experimentId);
     }
     if (!wasSelected && !belongsToSelectedGroup) return;
+
+    if (wasSelected && belongsToSelectedGroup && eventType !== 'experiment.deleted') {
+        if (generation !== _selectionGeneration || State.get('selectedExp') !== selectedKey) return;
+        try {
+            await streamExperimentQueries({
+                targeted_curve: {
+                    selector: { type: 'ids', ids: [experimentId] },
+                    projections: ['summary', 'metadata', 'curves'],
+                    curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+                },
+            }, {
+                onFrame: frame => installSelectedCurveFrame(frame, selectedKey, generation),
+            });
+        } catch (error) {
+            console.warn('Selected curve refresh failed:', error);
+        }
+        return;
+    }
 
     if (nextIds.length === 0) {
         State.update({ selectedExp: null, selectedExpIds: null, experimentData: null });
@@ -1059,8 +1205,7 @@ async function startAutoRefresh() {
         }
         queries.selection = {
             selector,
-            projections: ['summary', 'metadata', 'curves'],
-            curves: { series: ['val_loss', 'train_loss'], max_points: 1200 },
+            projections: ['summary', 'metadata'],
         };
     }
 
@@ -1085,10 +1230,7 @@ async function startAutoRefresh() {
     const experiments = renderExperimentListData(getDashboardExperimentGroups());
 
     if (savedExp && authoritativeSelectionIds.length) {
-        const freshData = authoritativeSelectionIds
-            .map(id => freshSelection.get(id) || cached.details.get(id))
-            .filter(Boolean);
-        if (freshData.length) await selectExperiment(savedExp, authoritativeSelectionIds, freshData);
+        await selectExperiment(savedExp, authoritativeSelectionIds);
     } else if (!savedExp && experiments.length > 0) {
         // A first visit has no selection to include in the initial multi-query.
         // The first authoritative group frame determines the one follow-up query.

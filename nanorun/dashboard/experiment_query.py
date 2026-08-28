@@ -491,15 +491,43 @@ def _query_metrics(
 ) -> tuple[dict[int, dict[str, list[dict[str, Any]]]], dict[int, list[dict[str, Any]]]]:
     indexed: dict[int, dict[str, list[dict[str, Any]]]] = defaultdict(dict)
     fallback_requirements: dict[int, tuple[set[str], int]] = {}
+    state_by_key: dict[tuple[int, str], sqlite3.Row] = {}
+    curve_ids = sorted(curve_requirements)
+    if curve_ids:
+        state_placeholders = ",".join("?" for _ in curve_ids)
+        state_rows = conn.execute(
+            f"""SELECT experiment_id, metric_name, metrics_revision,
+                       min_step, max_step, point_count
+                FROM metric_curve_index_state
+                WHERE experiment_id IN ({state_placeholders})""",
+            curve_ids,
+        ).fetchall()
+        state_by_key = {
+            (int(row["experiment_id"]), row["metric_name"]): row for row in state_rows
+        }
     for experiment_id, (series, max_points, metrics_revision) in curve_requirements.items():
-        try:
-            ensure_curve_index(conn, experiment_id, series, metrics_revision)
-        except sqlite3.Error:
-            conn.rollback()
+        states = {name: state_by_key.get((experiment_id, name)) for name in series}
+        if any(
+            state is None or int(state["metrics_revision"]) != int(metrics_revision)
+            for state in states.values()
+        ):
+            try:
+                ensure_curve_index(conn, experiment_id, series, metrics_revision)
+                refreshed = conn.execute(
+                    """SELECT experiment_id, metric_name, metrics_revision,
+                              min_step, max_step, point_count
+                       FROM metric_curve_index_state WHERE experiment_id=?""",
+                    (experiment_id,),
+                ).fetchall()
+                for state in refreshed:
+                    state_by_key[(experiment_id, state["metric_name"])] = state
+            except sqlite3.Error:
+                conn.rollback()
         missing: set[str] = set()
         for metric_name in series:
             candidates = indexed_curve_candidates(
                 conn, experiment_id, metric_name, metrics_revision, max_points,
+                state_by_key.get((experiment_id, metric_name)),
             )
             if candidates is None:
                 missing.add(metric_name)

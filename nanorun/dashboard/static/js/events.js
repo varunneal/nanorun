@@ -144,11 +144,10 @@ async function loadDashboardSnapshot() {
 }
 
 async function restoreDashboardCache() {
-    const [shell, cachedGroups, summaryEntries, detailEntries] = await Promise.all([
+    const [shell, cachedGroups, summaryEntries] = await Promise.all([
         DashboardCache.get('dashboard:shell'),
         DashboardCache.get('sidebar:groups'),
         DashboardCache.entries('experiment:'),
-        DashboardCache.entries('curve:'),
     ]);
     if (shell) {
         _dashboardQueueData = shell.queue || _dashboardQueueData;
@@ -167,20 +166,8 @@ async function restoreDashboardCache() {
         _dashboardEntityRevisions.set(`experiment:${id}`, Number(summary.revision || 0));
         _dashboardMetricRevisions.set(id, Number(summary.metrics_revision || 0));
     });
-    const details = new Map();
-    detailEntries.forEach(({ value }) => {
-        if (value?.id) {
-            const id = Number(value.id);
-            const revision = Number(value.metrics_revision || 0);
-            const prior = details.get(id);
-            if (!prior || Number(prior.metrics_revision || 0) <= revision) {
-                details.set(id, value);
-                _dashboardCurveRevisions.set(id, revision);
-            }
-        }
-    });
     if (summaryEntries.length || shell) _dashboardSnapshotReady = true;
-    return { shell, groups: cachedGroups || [], details };
+    return { shell, groups: cachedGroups || [], details: new Map() };
 }
 
 function _knownExperimentCacheState() {
@@ -276,7 +263,7 @@ async function applyExperimentQueryFrame(frame) {
         if (incoming.loss_curves) {
             _dashboardCurveRevisions.set(id, Number(merged.metrics_revision || 0));
             DashboardCache.set(
-                `curve:${id}:${Number(merged.metrics_revision || 0)}`, merged
+                `curve:${id}`, merged
             );
         }
         return;
