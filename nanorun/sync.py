@@ -241,7 +241,12 @@ def _current_branch(repo: Path) -> str:
 
 
 def worktree_is_clean(repo: Path) -> bool:
-    result = _git(repo, ["status", "--porcelain"])
+    """Whether tracked files and the index have no uncommitted changes.
+
+    Untracked files do not make an otherwise safe merge dirty. Git still
+    refuses the merge itself if an incoming path would overwrite one.
+    """
+    result = _git(repo, ["status", "--porcelain", "--untracked-files=no"])
     return result.returncode == 0 and not result.stdout.strip()
 
 
