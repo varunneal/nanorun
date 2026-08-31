@@ -641,6 +641,21 @@ PID_CLI=$!
 PID_CLI=""
 """
 
+    # Bootstrap machines host long-running agent sessions in tmux. Keep these
+    # defaults in the user's config without replacing any settings they already
+    # maintain there, and avoid duplicating them when setup is re-run.
+    if install_cli:
+        tmux_block = """
+# ── tmux defaults (bootstrap sessions only) ──
+TMUX_CONF="$HOME_DIR/.tmux.conf"
+touch "$TMUX_CONF"
+grep -qxF 'set -g mouse on' "$TMUX_CONF" || printf 'set -g mouse on\\n' >> "$TMUX_CONF"
+grep -qxF 'set -g history-limit 100000' "$TMUX_CONF" || printf 'set -g history-limit 100000\\n' >> "$TMUX_CONF"
+echo "STATUS:tmux_config:OK:mouse enabled, history limit 100000"
+"""
+    else:
+        tmux_block = ""
+
     # Git auth block (bootstrap sessions only): standing GitHub access so the
     # machine's own local session can push its nanorun/local/* branch.
     if git_auth:
@@ -830,6 +845,7 @@ PID_DEPS=$!
 
 {hf_block}
 {cli_block}
+{tmux_block}
 {git_block}
 {agents_block}
 
