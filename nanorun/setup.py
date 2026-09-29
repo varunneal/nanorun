@@ -416,7 +416,11 @@ def replace_machine_local_identity(
         f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
         f"git clone {repo_url} {repo_path}"
     )
-    result = remote.run_with_agent(clone_cmd, timeout=180)
+    if getattr(session, "use_pty", False):
+        from .proxy_git import sync_repository
+        result = sync_repository(remote, repo_path, repo_url, branch="main")
+    else:
+        result = remote.run_with_agent(clone_cmd, timeout=180)
     if not result.success:
         console.print("  [red]fresh clone FAILED[/red]")
         if result.stderr:
@@ -1021,25 +1025,24 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
 
     # ── Git clone/pull (needs agent forwarding, separate SSH call) ───────────
     console.print("\n[bold]Syncing repository...[/bold]")
-    result = remote.run(f"test -d {repo_path} && echo exists")
-    if "exists" in result.stdout:
-        r = remote.run_with_agent(f"cd {repo_path} && git pull origin main", timeout=60)
-        if r.success:
-            console.print("  [green]repo: updated[/green]")
-        else:
-            failures.append(SetupFailure("repo", r.stderr[:200]))
-            console.print(f"  [red]repo: pull FAILED[/red]")
+    if getattr(session, "use_pty", False):
+        from .proxy_git import sync_repository
+        r = sync_repository(remote, repo_path, repo_url, branch="main")
     else:
-        clone_cmd = (
-            f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
-            f"git clone {repo_url} {repo_path}"
-        )
-        r = remote.run_with_agent(clone_cmd, timeout=60)
-        if r.success:
-            console.print("  [green]repo: cloned[/green]")
+        result = remote.run(f"test -d {repo_path} && echo exists")
+        if "exists" in result.stdout:
+            r = remote.run_with_agent(f"cd {repo_path} && git pull origin main", timeout=60)
         else:
-            failures.append(SetupFailure("repo", r.stderr[:200]))
-            console.print(f"  [red]repo: clone FAILED[/red]")
+            clone_cmd = (
+                f"GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' "
+                f"git clone {repo_url} {repo_path}"
+            )
+            r = remote.run_with_agent(clone_cmd, timeout=60)
+    if not r.success:
+        detail = (r.stderr or r.stdout).strip()[:400]
+        console.print(f"  [red]repo: FAILED — {detail}[/red]")
+        raise RuntimeError("Repository provisioning failed: " + detail)
+    console.print("  [green]repo: ready[/green]")
 
     # ── Machine-local git excludes (bootstrap only) ───────────────────────────
     # The machine commits from its own worktree, so keep its run logs out of the
@@ -1112,29 +1115,12 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
         agent_auth=agent_auth,
     )
 
-    # Ship script via stdin and execute
-    try:
-        client = remote._get_client()
-        stdin, stdout, stderr = client.exec_command("bash -s", timeout=600)
-        stdin.write(script)
-        stdin.channel.shutdown_write()
-        stdout.channel.recv_exit_status()
-        stdout_str = stdout.read().decode('utf-8', errors='replace')
-        stderr_str = stderr.read().decode('utf-8', errors='replace')
-
-        class _Result:
-            success = True
-            def __init__(self, out, err):
-                self.stdout = out
-                self.stderr = err
-        result = _Result(stdout_str, stderr_str)
-    except Exception as e:
-        class _FailResult:
-            success = False
-            stdout = ""
-            def __init__(self, err):
-                self.stderr = str(err)
-        result = _FailResult(e)
+    result = remote.run_script(script, timeout=600)
+    output = result.stdout + result.stderr
+    if not result.success or "STATUS:DONE" not in output.splitlines():
+        detail = (result.stderr or result.stdout).strip()[-400:]
+        console.print("  [red]Setup script did not complete[/red]")
+        raise RuntimeError("Setup script did not complete: " + detail)
 
     # Parse structured status lines from output
     if result.success or result.stdout:
@@ -1156,6 +1142,14 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
     else:
         failures.append(SetupFailure("setup script", f"Script failed: {result.stderr[:200]}"))
         console.print(f"  [red]Setup script failed to run[/red]")
+
+    required_steps = {"apt", "uv", "venv", "torch", "deps", "data", "flash_attn_3", "nanorun_cli"}
+    if any(f.step in required_steps for f in failures):
+        console.print(Panel(
+            "\n".join(f"  [red]✗[/red] [bold]{f.step}[/bold]: {f.detail}" for f in failures),
+            title="[bold red]Provisioning failures[/bold red]", border_style="red",
+        ))
+        raise RuntimeError("Provisioning failed; fix the reported steps and rerun setup")
 
     # ── Start daemon (1 SSH call) — skipped for bootstrap sessions ────────────
     if bootstrap:

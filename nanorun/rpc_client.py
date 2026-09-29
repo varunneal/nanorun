@@ -3,6 +3,8 @@
 Architecture:
   - SSH sessions use one shared tunnel per session. The tunnel forwards a
     random local port to localhost:9321 on the remote.
+  - Shell-only SSH proxies relay framed WebSocket bytes through a PTY instead
+    of relying on TCP forwarding. Each consumer owns its shell connection.
   - Local sessions connect directly to the loopback endpoint published by the
     local execution daemon.
   - Each consumer (CLI command, watcher) opens its own WebSocket over the
@@ -266,6 +268,7 @@ class RpcClient:
         self._session = session
         self._tunnel: Optional[SshTunnel] = None
         self._direct_port: Optional[int] = None
+        self._shell_socket = None
         self._ws = None
         self._event_callbacks: List[Callable[[EventMessage], None]] = []
 
@@ -297,6 +300,8 @@ class RpcClient:
         if self._session.session_type == "local":
             self._direct_port = self._local_endpoint_port()
             websocket_url = f"ws://127.0.0.1:{self._direct_port}"
+        elif self._session.use_pty:
+            websocket_url = f"ws://127.0.0.1:{RPC_PORT}"
         else:
             # Get or create the shared SSH tunnel.
             if not self._tunnel or not self._tunnel.alive:
@@ -311,8 +316,18 @@ class RpcClient:
         last_error: Optional[Exception] = None
         while time.time() < deadline:
             try:
+                connect_options = {}
+                if self._session.session_type != "local" and self._session.use_pty:
+                    from .ssh_proxy import ShellSocket
+                    if self._shell_socket:
+                        self._shell_socket.close()
+                    self._shell_socket = ShellSocket(self._session, RPC_PORT)
+                    connect_options["sock"] = self._shell_socket.start(
+                        timeout=max(0.5, deadline - time.time())
+                    )
                 self._ws = ws_connect(
                     websocket_url,
+                    **connect_options,
                     open_timeout=min(3, max(0.5, deadline - time.time())),
                     ping_interval=None,
                     max_size=2**24,  # 16MB — LIST_MAPPINGS can be large
@@ -320,6 +335,9 @@ class RpcClient:
                 return
             except Exception as e:
                 last_error = e
+                if self._shell_socket:
+                    self._shell_socket.close()
+                    self._shell_socket = None
                 time.sleep(0.5)
 
         raise ConnectionError(
@@ -338,6 +356,9 @@ class RpcClient:
             except Exception:
                 pass
             self._ws = None
+        if self._shell_socket:
+            self._shell_socket.close()
+            self._shell_socket = None
         if self._tunnel and stop_tunnel:
             self._tunnel.stop()
             self._tunnel = None

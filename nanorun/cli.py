@@ -820,7 +820,10 @@ def session_setup(verify: bool, interactive: bool, session_name):
             console.print("[dim]Local sessions use the existing environment; verifying it.[/dim]")
         verify_setup(remote)
     else:
-        run_setup(remote, auto_yes=not interactive, bootstrap=bool(sc and sc.bootstrap))
+        try:
+            run_setup(remote, auto_yes=not interactive, bootstrap=bool(sc and sc.bootstrap))
+        except (RuntimeError, ConnectionError) as error:
+            raise click.ClickException(str(error)) from error
 
 
 # ============================================================================
@@ -1128,10 +1131,13 @@ def sync(files: tuple, message: str, sync_all: bool, no_verify: bool, session_na
         return
 
     remote = require_session(session_name)
-    if sync_all:
-        push_code(remote, message, skip_syntax_check=no_verify)
-    else:
-        push_code(remote, message, skip_syntax_check=no_verify, files=rel_files)
+    try:
+        if sync_all:
+            push_code(remote, message, skip_syntax_check=no_verify)
+        else:
+            push_code(remote, message, skip_syntax_check=no_verify, files=rel_files)
+    except (RuntimeError, ConnectionError) as error:
+        raise click.ClickException(str(error)) from error
 
 
 # ============================================================================

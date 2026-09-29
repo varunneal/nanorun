@@ -28,7 +28,7 @@ class SessionConfig:
     tmux_session: str = "nanorun"
     key_file: Optional[str] = None  # Path to SSH private key (-i flag)
     ssh_options: Optional[List[str]] = None  # Extra SSH -o options (e.g. ["IdentitiesOnly=yes"])
-    use_pty: bool = False  # Request PTY for exec (needed for RunPod SSH proxy)
+    use_pty: bool = False  # Shell-only proxy transport for commands, Git sync, and RPC
     session_type: str = "ssh"  # "ssh", "local", or "iris"
     iris_config: Optional[str] = None  # Path to iris cluster yaml
     iris_binary: Optional[str] = None  # Path to iris CLI binary (default: "iris" on PATH)

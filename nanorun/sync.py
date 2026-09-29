@@ -934,10 +934,17 @@ def push_code(remote: RemoteSession, message: str = None, skip_syntax_check: boo
 
     # Step 3: Pull on remote (use agent forwarding for git auth)
     console.print("[dim]Pulling on remote...[/dim]")
-    remote_result = remote.run_with_agent(
-        f"cd {remote.config.repo_path} && git pull",
-        timeout=60
-    )
+    if remote.config.use_pty:
+        from .proxy_git import sync_repository
+        from .project_config import get_repo_url
+        remote_result = sync_repository(
+            remote, remote.config.repo_path,
+            get_repo_url() or "git@github.com:varunneal/nanorun-private.git",
+        )
+    else:
+        remote_result = remote.run_with_agent(
+            f"cd {remote.config.repo_path} && git pull", timeout=60
+        )
 
     if remote_result.success:
         # Show what changed
@@ -951,7 +958,9 @@ def push_code(remote: RemoteSession, message: str = None, skip_syntax_check: boo
                     console.print(f"  [dim]{line.strip()}[/dim]")
         record_synced_commit(remote.config.name)
     else:
-        console.print(f"[red]Remote pull failed: {remote_result.stderr}[/red]")
+        detail = remote_result.stderr or remote_result.stdout
+        console.print(f"[red]Remote pull failed: {detail}[/red]")
+        raise RuntimeError("Remote code sync failed: " + detail)
 
     # Step 4: Generate lineage diffs. For a targeted sync, include clean
     # entrypoints too so changing only a declared dependency still creates the

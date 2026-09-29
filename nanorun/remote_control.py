@@ -112,79 +112,32 @@ class RemoteSession:
 
     def _run_via_shell(self, client: paramiko.SSHClient, command: str, timeout: Optional[int]) -> CommandResult:
         """Execute command via interactive shell (for proxies that reject exec_command)."""
-        import re
-        transport = client.get_transport()
-        channel = transport.open_session()
-        if timeout:
-            channel.settimeout(timeout)
-        channel.get_pty(term='dumb', width=200, height=50)
-        channel.invoke_shell()
+        from .ssh_proxy import run_script
+        return run_script(client, command, timeout)
 
-        # Wait for shell prompt ($ or #) — RunPod proxies have slow banners
-        banner_deadline = time.time() + 10
-        buf = b""
-        while time.time() < banner_deadline:
-            if channel.recv_ready():
-                buf += channel.recv(65536)
-                decoded = buf.decode('utf-8', errors='replace')
-                if decoded.rstrip().endswith(('#', '$')):
-                    break
-            else:
-                time.sleep(0.2)
+    def run_script(self, script: str, timeout: Optional[int] = 600) -> CommandResult:
+        """Execute a script through the same transport as ordinary commands."""
+        try:
+            client = self._get_client()
+            if self.config.use_pty:
+                from .ssh_proxy import run_script
+                return run_script(client, script, timeout)
+            stdin, stdout, stderr = client.exec_command("bash -s", timeout=timeout)
+            stdin.write(script)
+            stdin.channel.shutdown_write()
+            output = stdout.read().decode("utf-8", errors="replace")
+            errors = stderr.read().decode("utf-8", errors="replace")
+            return CommandResult(output, errors, stdout.channel.recv_exit_status())
+        except Exception as exc:
+            return CommandResult("", str(exc), -1)
 
-        # Disable echo and bracket-paste mode for clean output parsing
-        channel.sendall(b"stty -echo; bind 'set enable-bracketed-paste off' 2>/dev/null\n")
-        time.sleep(0.5)
-        while channel.recv_ready():
-            channel.recv(65536)
-
-        # Send command wrapped in markers to extract output and exit code
-        marker = f"__NANORUN_{id(channel)}__"
-        wrapped = f"echo {marker}_START; {command}; EC=$?; echo {marker}_END_$EC\n"
-        channel.sendall(wrapped.encode())
-
-        # Read until we see the end marker
-        output = b""
-        deadline = time.time() + (timeout or 30)
-        while time.time() < deadline:
-            if channel.recv_ready():
-                output += channel.recv(65536)
-                if f"{marker}_END_".encode() in output:
-                    # Give a moment for any trailing data
-                    time.sleep(0.1)
-                    while channel.recv_ready():
-                        output += channel.recv(65536)
-                    break
-            else:
-                time.sleep(0.1)
-
-        channel.close()
-
-        # Parse output between markers
-        decoded = output.decode('utf-8', errors='replace')
-        decoded = decoded.replace('\r\n', '\n')
-        # Strip ANSI escape sequences
-        decoded = re.sub(r'\x1b\[[^m]*m|\x1b\][^\x07]*\x07|\x1b\[\?[0-9]*[hl]', '', decoded)
-
-        start_marker = f"{marker}_START\n"
-        end_marker_prefix = f"{marker}_END_"
-
-        stdout_str = ""
-        returncode = -1
-
-        start_idx = decoded.find(start_marker)
-        if start_idx >= 0:
-            after_start = decoded[start_idx + len(start_marker):]
-            end_idx = after_start.find(end_marker_prefix)
-            if end_idx >= 0:
-                stdout_str = after_start[:end_idx]
-                # Extract exit code
-                rest = after_start[end_idx + len(end_marker_prefix):]
-                code_match = re.match(r'(\d+)', rest)
-                if code_match:
-                    returncode = int(code_match.group(1))
-
-        return CommandResult(stdout=stdout_str, stderr="", returncode=returncode)
+    def upload_file(self, local_path: Path, remote_path: str, timeout: int = 600) -> CommandResult:
+        """Upload a verified file without requiring SFTP support."""
+        from .ssh_proxy import upload_file
+        try:
+            return upload_file(self._get_client(), Path(local_path), remote_path, timeout)
+        except Exception as exc:
+            return CommandResult("", str(exc), -1)
 
     def close(self):
         """Close the SSH connection."""
@@ -253,8 +206,16 @@ class RemoteSession:
         """Run a command with SSH agent forwarding.
 
         Uses subprocess SSH for commands that need agent forwarding (e.g., git operations).
-        Slower than run() but forwards your local SSH keys.
+        Slower than run() but forwards your local SSH keys. Shell-only proxies
+        request forwarding on their shell channel; repository sync uses Git
+        bundles instead because gateways may drop forwarding requests.
         """
+        if self.config.use_pty:
+            from .ssh_proxy import run_script
+            try:
+                return run_script(self._get_client(), command, timeout, forward_agent=True)
+            except Exception as exc:
+                return CommandResult("", str(exc), -1)
         ssh_cmd = self._build_subprocess_ssh_command() + [command]
         try:
             result = subprocess.run(
@@ -286,9 +247,47 @@ class RemoteSession:
 
         Falls back to subprocess SSH for interactive commands.
         """
+        if self.config.use_pty:
+            # Gateways reject exec even when a PTY is requested. Start a shell
+            # and let it read the command before returning stdin to the user.
+            from .ssh_proxy import open_shell
+            channel = open_shell(self._get_client(), forward_agent=True)
+            try:
+                channel.sendall(("stty echo; exec bash -c " + shlex.quote(command) + "\n").encode())
+                return self._interact_shell(channel)
+            finally:
+                channel.close()
         ssh_cmd = self._build_subprocess_ssh_command() + ["-t", command]
         result = subprocess.run(ssh_cmd)
         return result.returncode
+
+    @staticmethod
+    def _interact_shell(channel) -> int:
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd) if os.isatty(fd) else None
+        try:
+            if previous is not None:
+                tty.setraw(fd)
+            while True:
+                ready, _, _ = select.select([channel, fd], [], [])
+                if channel in ready:
+                    data = channel.recv(65536)
+                    if not data:
+                        return channel.recv_exit_status()
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                if fd in ready:
+                    data = os.read(fd, 65536)
+                    if not data:
+                        channel.shutdown_write()
+                        return 0
+                    channel.sendall(data)
+        finally:
+            if previous is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, previous)
 
     def _build_ssh_options(self) -> list[str]:
         """Build common SSH options for subprocess commands."""
