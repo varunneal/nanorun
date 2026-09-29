@@ -1143,7 +1143,9 @@ def run_setup(remote: RemoteSession, auto_yes: bool = False, bootstrap: bool = F
         failures.append(SetupFailure("setup script", f"Script failed: {result.stderr[:200]}"))
         console.print(f"  [red]Setup script failed to run[/red]")
 
-    required_steps = {"apt", "uv", "venv", "torch", "deps", "data", "flash_attn_3", "nanorun_cli"}
+    # FA3 and coding-agent tooling are optional; FlexAttention experiments do
+    # not depend on them. Report their failures without blocking the daemon.
+    required_steps = {"apt", "uv", "venv", "torch", "deps", "data", "nanorun_cli"}
     if any(f.step in required_steps for f in failures):
         console.print(Panel(
             "\n".join(f"  [red]✗[/red] [bold]{f.step}[/bold]: {f.detail}" for f in failures),
