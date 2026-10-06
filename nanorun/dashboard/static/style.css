@@ -822,6 +822,22 @@ main {
     flex: 1;
     min-width: 0;
     min-height: 0;
+    position: relative;
+}
+
+.chart-empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+.chart-empty-state[hidden] {
+    display: none;
 }
 
 /* Meta row + view switcher wrapper */

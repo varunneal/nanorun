@@ -6,6 +6,19 @@ let _chartOriginalColors = [];
 const CHART_COLORS = ['#5a9a5e', '#5a8ab8', '#c9a054', '#b05a7a', '#7a5a9a', '#5a9a9a', '#c9b854', '#8a7058'];
 const LOSS_CHART_MAX_POINTS = 1200;
 
+function clearLossChart() {
+    if (lossChart) lossChart.destroy();
+    lossChart = null;
+    _chartOriginalColors = [];
+}
+
+function setChartEmptyState(message = '') {
+    const emptyState = document.getElementById('chart-empty-state');
+    if (!emptyState) return;
+    emptyState.textContent = message;
+    emptyState.hidden = !message;
+}
+
 // Reduce dense curves before handing them to Chart.js. Each bucket keeps its
 // local minimum and maximum (in source order), so spikes and dips survive while
 // the canvas only has to render roughly one point per horizontal pixel.
@@ -486,17 +499,19 @@ function computeResidualData(validData) {
     const lossesByStep = {};
     curves.forEach(curve => {
         curve.data.forEach(point => {
+            const loss = point.loss ?? point.val_loss;
+            if (!Number.isFinite(loss)) return;
             if (!lossesByStep[point.step]) lossesByStep[point.step] = [];
             lossesByStep[point.step].push({
                 curveId: curve.id,
-                loss: point.loss ?? point.val_loss
+                loss
             });
         });
     });
 
     const validSteps = Object.keys(lossesByStep)
         .map(s => parseInt(s))
-        .filter(step => lossesByStep[step].length >= 2)
+        .filter(step => new Set(lossesByStep[step].map(point => point.curveId)).size >= 2)
         .sort((a, b) => a - b);
 
     if (validSteps.length === 0) return null;
@@ -514,7 +529,7 @@ function computeResidualData(validData) {
 
     const residualCurves = curves.map(curve => {
         const residuals = curve.data
-            .filter(point => medianByStep[point.step] !== undefined && (point.loss ?? point.val_loss) != null)
+            .filter(point => medianByStep[point.step] !== undefined && Number.isFinite(point.loss ?? point.val_loss))
             .map(point => ({
                 step: point.step,
                 residual: (point.loss ?? point.val_loss) - medianByStep[point.step]
@@ -543,7 +558,7 @@ function getEligibleViews(validData) {
     }
 
     // Curve-based views remain useful for failed, cancelled, and unknown runs.
-    if (curveData.length >= 2) views.push('residual');
+    if (computeResidualData(chartableData)?.length >= 2) views.push('residual');
 
     if (curveData.length >= 1) views.push('line');
 
@@ -625,6 +640,7 @@ function switchChartView(viewName, updateState = true) {
     const chartContainer = document.querySelector('.chart-container');
     const canvas = document.getElementById('loss-chart');
     const heatmapContainer = document.getElementById('chart-heatmap-container');
+    setChartEmptyState();
 
     chartContainer.classList.toggle('heatmap-view', viewName === 'heatmap');
     chartContainer.classList.toggle('residual-view', viewName === 'residual');
@@ -656,6 +672,7 @@ function switchChartView(viewName, updateState = true) {
             }
             const heatmapData = computeHeatmapData(heatmapProcessed, State.get('heatmapSelectedVars'));
             heatmapContainer.innerHTML = renderHeatmap(heatmapData);
+            if (!heatmapData) setChartEmptyState('No completed sweep results for the visible runs.');
             break;
         case 'residual':
             canvas.style.display = 'block';
@@ -718,13 +735,15 @@ function switchLossMetric(metric) {
 function renderResidualChart(residualData) {
     const ctx = document.getElementById('loss-chart').getContext('2d');
 
-    if (lossChart) {
-        lossChart.destroy();
-    }
+    clearLossChart();
 
     if (!residualData || residualData.length === 0) {
+        document.getElementById('chart-legend').innerHTML = '';
+        document.getElementById('chart-range').innerHTML = '';
+        setChartEmptyState('Residuals need at least two visible runs with loss measurements at matching steps. Use the line view to see their curves.');
         return;
     }
+    setChartEmptyState();
 
     const multiRun = residualData.length > 1;
 
@@ -902,9 +921,7 @@ function renderChartLegend(runs) {
 function updateChartMultiple(runs, totalSteps = 0) {
     const ctx = document.getElementById('loss-chart').getContext('2d');
 
-    if (lossChart) {
-        lossChart.destroy();
-    }
+    clearLossChart();
 
     const legendEl = document.getElementById('chart-legend');
     const rangeEl = document.getElementById('chart-range');
@@ -913,8 +930,10 @@ function updateChartMultiple(runs, totalSteps = 0) {
     if (validRuns.length === 0) {
         legendEl.innerHTML = '';
         rangeEl.innerHTML = '';
+        setChartEmptyState('No loss measurements for the visible runs.');
         return;
     }
+    setChartEmptyState();
 
     const isMulti = validRuns.length > 1;
 
