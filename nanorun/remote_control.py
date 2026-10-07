@@ -105,6 +105,9 @@ class RemoteSession:
             try:
                 client.connect(**connect_kwargs)
             except Exception as e:
+                # Paramiko leaves the transport (socket + 0.1s polling thread)
+                # running when auth fails, so close it or it leaks per attempt.
+                client.close()
                 raise ConnectionError(f"Failed to connect to {self.config.user}@{self.config.host}:{self.config.port}: {e}")
 
             self._client = client
