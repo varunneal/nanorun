@@ -1886,8 +1886,11 @@ def watcher_start(background: bool):
     else:
         console.print("[cyan]Starting watcher in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        watcher_instance = Watcher()
-        watcher_instance.run()
+        from .watcher import WatcherAlreadyRunning
+        try:
+            Watcher().run()
+        except WatcherAlreadyRunning as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
 
 
 @watcher.command("stop")
@@ -2081,8 +2084,11 @@ def watcher_restart(background: bool):
     else:
         console.print("[cyan]Starting watcher in foreground...[/cyan]")
         console.print("[dim]Press Ctrl+C to stop[/dim]")
-        watcher_instance = Watcher()
-        watcher_instance.run()
+        from .watcher import WatcherAlreadyRunning
+        try:
+            Watcher().run()
+        except WatcherAlreadyRunning as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
 
 
 @job.command("crashes")

@@ -8,6 +8,7 @@ These are decoupled: artifact ingestion continues when RPC drops and vice versa.
 One main thread handles session discovery and signal handling.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -97,6 +98,10 @@ class WatcherPaths:
     @property
     def pid_file(self) -> Path:
         return self.watcher_dir / "watcher.pid"
+
+    @property
+    def lock_file(self) -> Path:
+        return self.watcher_dir / "watcher.lock"
 
     @property
     def legacy_pid_file(self) -> Path:
@@ -1894,6 +1899,9 @@ class Watcher:
 
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)
+        self._lock_fd = acquire_watcher_lock()
+        if self._lock_fd is None:
+            raise WatcherAlreadyRunning(read_watcher_lock_owner())
         try:
             PATHS.pid_file.write_text(str(os.getpid()))
             sessions = self._discover_sessions()
@@ -1923,12 +1931,48 @@ class Watcher:
             self._stop_hub_syncer()
             close_db()  # release the main thread's DB connection
             remove_watcher_pid_file()
+            os.close(self._lock_fd)
             log.info("Watcher stopped")
 
 
 def remove_watcher_pid_file():
-    if PATHS.pid_file.exists():
-        PATHS.pid_file.unlink()
+    """Remove the PID file only when it names this process."""
+    try:
+        owner = PATHS.pid_file.read_text().strip()
+    except OSError:
+        return
+    if owner == str(os.getpid()):
+        PATHS.pid_file.unlink(missing_ok=True)
+
+
+class WatcherAlreadyRunning(RuntimeError):
+    def __init__(self, pid: Optional[int]):
+        self.pid = pid
+        super().__init__(f"Watcher is already running (PID: {pid or 'unknown'})")
+
+
+def acquire_watcher_lock() -> Optional[int]:
+    """Take the exclusive watcher lock, or return None if another holds it.
+
+    The kernel releases a flock when its holder exits for any reason, so a
+    crashed or SIGKILLed watcher never leaves a stale lock behind.
+    """
+    fd = os.open(PATHS.lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def read_watcher_lock_owner() -> Optional[int]:
+    try:
+        return int(PATHS.lock_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -2084,7 +2128,11 @@ def main():
     if is_watcher_running():
         print("Watcher is already running", file=sys.stderr)
         sys.exit(1)
-    Watcher(dashboard_port=args.dashboard_port, no_dashboard=args.no_dashboard).run()
+    try:
+        Watcher(dashboard_port=args.dashboard_port, no_dashboard=args.no_dashboard).run()
+    except WatcherAlreadyRunning as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
