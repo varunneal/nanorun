@@ -269,6 +269,7 @@ class RpcClient:
         self._tunnel: Optional[SshTunnel] = None
         self._direct_port: Optional[int] = None
         self._shell_socket = None
+        self._shell_remote = None
         self._ws = None
         self._event_callbacks: List[Callable[[EventMessage], None]] = []
 
@@ -311,6 +312,9 @@ class RpcClient:
                 self._tunnel.start()
             websocket_url = f"ws://localhost:{self._tunnel.local_port}"
 
+        # Imported here because remote_control imports this module.
+        from .remote_control import RemoteSession, SshConnectError
+
         # Connect WebSocket with retry (daemon may still be booting).
         deadline = time.time() + timeout
         last_error: Optional[Exception] = None
@@ -321,7 +325,13 @@ class RpcClient:
                     from .ssh_proxy import ShellSocket
                     if self._shell_socket:
                         self._shell_socket.close()
-                    self._shell_socket = ShellSocket(self._session, RPC_PORT)
+                    # Retries reuse one SSH connection; RemoteSession only
+                    # reconnects when its transport has died.
+                    if self._shell_remote is None:
+                        self._shell_remote = RemoteSession(self._session)
+                    self._shell_socket = ShellSocket(
+                        self._session, RPC_PORT, remote=self._shell_remote,
+                    )
                     connect_options["sock"] = self._shell_socket.start(
                         timeout=max(0.5, deadline - time.time())
                     )
@@ -338,8 +348,15 @@ class RpcClient:
                 if self._shell_socket:
                     self._shell_socket.close()
                     self._shell_socket = None
+                if isinstance(e, SshConnectError):
+                    # Retrying only helps while the daemon boots; a failed
+                    # SSH login will not recover within this window.
+                    break
                 time.sleep(0.5)
 
+        if self._shell_remote:
+            self._shell_remote.close()
+            self._shell_remote = None
         raise ConnectionError(
             f"Could not connect to daemon WebSocket: {last_error}"
         )
@@ -359,6 +376,9 @@ class RpcClient:
         if self._shell_socket:
             self._shell_socket.close()
             self._shell_socket = None
+        if self._shell_remote:
+            self._shell_remote.close()
+            self._shell_remote = None
         if self._tunnel and stop_tunnel:
             self._tunnel.stop()
             self._tunnel = None

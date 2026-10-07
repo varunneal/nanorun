@@ -183,13 +183,16 @@ except BaseException:
 class ShellSocket:
     """A socket connected to remote localhost through a framed SSH shell.
 
-    Each WebSocket owns its SSH connection. No local listener, shared tunnel
-    state, remote credential copy, or exposed daemon port is required.
+    Each WebSocket owns its SSH connection unless a caller passes ``remote``
+    to share one across attempts; a shared remote is left open on close().
+    No local listener, shared tunnel state, remote credential copy, or exposed
+    daemon port is required.
     """
 
-    def __init__(self, session, remote_port: int):
+    def __init__(self, session, remote_port: int, remote=None):
         from .remote_control import RemoteSession
-        self.remote = RemoteSession(session)
+        self._owns_remote = remote is None
+        self.remote = remote if remote is not None else RemoteSession(session)
         self.remote_port = remote_port
         self.channel = None
         self.socket = None
@@ -277,4 +280,5 @@ while True:
                     sock.close()
             if self.channel:
                 self.channel.close()
-            self.remote.close()
+            if self._owns_remote:
+                self.remote.close()

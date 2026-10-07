@@ -60,6 +60,10 @@ class CommandResult:
         return self.returncode == 0
 
 
+class SshConnectError(ConnectionError):
+    """The SSH connection itself failed (network, host key, or auth)."""
+
+
 class RemoteSession:
     """Manages SSH connection and tmux sessions on remote machine using Paramiko."""
 
@@ -108,7 +112,7 @@ class RemoteSession:
                 # Paramiko leaves the transport (socket + 0.1s polling thread)
                 # running when auth fails, so close it or it leaks per attempt.
                 client.close()
-                raise ConnectionError(f"Failed to connect to {self.config.user}@{self.config.host}:{self.config.port}: {e}")
+                raise SshConnectError(f"Failed to connect to {self.config.user}@{self.config.host}:{self.config.port}: {e}")
 
             self._client = client
             return client
